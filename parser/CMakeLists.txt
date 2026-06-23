@@ -14,3 +14,8 @@ add_executable(benchmark benchmark.cpp parser.hpp random_access_rlz.hpp)
 target_compile_features(benchmark PRIVATE cxx_std_20)
 target_compile_options(benchmark PRIVATE -O3)
 target_link_libraries(benchmark PRIVATE sdsl)
+
+add_executable(compare_rlz_cache compare_rlz_cache.cpp parser.hpp cached_rlz_parser.hpp random_access_rlz.hpp)
+target_compile_features(compare_rlz_cache PRIVATE cxx_std_20)
+target_compile_options(compare_rlz_cache PRIVATE -O3)
+target_link_libraries(compare_rlz_cache PRIVATE sdsl)

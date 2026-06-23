@@ -1,0 +1,173 @@
+--- parser/compare_rlz_cache.cpp
++++ parser/compare_rlz_cache.cpp
+@@ -5,6 +5,7 @@
+ #include <fstream>
+ #include <iomanip>
+ #include <iostream>
++#include <memory>
+ #include <stdexcept>
+ #include <string>
+ #include <tuple>
+@@ -26,6 +27,7 @@
+     std::string suffix_array;
+     std::string filenames;
+     std::size_t bucket_divisor = 32;
++    std::string mode = "both"; // both, baseline, or cached
+ };
+ 
+ template <typename Fn>
+@@ -53,9 +55,9 @@
+ void print_usage(const char* prog) {
+     std::cerr
+         << "Usage:\n"
+-        << "  " << prog << " --reference PATH --filenames PATH [--suffix-array PATH] [--bucket-divisor N]\n\n"
++        << "  " << prog << " --reference PATH --filenames PATH [--suffix-array PATH] [--bucket-divisor N] [--mode both|baseline|cached]\n\n"
+         << "If --suffix-array is omitted, the program uses <reference>.sa\n"
+-        << "Default --bucket-divisor is 32.\n";
++        << "Default --bucket-divisor is 32. Default --mode is both.\n";
+ }
+ 
+ std::string trim(std::string s) {
+@@ -112,6 +114,8 @@
+             args.filenames = require_value(key);
+         } else if (key == "--bucket-divisor") {
+             args.bucket_divisor = static_cast<std::size_t>(std::stoull(require_value(key)));
++        } else if (key == "--mode") {
++            args.mode = require_value(key);
+         } else if (key == "--help" || key == "-h") {
+             print_usage(argv[0]);
+             std::exit(0);
+@@ -132,6 +136,9 @@
+     if (args.bucket_divisor == 0) {
+         throw std::runtime_error("--bucket-divisor must be > 0");
+     }
++    if (args.mode != "both" && args.mode != "baseline" && args.mode != "cached") {
++        throw std::runtime_error("--mode must be one of: both, baseline, cached");
++    }
+ 
+     return args;
+ }
+@@ -153,13 +160,17 @@
+                       << ") != reference bytes (" << ref.size() << ")\n";
+         }
+ 
+-        CachedRLZParser<Symbol, SAType> parser(ref, sa, args.bucket_divisor);
++        std::unique_ptr<CachedRLZParser<Symbol, SAType>> parser;
++        if (args.mode != "baseline") {
++            parser = std::make_unique<CachedRLZParser<Symbol, SAType>>(ref, sa, args.bucket_divisor);
++        }
+ 
+         std::cout << "reference," << args.reference << "\n";
+         std::cout << "suffix_array," << args.suffix_array << "\n";
+         std::cout << "files," << files.size() << "\n";
+         std::cout << "bucket_divisor," << args.bucket_divisor << "\n";
+-        std::cout << "cache_mode,warm_across_files\n\n";
++        std::cout << "run_mode," << args.mode << "\n";
++        std::cout << "cache_mode," << (args.mode == "baseline" ? "none" : "warm_across_files") << "\n\n";
+ 
+         std::cout
+             << "file,input_bytes,baseline_ms,cached_ms,baseline_phrases,cached_phrases,outputs_equal,"
+@@ -181,32 +192,54 @@
+             }
+ 
+             Triples baseline;
+-            const double baseline_ms = time_ms([&] {
+-                baseline = lzFactorize<Symbol, SAType>(input, ref, sa);
+-            });
++            Triples cached;
++            double baseline_ms = 0.0;
++            double cached_ms = 0.0;
++            std::size_t baseline_phrases = 0;
++            std::size_t cached_phrases = 0;
++            std::string equal_text = "NA";
++            std::size_t file_hits = 0;
++            std::size_t file_misses = 0;
++            double file_hit_rate = 0.0;
++            std::size_t cache_entries = 0;
++            double cache_mb = 0.0;
++
++            if (args.mode != "cached") {
++                baseline_ms = time_ms([&] {
++                    baseline = lzFactorize<Symbol, SAType>(input, ref, sa);
++                });
++                baseline_phrases = baseline.size();
++            }
+ 
+-            const auto before = parser.cache_info();
++            if (args.mode != "baseline") {
++                const auto before = parser->cache_info();
+ 
+-            Triples cached;
+-            const double cached_ms = time_ms([&] {
+-                cached = parser.lzFactorize(input);
+-            });
+-
+-            const auto after = parser.cache_info();
+-            const std::size_t file_hits = after.hits - before.hits;
+-            const std::size_t file_misses = after.misses - before.misses;
+-            const std::size_t file_queries = file_hits + file_misses;
+-            const double file_hit_rate = file_queries == 0
+-                ? 0.0
+-                : static_cast<double>(file_hits) / static_cast<double>(file_queries);
++                cached_ms = time_ms([&] {
++                    cached = parser->lzFactorize(input);
++                });
++
++                const auto after = parser->cache_info();
++                file_hits = after.hits - before.hits;
++                file_misses = after.misses - before.misses;
++                const std::size_t file_queries = file_hits + file_misses;
++                file_hit_rate = file_queries == 0
++                    ? 0.0
++                    : static_cast<double>(file_hits) / static_cast<double>(file_queries);
++                cached_phrases = cached.size();
++                cache_entries = after.current_size;
++                cache_mb = after.approx_bytes / (1024.0 * 1024.0);
++            }
+ 
+-            const bool equal = (baseline == cached);
+-            all_equal = all_equal && equal;
++            if (args.mode == "both") {
++                const bool equal = (baseline == cached);
++                all_equal = all_equal && equal;
++                equal_text = equal ? "YES" : "NO";
++            }
+ 
+             ++processed;
+             total_input_bytes += input.size();
+-            total_baseline_phrases += baseline.size();
+-            total_cached_phrases += cached.size();
++            total_baseline_phrases += baseline_phrases;
++            total_cached_phrases += cached_phrases;
+             total_baseline_ms += baseline_ms;
+             total_cached_ms += cached_ms;
+ 
+@@ -215,19 +248,22 @@
+                 << input.size() << ','
+                 << std::fixed << std::setprecision(3) << baseline_ms << ','
+                 << std::fixed << std::setprecision(3) << cached_ms << ','
+-                << baseline.size() << ','
+-                << cached.size() << ','
+-                << (equal ? "YES" : "NO") << ','
++                << baseline_phrases << ','
++                << cached_phrases << ','
++                << equal_text << ','
+                 << file_hits << ','
+                 << file_misses << ','
+                 << std::fixed << std::setprecision(6) << file_hit_rate << ','
+-                << after.current_size << ','
+-                << std::fixed << std::setprecision(3) << after.approx_bytes / (1024.0 * 1024.0) << ','
++                << cache_entries << ','
++                << std::fixed << std::setprecision(3) << cache_mb << ','
+                 << std::fixed << std::setprecision(2) << peak_rss_kb() / 1024.0
+                 << '\n';
+         }
+ 
+-        const auto final_info = parser.cache_info();
++        CachedRLZParser<Symbol, SAType>::CacheInfo final_info{};
++        if (parser) {
++            final_info = parser->cache_info();
++        }
+         const double avg_baseline_ms = processed == 0 ? 0.0 : total_baseline_ms / static_cast<double>(processed);
+         const double avg_cached_ms = processed == 0 ? 0.0 : total_cached_ms / static_cast<double>(processed);
+         const double speedup = total_cached_ms == 0.0 ? 0.0 : total_baseline_ms / total_cached_ms;
