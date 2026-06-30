@@ -17,7 +17,7 @@
 #endif
 
 #include "parser.hpp"
-#include "cached_rlz_parser.hpp"
+#include "rlz_lp.hpp"
 
 using Symbol = unsigned char;
 using SAType = unsigned int;
@@ -27,9 +27,8 @@ struct Args {
     std::string reference;
     std::string suffix_array;
     std::string filenames;
-    std::string bucket_hit_trace;
-    std::size_t bucket_divisor = 32;
-    std::string mode = "both"; // both, baseline, or cached
+    std::size_t div_p = 64;
+    std::string mode = "both";
 };
 
 template <typename Fn>
@@ -54,80 +53,13 @@ std::size_t peak_rss_kb() {
     return 0;
 }
 
-std::string csv_escape(const std::string& value) {
-    bool quote = false;
-
-    for (char c : value) {
-        if (c == ',' || c == '"' || c == '\n' || c == '\r') {
-            quote = true;
-            break;
-        }
-    }
-
-    if (!quote) {
-        return value;
-    }
-
-    std::string out = "\"";
-
-    for (char c : value) {
-        if (c == '"') {
-            out += "\"\"";
-        } else {
-            out += c;
-        }
-    }
-
-    out += "\"";
-    return out;
-}
-
-void write_bucket_trace_header(std::ofstream& out) {
-    out << "filename,bucket_hit_sequence,total_hits,unique_buckets,min_bucket,max_bucket\n";
-}
-
-void write_bucket_trace_row(std::ofstream& out,
-                            const std::string& filename,
-                            const std::vector<std::size_t>& seq) {
-    std::vector<std::size_t> sorted = seq;
-    std::sort(sorted.begin(), sorted.end());
-
-    const std::size_t total_hits = seq.size();
-
-    const std::size_t unique_buckets =
-        sorted.empty()
-            ? 0
-            : static_cast<std::size_t>(
-                  std::unique(sorted.begin(), sorted.end()) - sorted.begin()
-              );
-
-    const std::size_t min_bucket = sorted.empty() ? 0 : sorted.front();
-    const std::size_t max_bucket = sorted.empty() ? 0 : sorted.back();
-
-    out << csv_escape(filename) << ",\"";
-
-    for (std::size_t i = 0; i < seq.size(); ++i) {
-        if (i > 0) {
-            out << ' ';
-        }
-        out << seq[i];
-    }
-
-    out << "\","
-        << total_hits << ','
-        << unique_buckets << ','
-        << min_bucket << ','
-        << max_bucket << '\n';
-}
-
 void print_usage(const char* prog) {
     std::cerr
         << "Usage:\n"
         << "  " << prog << " --reference PATH --filenames PATH [--suffix-array PATH] "
-        << "[--bucket-divisor N] [--mode both|baseline|cached] "
-        << "[--bucket-hit-trace PATH]\n\n"
+        << "[--div_p N] [--mode both|baseline|cached]\n\n"
         << "If --suffix-array is omitted, the program uses <reference>.sa\n"
-        << "Default --bucket-divisor is 32. Default --mode is both.\n";
+        << "Default --div_p is 64.\n";
 }
 
 std::string trim(std::string s) {
@@ -191,11 +123,9 @@ Args parse_args(int argc, char** argv) {
             args.suffix_array = require_value(key);
         } else if (key == "--filenames") {
             args.filenames = require_value(key);
-        } else if (key == "--bucket-divisor") {
-            args.bucket_divisor =
+        } else if (key == "--div_p") {
+            args.div_p =
                 static_cast<std::size_t>(std::stoull(require_value(key)));
-        } else if (key == "--bucket-hit-trace") {
-            args.bucket_hit_trace = require_value(key);
         } else if (key == "--mode") {
             args.mode = require_value(key);
         } else if (key == "--help" || key == "-h") {
@@ -218,16 +148,12 @@ Args parse_args(int argc, char** argv) {
         args.suffix_array = args.reference + ".sa";
     }
 
-    if (args.bucket_divisor == 0) {
-        throw std::runtime_error("--bucket-divisor must be > 0");
+    if (args.div_p == 0) {
+        throw std::runtime_error("--div_p must be > 0");
     }
 
     if (args.mode != "both" && args.mode != "baseline" && args.mode != "cached") {
         throw std::runtime_error("--mode must be one of: both, baseline, cached");
-    }
-
-    if (!args.bucket_hit_trace.empty() && args.mode == "baseline") {
-        throw std::runtime_error("--bucket-hit-trace requires --mode cached or --mode both");
     }
 
     return args;
@@ -241,7 +167,10 @@ int main(int argc, char** argv) {
         std::cerr << "Loading reference and suffix array...\n";
 
         auto ref = read_file<Symbol>(args.reference.c_str());
+        std::cerr << "Reference loaded: " << ref.size() << " bytes\n";
+
         auto sa = read_file<SAType>(args.suffix_array.c_str());
+        std::cerr << "Suffix array loaded: " << sa.size() << " entries\n";
 
         if (ref.empty() || sa.empty()) {
             throw std::runtime_error("reference and suffix array must be non-empty");
@@ -252,46 +181,31 @@ int main(int argc, char** argv) {
                       << ") != reference bytes (" << ref.size() << ")\n";
         }
 
-        std::unique_ptr<CachedRLZParser<Symbol, SAType>> parser;
+        std::unique_ptr<RLZLPParser<Symbol, SAType>> parser;
 
         if (args.mode != "baseline") {
-            parser = std::make_unique<CachedRLZParser<Symbol, SAType>>(
-                ref, sa, args.bucket_divisor
+            parser = std::make_unique<RLZLPParser<Symbol, SAType>>(
+                ref, sa, args.div_p
             );
-        }
-
-        std::ofstream bucket_trace;
-
-        if (!args.bucket_hit_trace.empty()) {
-            bucket_trace.open(args.bucket_hit_trace);
-
-            if (!bucket_trace) {
-                throw std::runtime_error(
-                    "cannot open bucket-hit trace file: " + args.bucket_hit_trace
-                );
-            }
-
-            write_bucket_trace_header(bucket_trace);
+            std::cerr << "LP parser created\n";
         }
 
         std::cout << "reference," << args.reference << "\n";
         std::cout << "suffix_array," << args.suffix_array << "\n";
         std::cout << "files," << files.size() << "\n";
-        std::cout << "bucket_divisor," << args.bucket_divisor << "\n";
+        std::cout << "div_p," << args.div_p << "\n";
         std::cout << "run_mode," << args.mode << "\n";
         std::cout << "cache_mode,"
                   << (args.mode == "baseline" ? "none" : "warm_across_files")
                   << "\n";
-
-        if (!args.bucket_hit_trace.empty()) {
-            std::cout << "bucket_hit_trace," << args.bucket_hit_trace << "\n";
-        }
-
+        std::cout << "cache_layout,linear_probing_dynamic_table\n";
         std::cout << "\n";
 
         std::cout
             << "file,input_bytes,baseline_ms,cached_ms,baseline_phrases,cached_phrases,outputs_equal,"
             << "file_cache_hits,file_cache_misses,file_cache_hit_rate,total_cache_entries,approx_cache_MB,peak_RSS_MB\n";
+
+        std::cout.flush();
 
         bool all_equal = true;
         std::size_t processed = 0;
@@ -302,6 +216,9 @@ int main(int argc, char** argv) {
         double total_cached_ms = 0.0;
 
         for (const auto& file : files) {
+            std::cerr << "Processing " << (processed + 1) << "/" << files.size()
+                      << ": " << file << "\n";
+
             auto input = read_file<Symbol>(file.c_str());
 
             if (input.empty()) {
@@ -333,10 +250,6 @@ int main(int argc, char** argv) {
             if (args.mode != "baseline") {
                 const auto before = parser->cache_info();
 
-                // Clear only this file's bucket-hit sequence.
-                // Do not clear the cache: it must remain warm across files.
-                parser->clear_bucket_hit_sequence();
-
                 cached_ms = time_ms([&] {
                     cached = parser->lzFactorize(input);
                 });
@@ -347,24 +260,13 @@ int main(int argc, char** argv) {
                 file_misses = after.misses - before.misses;
 
                 const std::size_t file_queries = file_hits + file_misses;
-                file_hit_rate =
-                    file_queries == 0
-                        ? 0.0
-                        : static_cast<double>(file_hits) /
-                              static_cast<double>(file_queries);
+                file_hit_rate = file_queries == 0
+                    ? 0.0
+                    : static_cast<double>(file_hits) / static_cast<double>(file_queries);
 
                 cached_phrases = cached.size();
                 cache_entries = after.current_size;
                 cache_mb = after.approx_bytes / (1024.0 * 1024.0);
-
-                if (bucket_trace) {
-                    write_bucket_trace_row(
-                        bucket_trace,
-                        file,
-                        parser->bucket_hit_sequence()
-                    );
-                    bucket_trace.flush();
-                }
             }
 
             if (args.mode == "both") {
@@ -396,26 +298,27 @@ int main(int argc, char** argv) {
                 << std::fixed << std::setprecision(2)
                 << peak_rss_kb() / 1024.0
                 << '\n';
+
+            std::cout.flush();
         }
 
-        CachedRLZParser<Symbol, SAType>::CacheInfo final_info{};
+        RLZLPParser<Symbol, SAType>::CacheInfo final_info{};
 
         if (parser) {
             final_info = parser->cache_info();
         }
 
-        const double avg_baseline_ms =
-            processed == 0
-                ? 0.0
-                : total_baseline_ms / static_cast<double>(processed);
+        const double avg_baseline_ms = processed == 0
+            ? 0.0
+            : total_baseline_ms / static_cast<double>(processed);
 
-        const double avg_cached_ms =
-            processed == 0
-                ? 0.0
-                : total_cached_ms / static_cast<double>(processed);
+        const double avg_cached_ms = processed == 0
+            ? 0.0
+            : total_cached_ms / static_cast<double>(processed);
 
-        const double speedup =
-            total_cached_ms == 0.0 ? 0.0 : total_baseline_ms / total_cached_ms;
+        const double speedup = total_cached_ms == 0.0
+            ? 0.0
+            : total_baseline_ms / total_cached_ms;
 
         std::cout << "\nsummary,processed_files," << processed << "\n";
         std::cout << "summary,total_input_bytes," << total_input_bytes << "\n";
@@ -440,12 +343,21 @@ int main(int argc, char** argv) {
                   << final_info.hit_rate << "\n";
         std::cout << "summary,final_cache_entries,"
                   << final_info.current_size << "\n";
+        std::cout << "summary,final_table_slots,"
+                  << final_info.table_slots << "\n";
+        std::cout << "summary,final_load_factor,"
+                  << std::fixed << std::setprecision(6)
+                  << final_info.load_factor << "\n";
+        std::cout << "summary,max_probe_cluster,"
+                  << final_info.max_probe_cluster << "\n";
         std::cout << "summary,final_cache_MB,"
                   << std::fixed << std::setprecision(3)
                   << final_info.approx_bytes / (1024.0 * 1024.0) << "\n";
         std::cout << "summary,peak_RSS_MB,"
                   << std::fixed << std::setprecision(2)
                   << peak_rss_kb() / 1024.0 << "\n";
+
+        std::cout.flush();
 
         return all_equal ? 0 : 4;
     } catch (const std::exception& e) {

@@ -10,20 +10,10 @@
 #include <utility>
 #include <vector>
 
-#include "parser.hpp"   // original RLZ parser
-
-/**
- * CachedRLZParser is an add-on wrapper for the RLZ parser.
- *
- * The file binds one reference vector and one suffix array, then mirrors
- * lzFactorize/computeLZFactorAt while caching the expensive interval-refinement step:
- *
- *  (lb, rb, offset, next_symbol) -> (new_lb, new_rb)
- *
- **/
+#include "parser.hpp"
 
 template <typename T1, typename T2>
-class CachedRLZParser {
+class RLZLPParser {
 public:
     using input_type = std::vector<T1>;
     using reference_type = std::vector<T1>;
@@ -37,8 +27,8 @@ public:
         std::size_t hits = 0;
         std::size_t misses = 0;
         std::size_t current_size = 0;
-        std::size_t bucket_count = 0;
-        std::size_t max_bucket_size = 0;
+        std::size_t table_slots = 0;
+        std::size_t max_probe_cluster = 0;
         double hit_rate = 0.0;
         double load_factor = 0.0;
         std::size_t approx_bytes = 0;
@@ -46,13 +36,13 @@ public:
 
 private:
     struct LookupKey {
-        std::size_t lb_remainder;
+        std::size_t lb;
         std::size_t rb;
         std::size_t offset;
         T1 symbol;
 
         bool operator==(const LookupKey& other) const noexcept {
-            return lb_remainder == other.lb_remainder &&
+            return lb == other.lb &&
                    rb == other.rb &&
                    offset == other.offset &&
                    symbol == other.symbol;
@@ -64,60 +54,46 @@ private:
         std::size_t new_rb;
     };
 
-    using Entry = std::pair<LookupKey, Interval>;
-    using Bucket = std::vector<Entry>;
+    struct Slot {
+        bool occupied = false;
+        LookupKey key{};
+        Interval interval{};
+    };
 
     const reference_type* ref_ = nullptr;
     const suffix_array_type* sa_ = nullptr;
 
-    // Used to map lb to a bucket:
-    // bucket_index = lb / bucket_divisor_.
-    // This is not the number of entries allowed in a bucket.
-    std::size_t bucket_divisor_ = 256;
-
-    std::vector<Bucket> table_;
+    std::size_t div_p_ = 64;
+    std::vector<Slot> table_;
 
     std::size_t hits_ = 0;
     std::size_t misses_ = 0;
     std::size_t entries_ = 0;
 
-    // Per-file trace of bucket indices where cache hits occur.
-    // This is cleared before each input file, but the cache itself stays warm.
-    std::vector<std::size_t> bucket_hit_sequence_;
+    static constexpr double max_load_factor_ = 0.70;
 
 public:
-    /**
-     * Bind this cache to exactly one (reference, suffix-array) pair.
-     */
-    explicit CachedRLZParser(
+    explicit RLZLPParser(
         const reference_type& ref,
         const suffix_array_type& sa,
-        std::size_t bucket_divisor = 256
+        std::size_t div_p = 64
     ) : ref_(&ref),
         sa_(&sa),
-        bucket_divisor_(bucket_divisor == 0 ? 256 : bucket_divisor) {
+        div_p_(div_p == 0 ? 64 : div_p) {
         if (ref.empty()) {
-            throw std::invalid_argument("CachedRLZParser: reference is empty");
+            throw std::invalid_argument("RLZLPParser: reference is empty");
         }
         if (sa.empty()) {
-            throw std::invalid_argument("CachedRLZParser: suffix array is empty");
+            throw std::invalid_argument("RLZLPParser: suffix array is empty");
         }
         rebuild_table();
     }
 
-    /**
-     * File loading.
-     */
     template <typename T>
     static std::vector<T> read_file(const char* filename) {
         return ::read_file<T>(filename);
     }
 
-    /**
-     * binarySearchLB: The useful cached unit for RLZ is the combined interval
-     * transition, because computeLZFactorAt always needs both LB and RB before
-     * continuing.
-     */
     std::optional<std::int64_t> binarySearchLB(
         const reference_type& ref,
         const suffix_array_type& sa,
@@ -129,10 +105,6 @@ public:
         return ::binarySearchLB<T1, T2>(ref, sa, lo, hi, offset, c);
     }
 
-    /**
-     * binarySearchRB is not cached alone for the same reason as binarySearchLB.
-     * The wrapper caches (lb, rb, offset, c) -> (new_lb, new_rb).
-     */
     std::optional<std::int64_t> binarySearchRB(
         const reference_type& ref,
         const suffix_array_type& sa,
@@ -144,10 +116,6 @@ public:
         return ::binarySearchRB<T1, T2>(ref, sa, lo, hi, offset, c);
     }
 
-    /**
-     * Cached equivalent of RLZ computeLZFactorAt(input, ref, sa, pos).
-     * It caches only interval refinements; failed refinements are not cached.
-     */
     factor_type computeLZFactorAt(
         const input_type& input,
         const reference_type& ref,
@@ -158,9 +126,6 @@ public:
         return computeLZFactorAt(input, input_pos);
     }
 
-    /**
-     * Convenience overload using the reference and suffix array bound at construction.
-     */
     factor_type computeLZFactorAt(
         const input_type& input,
         const std::size_t input_pos
@@ -174,7 +139,6 @@ public:
 
         while (j < input.size()) {
             if (nlb == nrb) {
-                // Not cached: there is no interval refinement, only one suffix check.
                 if ((*ref_)[static_cast<std::size_t>((*sa_)[nlb]) + offset] != input[j]) {
                     break;
                 }
@@ -233,11 +197,6 @@ public:
         return {match, offset};
     }
 
-    /**
-     * Cached equivalent of lzFactorize(input, ref, sa).
-     * The whole factor list is not cached; only the internal suffix-array
-     * interval transitions are cached.
-     */
     phrase_vector_type lzFactorize(
         const input_type& input,
         const reference_type& ref,
@@ -247,9 +206,6 @@ public:
         return lzFactorize(input);
     }
 
-    /**
-     * Convenience overload using the reference and suffix array bound at construction.
-     */
     phrase_vector_type lzFactorize(const input_type& input) {
         phrase_vector_type spl_vec;
         std::size_t i = 0;
@@ -269,90 +225,80 @@ public:
         return spl_vec;
     }
 
-    /**
-     * Clear cache entries and statistics. Use before a cold-cache timing run.
-     */
     void clear_cache() {
         rebuild_table();
         hits_ = 0;
         misses_ = 0;
         entries_ = 0;
-        bucket_hit_sequence_.clear();
     }
 
-    /**
-     * Clear only the per-file bucket-hit sequence.
-     * This must not clear the cache because experiments use a warm cache across files.
-     */
-    void clear_bucket_hit_sequence() {
-        bucket_hit_sequence_.clear();
-    }
-
-    /**
-     * Return the sequence of bucket indices hit while parsing the current file.
-     */
-    const std::vector<std::size_t>& bucket_hit_sequence() const {
-        return bucket_hit_sequence_;
-    }
-
-    /**
-     * Report hit count, miss count, current dynamic cache size, and basic table stats.
-     */
     CacheInfo cache_info() const {
         CacheInfo info;
 
         info.hits = hits_;
         info.misses = misses_;
         info.current_size = entries_;
-        info.bucket_count = table_.size();
-        info.max_bucket_size = max_bucket_size();
+        info.table_slots = table_.size();
+        info.max_probe_cluster = max_probe_cluster();
 
         const std::size_t total = hits_ + misses_;
-        info.hit_rate =
-            total == 0
-                ? 0.0
-                : static_cast<double>(hits_) / static_cast<double>(total);
+        info.hit_rate = total == 0
+            ? 0.0
+            : static_cast<double>(hits_) / static_cast<double>(total);
 
-        info.load_factor =
-            table_.empty()
-                ? 0.0
-                : static_cast<double>(entries_) / static_cast<double>(table_.size());
+        info.load_factor = table_.empty()
+            ? 0.0
+            : static_cast<double>(entries_) / static_cast<double>(table_.size());
 
-        info.approx_bytes =
-            table_.size() * sizeof(Bucket) + entries_ * sizeof(Entry);
+        info.approx_bytes = table_.size() * sizeof(Slot);
 
         return info;
     }
 
 private:
     void rebuild_table() {
-        const std::size_t buckets = std::max<std::size_t>(
+        const std::size_t slots = std::max<std::size_t>(
             1,
-            (ref_->size() + bucket_divisor_ - 1) / bucket_divisor_
+            sa_->size() / div_p_
         );
 
-        table_.clear();
-        table_.resize(buckets);
+        table_.assign(slots, Slot{});
     }
 
     void assert_bound_pair(const reference_type& ref,
                            const suffix_array_type& sa) const {
         if (&ref != ref_ || &sa != sa_) {
             throw std::invalid_argument(
-                "CachedRLZParser: this cache is bound to a different reference/suffix-array pair"
+                "RLZLPParser: this cache is bound to a different reference/suffix-array pair"
             );
         }
     }
 
-    std::size_t bucket_index(const std::size_t lb) const {
-        return lb / bucket_divisor_;
+    static std::size_t mix_hash(std::size_t x) noexcept {
+        x += static_cast<std::size_t>(0x9e3779b97f4a7c15ull);
+        x = (x ^ (x >> 30)) * static_cast<std::size_t>(0xbf58476d1ce4e5b9ull);
+        x = (x ^ (x >> 27)) * static_cast<std::size_t>(0x94d049bb133111ebull);
+        return x ^ (x >> 31);
+    }
+
+    std::size_t key_hash(const LookupKey& key) const noexcept {
+        std::size_t h = mix_hash(key.lb / div_p_);
+        h ^= mix_hash(key.lb + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (h << 6) + (h >> 2));
+        h ^= mix_hash(key.rb + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (h << 6) + (h >> 2));
+        h ^= mix_hash(key.offset + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (h << 6) + (h >> 2));
+        h ^= mix_hash(static_cast<std::size_t>(key.symbol) + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (h << 6) + (h >> 2));
+        return h;
+    }
+
+    std::size_t start_slot(const LookupKey& key) const {
+        return key_hash(key) % table_.size();
     }
 
     LookupKey make_key(const std::size_t lb,
                        const std::size_t rb,
                        const std::size_t offset,
                        const T1 symbol) const {
-        return LookupKey{lb % bucket_divisor_, rb, offset, symbol};
+        return LookupKey{lb, rb, offset, symbol};
     }
 
     bool lookup(const std::size_t lb,
@@ -360,21 +306,24 @@ private:
                 const std::size_t offset,
                 const T1 symbol,
                 Interval& cached_interval) {
-        const std::size_t b = bucket_index(lb);
-        assert(b < table_.size());
-
         const LookupKey key = make_key(lb, rb, offset, symbol);
+        std::size_t pos = start_slot(key);
 
-        for (const auto& [entry_key, entry_interval] : table_[b]) {
-            if (entry_key == key) {
-                cached_interval = entry_interval;
+        for (std::size_t probe = 0; probe < table_.size(); ++probe) {
+            const Slot& slot = table_[pos];
+
+            if (!slot.occupied) {
+                ++misses_;
+                return false;
+            }
+
+            if (slot.key == key) {
+                cached_interval = slot.interval;
                 ++hits_;
-
-                // Record the bucket index only when the cache actually hits.
-                bucket_hit_sequence_.push_back(b);
-
                 return true;
             }
+
+            pos = (pos + 1 == table_.size()) ? 0 : pos + 1;
         }
 
         ++misses_;
@@ -387,24 +336,90 @@ private:
                 const T1 symbol,
                 const std::size_t new_lb,
                 const std::size_t new_rb) {
-        const std::size_t b = bucket_index(lb);
-        assert(b < table_.size());
+        const LookupKey key = make_key(lb, rb, offset, symbol);
+        maybe_resize();
 
-        table_[b].emplace_back(
-            make_key(lb, rb, offset, symbol),
-            Interval{new_lb, new_rb}
-        );
+        std::size_t pos = start_slot(key);
 
-        ++entries_;
-    }
+        for (std::size_t probe = 0; probe < table_.size(); ++probe) {
+            Slot& slot = table_[pos];
 
-    std::size_t max_bucket_size() const {
-        std::size_t m = 0;
+            if (!slot.occupied) {
+                slot.occupied = true;
+                slot.key = key;
+                slot.interval = Interval{new_lb, new_rb};
+                ++entries_;
+                return;
+            }
 
-        for (const auto& bucket : table_) {
-            m = std::max(m, bucket.size());
+            if (slot.key == key) {
+                slot.interval = Interval{new_lb, new_rb};
+                return;
+            }
+
+            pos = (pos + 1 == table_.size()) ? 0 : pos + 1;
         }
 
-        return m;
+        throw std::runtime_error("RLZLPParser: linear probing table is full after resize");
+    }
+
+    void maybe_resize() {
+        if (table_.empty()) {
+            table_.assign(1, Slot{});
+            return;
+        }
+
+        const double next_load =
+            static_cast<double>(entries_ + 1) / static_cast<double>(table_.size());
+
+        if (next_load <= max_load_factor_) {
+            return;
+        }
+
+        std::vector<Slot> old_table = std::move(table_);
+        table_.assign(old_table.size() * 2, Slot{});
+        entries_ = 0;
+
+        for (const Slot& slot : old_table) {
+            if (slot.occupied) {
+                reinsert(slot.key, slot.interval);
+            }
+        }
+    }
+
+    void reinsert(const LookupKey& key, const Interval& interval) {
+        std::size_t pos = start_slot(key);
+
+        for (std::size_t probe = 0; probe < table_.size(); ++probe) {
+            Slot& slot = table_[pos];
+
+            if (!slot.occupied) {
+                slot.occupied = true;
+                slot.key = key;
+                slot.interval = interval;
+                ++entries_;
+                return;
+            }
+
+            pos = (pos + 1 == table_.size()) ? 0 : pos + 1;
+        }
+
+        throw std::runtime_error("RLZLPParser: reinsert failed during resize");
+    }
+
+    std::size_t max_probe_cluster() const {
+        std::size_t best = 0;
+        std::size_t run = 0;
+
+        for (const Slot& slot : table_) {
+            if (slot.occupied) {
+                ++run;
+                best = std::max(best, run);
+            } else {
+                run = 0;
+            }
+        }
+
+        return best;
     }
 };
