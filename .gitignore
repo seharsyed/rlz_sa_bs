@@ -1,2 +1,15 @@
 build/
 notes.txt
+
+# experiment outputs
+*.csv
+*.zip
+*.xlsx
+
+# build artefacts
+*.o
+*.out
+*.a
+*.so
+parser/compare_rlz_cache
+parser/rlz_lp

@@ -28,7 +28,6 @@ public:
         std::size_t misses = 0;
         std::size_t current_size = 0;
         std::size_t table_slots = 0;
-        std::size_t max_probe_cluster = 0;
         double hit_rate = 0.0;
         double load_factor = 0.0;
         std::size_t approx_bytes = 0;
@@ -239,7 +238,6 @@ public:
         info.misses = misses_;
         info.current_size = entries_;
         info.table_slots = table_.size();
-        info.max_probe_cluster = max_probe_cluster();
 
         const std::size_t total = hits_ + misses_;
         info.hit_rate = total == 0
@@ -274,20 +272,11 @@ private:
         }
     }
 
-    static std::size_t mix_hash(std::size_t x) noexcept {
-        x += static_cast<std::size_t>(0x9e3779b97f4a7c15ull);
-        x = (x ^ (x >> 30)) * static_cast<std::size_t>(0xbf58476d1ce4e5b9ull);
-        x = (x ^ (x >> 27)) * static_cast<std::size_t>(0x94d049bb133111ebull);
-        return x ^ (x >> 31);
-    }
-
     std::size_t key_hash(const LookupKey& key) const noexcept {
-        std::size_t h = mix_hash(key.lb / div_p_);
-        h ^= mix_hash(key.lb + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (h << 6) + (h >> 2));
-        h ^= mix_hash(key.rb + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (h << 6) + (h >> 2));
-        h ^= mix_hash(key.offset + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (h << 6) + (h >> 2));
-        h ^= mix_hash(static_cast<std::size_t>(key.symbol) + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (h << 6) + (h >> 2));
-        return h;
+        return key.lb ^
+               (key.rb << 1) ^
+               (key.offset << 2) ^
+               (static_cast<std::size_t>(key.symbol) << 3);
     }
 
     std::size_t start_slot(const LookupKey& key) const {
@@ -407,19 +396,4 @@ private:
         throw std::runtime_error("RLZLPParser: reinsert failed during resize");
     }
 
-    std::size_t max_probe_cluster() const {
-        std::size_t best = 0;
-        std::size_t run = 0;
-
-        for (const Slot& slot : table_) {
-            if (slot.occupied) {
-                ++run;
-                best = std::max(best, run);
-            } else {
-                run = 0;
-            }
-        }
-
-        return best;
-    }
 };

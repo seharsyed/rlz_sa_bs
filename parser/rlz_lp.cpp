@@ -348,8 +348,6 @@ int main(int argc, char** argv) {
         std::cout << "summary,final_load_factor,"
                   << std::fixed << std::setprecision(6)
                   << final_info.load_factor << "\n";
-        std::cout << "summary,max_probe_cluster,"
-                  << final_info.max_probe_cluster << "\n";
         std::cout << "summary,final_cache_MB,"
                   << std::fixed << std::setprecision(3)
                   << final_info.approx_bytes / (1024.0 * 1024.0) << "\n";
