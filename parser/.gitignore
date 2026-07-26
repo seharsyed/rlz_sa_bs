@@ -1,6 +1,10 @@
 # Suffix array files
 *.sa
 
+# Shell and patch files
+*.sh
+*.patch
+
 # Object / compiled files
 *.o
 *.obj

@@ -3,7 +3,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
@@ -16,10 +15,8 @@ public:
     using input_type = std::vector<T1>;
     using reference_type = std::vector<T1>;
     using suffix_array_type = std::vector<T2>;
-
     using factor_type = std::tuple<std::size_t, std::size_t>;
-    using phrase_type =
-        std::tuple<std::size_t, std::size_t, std::size_t>;
+    using phrase_type = std::tuple<std::size_t, std::size_t, std::size_t>;
     using phrase_vector_type = std::vector<phrase_type>;
 
     struct CacheInfo {
@@ -74,7 +71,7 @@ public:
     explicit RLZLPParser(
         const reference_type& ref,
         const suffix_array_type& sa,
-        std::size_t div_p = 64
+        const std::size_t div_p = 64
     )
         : ref_(&ref),
           sa_(&sa),
@@ -95,57 +92,6 @@ public:
         initialize_table();
     }
 
-    template <typename T>
-    static std::vector<T> read_file(const char* filename) {
-        return ::read_file<T>(filename);
-    }
-
-    std::optional<std::int64_t> binarySearchLB(
-        const reference_type& ref,
-        const suffix_array_type& sa,
-        const std::int64_t lo,
-        const std::int64_t hi,
-        const std::int64_t offset,
-        const T1 c
-    ) const {
-        return ::binarySearchLB<T1, T2>(
-            ref,
-            sa,
-            lo,
-            hi,
-            offset,
-            c
-        );
-    }
-
-    std::optional<std::int64_t> binarySearchRB(
-        const reference_type& ref,
-        const suffix_array_type& sa,
-        const std::int64_t lo,
-        const std::int64_t hi,
-        const std::int64_t offset,
-        const T1 c
-    ) const {
-        return ::binarySearchRB<T1, T2>(
-            ref,
-            sa,
-            lo,
-            hi,
-            offset,
-            c
-        );
-    }
-
-    factor_type computeLZFactorAt(
-        const input_type& input,
-        const reference_type& ref,
-        const suffix_array_type& sa,
-        const std::size_t input_pos
-    ) {
-        assert_bound_pair(ref, sa);
-        return computeLZFactorAt(input, input_pos);
-    }
-
     factor_type computeLZFactorAt(
         const input_type& input,
         const std::size_t input_pos
@@ -160,20 +106,19 @@ public:
         while (j < input.size()) {
             if (nlb == nrb) {
                 if ((*ref_)[
-                        static_cast<std::size_t>((*sa_)[nlb]) +
-                        offset
+                        static_cast<std::size_t>((*sa_)[nlb]) + offset
                     ] != input[j]) {
                     break;
                 }
             } else {
                 Interval cached_interval{};
-                const T1 c = input.at(j);
+                const T1 symbol = input.at(j);
 
                 if (lookup(
                         nlb,
                         nrb,
                         offset,
-                        c,
+                        symbol,
                         cached_interval
                     )) {
                     nlb = cached_interval.new_lb;
@@ -186,7 +131,7 @@ public:
                             static_cast<std::int64_t>(nlb),
                             static_cast<std::int64_t>(nrb),
                             static_cast<std::int64_t>(offset),
-                            c
+                            symbol
                         );
 
                     if (!opt_lb) {
@@ -203,7 +148,7 @@ public:
                             static_cast<std::int64_t>(new_lb),
                             static_cast<std::int64_t>(nrb),
                             static_cast<std::int64_t>(offset),
-                            c
+                            symbol
                         );
 
                     if (!opt_rb) {
@@ -213,15 +158,11 @@ public:
                     const std::size_t new_rb =
                         static_cast<std::size_t>(*opt_rb);
 
-                    if (new_lb > new_rb) {
-                        break;
-                    }
-
                     insert(
                         nlb,
                         nrb,
                         offset,
-                        c,
+                        symbol,
                         new_lb,
                         new_rb
                     );
@@ -231,23 +172,13 @@ public:
                 }
             }
 
-            match =
-                static_cast<std::size_t>((*sa_)[nlb]);
+            match = static_cast<std::size_t>((*sa_)[nlb]);
 
             ++j;
             ++offset;
         }
 
         return {match, offset};
-    }
-
-    phrase_vector_type lzFactorize(
-        const input_type& input,
-        const reference_type& ref,
-        const suffix_array_type& sa
-    ) {
-        assert_bound_pair(ref, sa);
-        return lzFactorize(input);
     }
 
     phrase_vector_type lzFactorize(
@@ -261,10 +192,9 @@ public:
                 computeLZFactorAt(input, i);
 
             if (len <= 1) {
-                pos =
-                    static_cast<std::size_t>(
-                        input.at(i)
-                    );
+                pos = static_cast<std::size_t>(
+                    input.at(i)
+                );
                 len = 1;
             }
 
@@ -280,8 +210,6 @@ public:
 
         hits_ = 0;
         misses_ = 0;
-        entries_ = 0;
-        table_full_ = false;
     }
 
     CacheInfo cache_info() const {
@@ -322,18 +250,6 @@ private:
         table_.assign(slots, Entry{});
         entries_ = 0;
         table_full_ = false;
-    }
-
-    void assert_bound_pair(
-        const reference_type& ref,
-        const suffix_array_type& sa
-    ) const {
-        if (&ref != ref_ || &sa != sa_) {
-            throw std::invalid_argument(
-                "RLZLPParser: this cache is bound to a "
-                "different reference/suffix-array pair"
-            );
-        }
     }
 
     bool lookup(
@@ -422,17 +338,11 @@ private:
                 };
 
                 ++entries_;
-                return;
-            }
 
-            if (entry.key.lb == lb &&
-                entry.key.rb == rb &&
-                entry.key.offset == offset &&
-                entry.key.symbol == symbol) {
-                entry.interval = Interval{
-                    new_lb,
-                    new_rb
-                };
+                if (entries_ == table_.size()) {
+                    table_full_ = true;
+                }
+
                 return;
             }
 
