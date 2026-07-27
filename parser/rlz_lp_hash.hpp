@@ -63,7 +63,7 @@ private:
     const reference_type* ref_ = nullptr;
     const suffix_array_type* sa_ = nullptr;
 
-    std::size_t p_ = 64;
+    std::size_t div_p_ = 64;
     std::vector<Slot> table_;
 
     std::size_t hits_ = 0;
@@ -71,24 +71,21 @@ private:
     std::size_t entries_ = 0;
 
     static constexpr double max_load_factor_ = 0.70;
-    static constexpr std::size_t hash_prime_ = 1000003u;
 
 public:
     explicit RLZLPParser(
         const reference_type& ref,
         const suffix_array_type& sa,
-        std::size_t p = 64
+        std::size_t div_p = 64
     ) : ref_(&ref),
         sa_(&sa),
-        p_(p == 0 ? 64 : p) {
+        div_p_(div_p == 0 ? 64 : div_p) {
         if (ref.empty()) {
             throw std::invalid_argument("RLZLPParser: reference is empty");
         }
-
         if (sa.empty()) {
             throw std::invalid_argument("RLZLPParser: suffix array is empty");
         }
-
         rebuild_table();
     }
 
@@ -165,8 +162,7 @@ public:
                         break;
                     }
 
-                    const std::size_t new_lb =
-                        static_cast<std::size_t>(*opt_lb);
+                    const std::size_t new_lb = static_cast<std::size_t>(*opt_lb);
 
                     const auto opt_rb = ::binarySearchRB<T1, T2>(
                         *ref_, *sa_,
@@ -180,21 +176,13 @@ public:
                         break;
                     }
 
-                    const std::size_t new_rb =
-                        static_cast<std::size_t>(*opt_rb);
+                    const std::size_t new_rb = static_cast<std::size_t>(*opt_rb);
 
                     if (new_lb > new_rb) {
                         break;
                     }
 
-                    insert(
-                        nlb,
-                        nrb,
-                        offset,
-                        c,
-                        new_lb,
-                        new_rb
-                    );
+                    insert(nlb, nrb, offset, c, new_lb, new_rb);
 
                     nlb = new_lb;
                     nrb = new_rb;
@@ -254,16 +242,13 @@ public:
         info.max_probe_cluster = max_probe_cluster();
 
         const std::size_t total = hits_ + misses_;
-
         info.hit_rate = total == 0
             ? 0.0
-            : static_cast<double>(hits_) /
-              static_cast<double>(total);
+            : static_cast<double>(hits_) / static_cast<double>(total);
 
         info.load_factor = table_.empty()
             ? 0.0
-            : static_cast<double>(entries_) /
-              static_cast<double>(table_.size());
+            : static_cast<double>(entries_) / static_cast<double>(table_.size());
 
         info.approx_bytes = table_.size() * sizeof(Slot);
 
@@ -274,16 +259,14 @@ private:
     void rebuild_table() {
         const std::size_t slots = std::max<std::size_t>(
             1,
-            sa_->size() / p_
+            sa_->size() / div_p_
         );
 
         table_.assign(slots, Slot{});
     }
 
-    void assert_bound_pair(
-        const reference_type& ref,
-        const suffix_array_type& sa
-    ) const {
+    void assert_bound_pair(const reference_type& ref,
+                           const suffix_array_type& sa) const {
         if (&ref != ref_ || &sa != sa_) {
             throw std::invalid_argument(
                 "RLZLPParser: this cache is bound to a different reference/suffix-array pair"
@@ -291,46 +274,40 @@ private:
         }
     }
 
-    // Polynomial hash over the complete cache key.
-    std::size_t key_hash(const LookupKey& key) const noexcept {
-        std::size_t h = key.lb;
-        h = h * hash_prime_ + key.rb;
-        h = h * hash_prime_ + key.offset;
-        h = h * hash_prime_ +
-            static_cast<std::size_t>(key.symbol);
-        return h;
-    }
+std::size_t key_hash(const LookupKey& key) const noexcept {
+    std::size_t h = key.lb;
+    h = h * 1000003u + key.rb;
+    h = h * 1000003u + key.offset;
+    h = h * 1000003u + static_cast<std::size_t>(key.symbol);
+    return h;
+}
 
     std::size_t start_slot(const LookupKey& key) const {
         return key_hash(key) % table_.size();
     }
+    
+/*
+std::size_t start_slot(const LookupKey& key) const {
+    return (key.lb / div_p_) % table_.size();
+}
+*/
 
-    LookupKey make_key(
-        const std::size_t lb,
-        const std::size_t rb,
-        const std::size_t offset,
-        const T1 symbol
-    ) const {
+    LookupKey make_key(const std::size_t lb,
+                       const std::size_t rb,
+                       const std::size_t offset,
+                       const T1 symbol) const {
         return LookupKey{lb, rb, offset, symbol};
     }
 
-    bool lookup(
-        const std::size_t lb,
-        const std::size_t rb,
-        const std::size_t offset,
-        const T1 symbol,
-        Interval& cached_interval
-    ) {
-        const LookupKey key =
-            make_key(lb, rb, offset, symbol);
-
+    bool lookup(const std::size_t lb,
+                const std::size_t rb,
+                const std::size_t offset,
+                const T1 symbol,
+                Interval& cached_interval) {
+        const LookupKey key = make_key(lb, rb, offset, symbol);
         std::size_t pos = start_slot(key);
 
-        for (
-            std::size_t probe = 0;
-            probe < table_.size();
-            ++probe
-        ) {
+        for (std::size_t probe = 0; probe < table_.size(); ++probe) {
             const Slot& slot = table_[pos];
 
             if (!slot.occupied) {
@@ -344,69 +321,46 @@ private:
                 return true;
             }
 
-            pos =
-                (pos + 1 == table_.size())
-                    ? 0
-                    : pos + 1;
+            pos = (pos + 1 == table_.size()) ? 0 : pos + 1;
         }
 
         ++misses_;
         return false;
     }
 
-    void insert(
-        const std::size_t lb,
-        const std::size_t rb,
-        const std::size_t offset,
-        const T1 symbol,
-        const std::size_t new_lb,
-        const std::size_t new_rb
-    ) {
-        const LookupKey key =
-            make_key(lb, rb, offset, symbol);
-
+    void insert(const std::size_t lb,
+                const std::size_t rb,
+                const std::size_t offset,
+                const T1 symbol,
+                const std::size_t new_lb,
+                const std::size_t new_rb) {
+        const LookupKey key = make_key(lb, rb, offset, symbol);
         resize_table();
 
         std::size_t pos = start_slot(key);
 
-        for (
-            std::size_t probe = 0;
-            probe < table_.size();
-            ++probe
-        ) {
+        for (std::size_t probe = 0; probe < table_.size(); ++probe) {
             Slot& slot = table_[pos];
 
             if (!slot.occupied) {
                 slot.occupied = true;
                 slot.key = key;
-                slot.interval = Interval{
-                    new_lb,
-                    new_rb
-                };
+                slot.interval = Interval{new_lb, new_rb};
                 ++entries_;
                 return;
             }
 
             if (slot.key == key) {
-                slot.interval = Interval{
-                    new_lb,
-                    new_rb
-                };
+                slot.interval = Interval{new_lb, new_rb};
                 return;
             }
 
-            pos =
-                (pos + 1 == table_.size())
-                    ? 0
-                    : pos + 1;
+            pos = (pos + 1 == table_.size()) ? 0 : pos + 1;
         }
 
-        throw std::runtime_error(
-            "RLZLPParser: linear probing table is full after resize"
-        );
+        throw std::runtime_error("RLZLPParser: linear probing table is full after resize");
     }
 
-    // Keep the load factor at or below 70%.
     void resize_table() {
         if (table_.empty()) {
             table_.assign(1, Slot{});
@@ -414,44 +368,27 @@ private:
         }
 
         const double next_load =
-            static_cast<double>(entries_ + 1) /
-            static_cast<double>(table_.size());
+            static_cast<double>(entries_ + 1) / static_cast<double>(table_.size());
 
         if (next_load <= max_load_factor_) {
             return;
         }
 
-        std::vector<Slot> old_table =
-            std::move(table_);
-
-        table_.assign(
-            old_table.size() * 2,
-            Slot{}
-        );
-
+        std::vector<Slot> old_table = std::move(table_);
+        table_.assign(old_table.size() * 2, Slot{});
         entries_ = 0;
 
         for (const Slot& slot : old_table) {
             if (slot.occupied) {
-                reinsert(
-                    slot.key,
-                    slot.interval
-                );
+                reinsert(slot.key, slot.interval);
             }
         }
     }
 
-    void reinsert(
-        const LookupKey& key,
-        const Interval& interval
-    ) {
+    void reinsert(const LookupKey& key, const Interval& interval) {
         std::size_t pos = start_slot(key);
 
-        for (
-            std::size_t probe = 0;
-            probe < table_.size();
-            ++probe
-        ) {
+        for (std::size_t probe = 0; probe < table_.size(); ++probe) {
             Slot& slot = table_[pos];
 
             if (!slot.occupied) {
@@ -462,53 +399,18 @@ private:
                 return;
             }
 
-            pos =
-                (pos + 1 == table_.size())
-                    ? 0
-                    : pos + 1;
+            pos = (pos + 1 == table_.size()) ? 0 : pos + 1;
         }
 
-        throw std::runtime_error(
-            "RLZLPParser: reinsert failed during resize"
-        );
+        throw std::runtime_error("RLZLPParser: reinsert failed during resize");
     }
 
     std::size_t max_probe_cluster() const {
-        if (table_.empty()) {
-            return 0;
-        }
-
-        // Start after an empty slot so a wrapped cluster is counted once.
-        std::size_t first_empty = table_.size();
-
-        for (
-            std::size_t i = 0;
-            i < table_.size();
-            ++i
-        ) {
-            if (!table_[i].occupied) {
-                first_empty = i;
-                break;
-            }
-        }
-
-        if (first_empty == table_.size()) {
-            return table_.size();
-        }
-
         std::size_t best = 0;
         std::size_t run = 0;
 
-        for (
-            std::size_t step = 1;
-            step <= table_.size();
-            ++step
-        ) {
-            const std::size_t pos =
-                (first_empty + step) %
-                table_.size();
-
-            if (table_[pos].occupied) {
+        for (const Slot& slot : table_) {
+            if (slot.occupied) {
                 ++run;
                 best = std::max(best, run);
             } else {

@@ -2,23 +2,27 @@
 #include "rlz_lp.hpp"
 
 int main(int argc, char** argv) {
-    // Read the command-line options.
     const Args args = parse_args(argc, argv);
-
-    // Load the input list, reference, and suffix array.
     const LoadedData data = load_data(args);
 
-    // Create the linear-probing RLZ parser.
-    RLZLPParser<Symbol, SAType> parser(data.ref, data.sa, args.div_p);
+    RLZLPParser<Symbol, SAType> parser(
+        data.ref,
+        data.sa,
+        args.p
+    );
 
-    // Run RLZ on all input files and collect the results.
-    const RunResults results = run_rlz(data, parser);
+    print_parser_ready(parser.cache_info());
 
-    // Print the run details and per-file results.
-    print_results(args, data, results);
+    print_run_details(args, data);
+    print_result_header();
 
-    // Print the final timing and cache summary.
-    print_lp_summary(results, parser.cache_info());
+    const RunResults results =
+        run_rlz(data, parser);
+
+    print_lp_summary(
+        results,
+        parser.cache_info()
+    );
 
     return 0;
 }
