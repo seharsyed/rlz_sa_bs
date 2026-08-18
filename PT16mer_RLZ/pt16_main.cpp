@@ -95,23 +95,29 @@ int main(int argc, char** argv) {
 
         // ---------- PT16 preprocessing ----------
 
-        std::cerr << std::endl;
-        std::cerr << "========================================" << std::endl;
-        std::cerr << "[6] PT16 TABLE" << std::endl;
-        std::cerr << "========================================" << std::endl;
+std::cerr << std::endl;
+std::cerr << "========================================" << std::endl;
+std::cerr << "[6] PT16 TABLE" << std::endl;
+std::cerr << "========================================" << std::endl;
 
-        if (!pt16_table_exists(pt16_path)) {
-            std::cerr << "PT16 table not found." << std::endl;
-            std::cerr << "Building H, L and interval starts..." << std::endl;
+double pt16_build_ms = 0.0;
 
-            build_pt16_table(reference, suffix_array, pt16_path);
+// Always rebuild the PT16 table for the current experiment.
+if (fs::exists(pt16_path)) {
+    std::cerr << "Removing existing PT16 table..." << std::endl;
+    fs::remove(pt16_path);
+}
 
-            std::cerr << "PT16 table built." << std::endl;
-            std::cerr << "Table: " << pt16_path << std::endl;
-        } else {
-            std::cerr << "Using existing PT16 table." << std::endl;
-            std::cerr << "Table: " << pt16_path << std::endl;
-        }
+std::cerr << "Building H, L and interval starts..." << std::endl;
+
+pt16_build_ms = time_ms([&] {
+    build_pt16_table(reference, suffix_array, pt16_path);
+});
+
+std::cerr << "PT16 table built." << std::endl;
+std::cerr << "PT16 build time: " << pt16_build_ms << " ms" << std::endl;
+std::cerr << "PT16 build time: " << pt16_build_ms / 1000.0 << " s" << std::endl;
+std::cerr << "Table: " << pt16_path << std::endl;
 
         // ---------- Load PT16 ----------
 
@@ -209,6 +215,7 @@ int main(int argc, char** argv) {
             total_pt16_phrases,
             total_baseline_ms,
             total_pt16_ms,
+            pt16_build_ms,
             all_equal
         };
 
@@ -223,6 +230,19 @@ int main(int argc, char** argv) {
             ? 0.0
             : static_cast<double>(parser.stats().hits) / static_cast<double>(total_queries);
 
+
+
+
+            const std::size_t total_hit_types =
+            parser.stats().singleton_hits + parser.stats().range_hits;
+
+            const double singleton_hit_rate =
+            total_hit_types == 0
+            ? 0.0
+            : static_cast<double>(parser.stats().singleton_hits) /
+            static_cast<double>(total_hit_types);
+
+
         std::cout << "results=" << args.results << std::endl;
         std::cout << "total_baseline_ms=" << total_baseline_ms << std::endl;
         std::cout << "total_pt16_ms=" << total_pt16_ms << std::endl;
@@ -231,6 +251,12 @@ int main(int argc, char** argv) {
         std::cout << "pt16_misses=" << parser.stats().misses << std::endl;
         std::cout << "pt16_hit_rate=" << total_hit_rate << std::endl;
         std::cout << "pt16_entries=" << parser.stats().entries << std::endl;
+        std::cout << "singleton_hits=" << parser.stats().singleton_hits << std::endl;
+        std::cout << "range_hits=" << parser.stats().range_hits << std::endl;
+        std::cout << "singleton_hit_rate=" << singleton_hit_rate << std::endl;
+        std::cout << "pt16_build_ms=" << pt16_build_ms << std::endl;
+
+
         std::cout << "pt16_MB="
                   << static_cast<double>(parser.stats().approx_bytes) / (1024.0 * 1024.0)
                   << std::endl;

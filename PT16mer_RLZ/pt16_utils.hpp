@@ -128,11 +128,10 @@ inline std::string get_pt16_path(const Args& args) {
         return args.pt16_table;
     }
 
-    return args.reference + ".pt16_hl.bin";
-}
+    const fs::path reference_path(args.reference);
+    const std::string dataset = reference_path.parent_path().filename().string();
 
-inline bool pt16_table_exists(const std::string& path) {
-    return fs::exists(path);
+    return (reference_path.parent_path() / (dataset + "_pt16_hl.bin")).string();
 }
 
 
@@ -229,13 +228,18 @@ inline bool factor_file_equals(const std::string& path, const Triples& factors) 
 struct PT16Delta {
     std::size_t hits;
     std::size_t misses;
+    std::size_t singleton_hits;
+    std::size_t range_hits;
 };
+
 
 template <typename Stats>
 inline PT16Delta stats_difference(const Stats& previous, const Stats& current) {
     return {
         current.hits - previous.hits,
-        current.misses - previous.misses
+        current.misses - previous.misses,
+        current.singleton_hits - previous.singleton_hits,
+        current.range_hits - previous.range_hits
     };
 }
 
@@ -249,6 +253,7 @@ struct BenchmarkSummary {
     std::size_t total_pt16_phrases;
     double total_baseline_ms;
     double total_pt16_ms;
+    double pt16_build_ms;
     bool all_equal;
 };
 
@@ -262,13 +267,19 @@ public:
             throw std::runtime_error("cannot create results file: " + path);
         }
 
-        output << "file,input_bytes,baseline_ms,pt16_ms,speedup,baseline_phrases,pt16_phrases,outputs_equal,pt16_hits,pt16_misses,pt16_hit_rate,pt16_entries,pt16_MB,peak_RSS_MB\n";
+        //output << "file,input_bytes,baseline_ms,pt16_ms,speedup,baseline_phrases,pt16_phrases,outputs_equal,pt16_hits,pt16_misses,pt16_hit_rate,pt16_entries,pt16_MB,peak_RSS_MB\n";
+    
+        output << "file,input_bytes,baseline_ms,pt16_ms,speedup,baseline_phrases,pt16_phrases,outputs_equal,pt16_hits,pt16_misses,pt16_hit_rate,singleton_hits,range_hits,singleton_hit_rate,pt16_entries,pt16_MB,peak_RSS_MB\n";
+    
     }
 
     void write_row(const BaselineResult& baseline, double pt16_ms, std::size_t pt16_phrases, bool equal, const PT16Delta& stats, std::size_t entries, std::size_t approx_bytes) {
         const std::size_t queries = stats.hits + stats.misses;
         const double hit_rate = queries == 0 ? 0.0 : static_cast<double>(stats.hits) / static_cast<double>(queries);
         const double speedup = pt16_ms == 0.0 ? 0.0 : baseline.baseline_ms / pt16_ms;
+        const std::size_t hit_types = stats.singleton_hits + stats.range_hits;
+        const double singleton_hit_rate = hit_types == 0 ? 0.0 : static_cast<double>(stats.singleton_hits) / static_cast<double>(hit_types);
+
 
         output << baseline.filename << ','
                << baseline.input_bytes << ','
@@ -283,6 +294,9 @@ public:
                << stats.misses << ','
                << std::setprecision(6)
                << hit_rate << ','
+               << stats.singleton_hits << ','
+                << stats.range_hits << ','
+                << singleton_hit_rate << ','
                << entries << ','
                << std::setprecision(3)
                << static_cast<double>(approx_bytes) / (1024.0 * 1024.0) << ','
@@ -294,7 +308,9 @@ public:
     template <typename Stats>
     void write_summary(const BenchmarkSummary& summary, const Stats& stats) {
         const double speedup = summary.total_pt16_ms == 0.0 ? 0.0 : summary.total_baseline_ms / summary.total_pt16_ms;
-
+        const std::size_t hit_types = stats.singleton_hits + stats.range_hits;
+        const double singleton_hit_rate = hit_types == 0 ? 0.0 : static_cast<double>(stats.singleton_hits) / static_cast<double>(hit_types);
+        
         output << "summary,processed_files," << summary.processed_files << '\n';
         output << "summary,total_input_bytes," << summary.total_input_bytes << '\n';
         output << "summary,total_baseline_phrases," << summary.total_baseline_phrases << '\n';
@@ -308,6 +324,10 @@ public:
         output << "summary,pt16_entries," << stats.entries << '\n';
         output << "summary,pt16_MB," << std::setprecision(3) << static_cast<double>(stats.approx_bytes) / (1024.0 * 1024.0) << '\n';
         output << "summary,peak_RSS_MB," << std::setprecision(2) << peak_rss_mb() << '\n';
+        output << "summary,total_singleton_hits," << stats.singleton_hits << '\n';
+        output << "summary,total_range_hits," << stats.range_hits << '\n';
+        output << "summary,singleton_hit_rate," << std::setprecision(6) << singleton_hit_rate << '\n';
+        output << "summary,pt16_build_ms," << summary.pt16_build_ms << '\n';
     }
 
 private:

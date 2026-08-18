@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -52,17 +51,11 @@ private:
 
     std::array<std::uint8_t, 256> alphatab_{};
 
-
-    // ---------- PT16 H/L representation ----------
-
     std::vector<std::uint32_t> H_;
     std::vector<std::uint16_t> L_;
-
-    // Only the SA starting position of each PT16 interval is stored.
     std::vector<std::uint32_t> interval_starts_;
 
     mutable Stats stats_;
-
 
 public:
     PT16RLZParser(
@@ -75,14 +68,12 @@ public:
     }
 
 
-    // ---------- RLZ factor at one phrase start ----------
-
     factor_type computeLZFactorAt(
         const input_type& input,
         const std::size_t input_pos,
         const std::vector<LookupResult>& lookup_results
     ) {
-        // Fewer than 16 characters remain: use ordinary RLZ.
+        // Fewer than 16 characters remain, so use ordinary RLZ.
         if (input.size() - input_pos < kmer_length) {
             return ::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
         }
@@ -90,13 +81,11 @@ public:
         // Use the PT16 result already computed during pre-bucketing.
         const LookupResult& result = lookup_results[input_pos];
 
-        // PT16 miss: count the phrase-start miss and use ordinary RLZ.
         if (!result.found) {
             ++stats_.misses;
             return ::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
         }
 
-        // Count PT16 hits only when the position is an actual RLZ phrase start.
         ++stats_.hits;
 
         if (result.sa_start == result.sa_end) {
@@ -110,9 +99,16 @@ public:
         std::size_t nlb = result.sa_start;
         std::size_t nrb = result.sa_end;
 
-        // Range case: narrow the SA interval from character 17 onward.
+        // Range intervals are narrowed from character 17 onward.
         while (nlb < nrb && j < input.size()) {
-            const auto lb = ::binarySearchLB<T1, T2>(*ref_, *sa_, nlb, nrb, offset, input[j]);
+            const auto lb = ::binarySearchLB<T1, T2>(
+                *ref_,
+                *sa_,
+                nlb,
+                nrb,
+                offset,
+                input[j]
+            );
 
             if (!lb) {
                 break;
@@ -140,7 +136,7 @@ public:
 
         std::size_t match = static_cast<std::size_t>((*sa_)[nlb]);
 
-        // Singleton case: extend directly from character 17 onward.
+        // A singleton interval is extended by direct comparison.
         if (nlb == nrb) {
             while (
                 j < input.size() &&
@@ -156,40 +152,33 @@ public:
     }
 
 
-    // ---------- RLZ factorization with pre-bucketing ----------
-
     phrase_vector_type lzFactorize(const input_type& input) {
-
-        // Group every valid position of S by the upper 16 bits
-        // of its packed 16-mer.
+        // Group positions of S by the upper 16 bits of their packed 16-mer.
         std::array<std::vector<std::size_t>, number_of_buckets> position_buckets;
+
+        // Keep the packed key so the 16-mer is not packed again during
+        // the grouped PT16 access.
+        std::vector<std::uint32_t> keys(input.size());
 
         for (std::size_t i = 0; i + kmer_length <= input.size(); ++i) {
             const std::uint32_t key = pack_16mer(input, i);
             const std::uint32_t bucket = key >> low_bits;
 
+            keys[i] = key;
             position_buckets[bucket].push_back(i);
         }
-
-
-        // ---------- Grouped PT16 accesses ----------
 
         // Store the PT16 result for every valid position of S.
         std::vector<LookupResult> lookup_results(input.size());
 
-        // Positions using the same H/L region are processed together.
+        // Process positions belonging to the same H/L bucket together.
         for (std::uint32_t bucket = 0; bucket < number_of_buckets; ++bucket) {
-            for (const std::size_t position : position_buckets[bucket]) {
-                const std::uint32_t key = pack_16mer(input, position);
-                lookup_results[position] = prebucketing_s(key);
+            for (const std::size_t i : position_buckets[bucket]) {
+                lookup_results[i] = prebucketing_s(keys[i]);
             }
         }
 
-
-        // ---------- Greedy RLZ parsing ----------
-
-        // Parsing remains left-to-right; the precomputed PT16 result is
-        // used only when the corresponding position becomes a phrase start.
+        // Greedy RLZ parsing remains left-to-right.
         phrase_vector_type spl_vec;
         std::size_t i = 0;
 
@@ -215,18 +204,13 @@ public:
 
 
 private:
-
-    // ---------- Build alphatab once ----------
-
     void initialise_alphatab() {
-        alphatab_[static_cast<unsigned char>('A')] = 0; // 00
-        alphatab_[static_cast<unsigned char>('C')] = 1; // 01
-        alphatab_[static_cast<unsigned char>('G')] = 2; // 10
-        alphatab_[static_cast<unsigned char>('T')] = 3; // 11
+        alphatab_[static_cast<unsigned char>('A')] = 0;
+        alphatab_[static_cast<unsigned char>('C')] = 1;
+        alphatab_[static_cast<unsigned char>('G')] = 2;
+        alphatab_[static_cast<unsigned char>('T')] = 3;
     }
 
-
-    // ---------- Read PT16 H/L table ----------
 
     template <typename T>
     static void read_value(std::ifstream& input, T& value) {
@@ -248,9 +232,18 @@ private:
         char magic[8]{};
         input.read(magic, sizeof(magic));
 
-        const char expected_magic[8] = {'P', 'T', '1', '6', 'H', 'L', '0', '1'};
+        const char expected_magic[8] = {
+            'P', 'T', '1', '6', 'H', 'L', '0', '1'
+        };
 
-        if (!input || std::memcmp(magic, expected_magic, sizeof(magic)) != 0) {
+        if (
+            !input ||
+            std::memcmp(
+                magic,
+                expected_magic,
+                sizeof(magic)
+            ) != 0
+        ) {
             throw std::runtime_error("Invalid PT16 H/L table");
         }
 
@@ -263,25 +256,36 @@ private:
 
         input.read(
             reinterpret_cast<char*>(H_.data()),
-            static_cast<std::streamsize>(H_.size() * sizeof(std::uint32_t))
+            static_cast<std::streamsize>(
+                H_.size() * sizeof(std::uint32_t)
+            )
         );
 
         input.read(
             reinterpret_cast<char*>(L_.data()),
-            static_cast<std::streamsize>(L_.size() * sizeof(std::uint16_t))
+            static_cast<std::streamsize>(
+                L_.size() * sizeof(std::uint16_t)
+            )
         );
 
         input.read(
             reinterpret_cast<char*>(interval_starts_.data()),
-            static_cast<std::streamsize>(interval_starts_.size() * sizeof(std::uint32_t))
+            static_cast<std::streamsize>(
+                interval_starts_.size() *
+                sizeof(std::uint32_t)
+            )
         );
 
         if (!input) {
-            throw std::runtime_error("Failed while loading PT16 H/L table");
+            throw std::runtime_error(
+                "Failed while loading PT16 H/L table"
+            );
         }
 
         if (H_.back() != L_.size()) {
-            throw std::runtime_error("PT16 H directory does not end at m");
+            throw std::runtime_error(
+                "PT16 H directory does not end at m"
+            );
         }
 
         stats_.entries = L_.size();
@@ -289,17 +293,29 @@ private:
         stats_.approx_bytes =
             H_.size() * sizeof(std::uint32_t) +
             L_.size() * sizeof(std::uint16_t) +
-            interval_starts_.size() * sizeof(std::uint32_t);
+            interval_starts_.size() *
+                sizeof(std::uint32_t);
     }
 
 
-    // ---------- Pack one 16-mer ----------
-
-    std::uint32_t pack_16mer(const input_type& input, const std::size_t position) const {
+    std::uint32_t pack_16mer(
+        const input_type& input,
+        const std::size_t position
+    ) const {
         std::uint32_t key = 0;
 
-        for (std::uint32_t j = 0; j < kmer_length; ++j) {
-            const std::uint8_t code = alphatab_[static_cast<unsigned char>(input[position + j])];
+        for (
+            std::uint32_t j = 0;
+            j < kmer_length;
+            ++j
+        ) {
+            const std::uint8_t code =
+                alphatab_[
+                    static_cast<unsigned char>(
+                        input[position + j]
+                    )
+                ];
+
             key = (key << 2U) | code;
         }
 
@@ -307,24 +323,25 @@ private:
     }
 
 
-    // ---------- Recover inclusive SA interval end ----------
-
-    std::uint32_t interval_end(const std::size_t position) const {
+    std::uint32_t interval_end(
+        const std::size_t position
+    ) const {
         std::size_t sa_end;
 
         if (position + 1 < interval_starts_.size()) {
-            sa_end = static_cast<std::size_t>(interval_starts_[position + 1]) - 1;
+            sa_end =
+                static_cast<std::size_t>(
+                    interval_starts_[position + 1]
+                ) - 1;
         } else {
             sa_end = sa_->size() - 1;
         }
 
-        /*
-        build_entries() skips suffixes shorter than 16. Such suffixes can
-        occur between two valid PT16 intervals, so remove them from the
-        calculated end of the current interval.
-        */
+        // Suffixes shorter than 16 are not PT16 entries.
         while (
-            static_cast<std::size_t>((*sa_)[sa_end]) + kmer_length >
+            static_cast<std::size_t>(
+                (*sa_)[sa_end]
+            ) + kmer_length >
             ref_->size()
         ) {
             --sa_end;
@@ -334,28 +351,54 @@ private:
     }
 
 
-    // ---------- Existing PT16 lookup ----------
+    // Existing PT16 lookup used by the original parser.
+    LookupResult lookup(
+        const std::uint32_t key
+    ) const {
+        const std::uint32_t bucket =
+            key >> low_bits;
 
-    LookupResult lookup(const std::uint32_t key) const {
-        const std::uint32_t bucket = key >> low_bits;
-        const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
+        const std::uint16_t low =
+            static_cast<std::uint16_t>(
+                key & low_mask
+            );
 
-        const std::uint32_t begin = H_[bucket];
-        const std::uint32_t end = H_[bucket + 1];
+        const std::uint32_t begin =
+            H_[bucket];
+
+        const std::uint32_t end =
+            H_[bucket + 1];
 
         if (begin == end) {
             ++stats_.misses;
             return {};
         }
 
-        for (std::uint32_t position = begin; position < end; ++position) {
+        for (
+            std::uint32_t position = begin;
+            position < end;
+            ++position
+        ) {
             if (L_[position] == low) {
                 ++stats_.hits;
 
-                const std::uint32_t sa_start = interval_starts_[position];
-                const std::uint32_t sa_end = interval_end(position);
+                const std::uint32_t sa_start =
+                    interval_starts_[position];
 
-                return {true, sa_start, sa_end};
+                const std::uint32_t sa_end =
+                    interval_end(position);
+
+                if (sa_start == sa_end) {
+                    ++stats_.singleton_hits;
+                } else {
+                    ++stats_.range_hits;
+                }
+
+                return {
+                    true,
+                    sa_start,
+                    sa_end
+                };
             }
         }
 
@@ -364,31 +407,46 @@ private:
     }
 
 
-    // ---------- Pre-bucketing PT16 access ----------
+    // PT16 search used while pre-bucketing S.
+    // Statistics are counted later only at actual RLZ phrase starts.
+    LookupResult prebucketing_s(
+        const std::uint32_t key
+    ) const {
+        const std::uint32_t bucket =
+            key >> low_bits;
 
-    /*
-    Performs the same H/L search as lookup(), but does not update the
-    hit/miss counters because it is called for every valid position of S.
-    Statistics are recorded later only when a position becomes an RLZ
-    phrase start.
-    */
-    LookupResult prebucketing_s(const std::uint32_t key) const {
-        const std::uint32_t bucket = key >> low_bits;
-        const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
+        const std::uint16_t low =
+            static_cast<std::uint16_t>(
+                key & low_mask
+            );
 
-        const std::uint32_t begin = H_[bucket];
-        const std::uint32_t end = H_[bucket + 1];
+        const std::uint32_t begin =
+            H_[bucket];
+
+        const std::uint32_t end =
+            H_[bucket + 1];
 
         if (begin == end) {
             return {};
         }
 
-        for (std::uint32_t position = begin; position < end; ++position) {
+        for (
+            std::uint32_t position = begin;
+            position < end;
+            ++position
+        ) {
             if (L_[position] == low) {
-                const std::uint32_t sa_start = interval_starts_[position];
-                const std::uint32_t sa_end = interval_end(position);
+                const std::uint32_t sa_start =
+                    interval_starts_[position];
 
-                return {true, sa_start, sa_end};
+                const std::uint32_t sa_end =
+                    interval_end(position);
+
+                return {
+                    true,
+                    sa_start,
+                    sa_end
+                };
             }
         }
 
