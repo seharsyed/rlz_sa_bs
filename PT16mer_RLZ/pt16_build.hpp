@@ -7,13 +7,16 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <bit>
+
 
 constexpr std::uint32_t KMER_LENGTH = 16;
 constexpr std::uint32_t BUCKET_SIZE = 65536;
 constexpr std::uint32_t LOW_BITS = 16;
 constexpr std::uint32_t LOW_MASK = BUCKET_SIZE - 1;
 constexpr std::uint32_t NUMBER_OF_BUCKETS = 65536;
-
+constexpr std::uint32_t EMPTY_BUCKET_FLAG = 1U << 31;
 
 // ---------- Build alphatab once ----------
 
@@ -125,15 +128,71 @@ static ScanResult build_entries(const std::vector<unsigned char>& reference, con
 }
 
 
-// Builds H from the number of PT16 entries assigned to each bucket.
+// Number of common leading bits between two 16-bit bucket prefixes.
+
+static std::uint32_t lcp_bits_16(
+    const std::uint32_t first,
+    const std::uint32_t second
+) {
+    const std::uint32_t difference = (first ^ second) << 16U;
+    return std::countl_zero(difference);
+}
+
+
+/*
+Builds the normal H prefix sums, then marks each empty bucket.
+For an empty bucket b:
+    MSB = 1
+    lower 31 bits = non-empty bucket x with maximum LCP with b.
+*/
 
 static std::vector<std::uint32_t> build_H(const ScanResult& scan) {
     std::vector<std::uint32_t> H(static_cast<std::size_t>(NUMBER_OF_BUCKETS) + 1, 0);
+    std::vector<std::uint32_t> non_empty_buckets;
 
     H[0] = 0;
 
+    // First construct the ordinary H directory.
     for (std::uint32_t bucket = 0; bucket < NUMBER_OF_BUCKETS; ++bucket) {
         H[bucket + 1] = H[bucket] + scan.count[bucket];
+
+        if (scan.count[bucket] != 0) {
+            non_empty_buckets.push_back(bucket);
+        }
+    }
+
+    // Encode every empty bucket.
+    for (std::uint32_t bucket = 0; bucket < NUMBER_OF_BUCKETS; ++bucket) {
+        if (scan.count[bucket] != 0) {
+            continue;
+        }
+
+        // The best LCP candidate must be the nearest non-empty
+        // bucket on the left or right in prefix order.
+        const auto next = std::lower_bound(
+            non_empty_buckets.begin(),
+            non_empty_buckets.end(),
+            bucket
+        );
+
+        std::uint32_t x;
+
+        if (next == non_empty_buckets.begin()) {
+            x = *next;
+        } else if (next == non_empty_buckets.end()) {
+            x = non_empty_buckets.back();
+        } else {
+            const std::uint32_t left = *(next - 1);
+            const std::uint32_t right = *next;
+
+            if (lcp_bits_16(bucket, left) >= lcp_bits_16(bucket, right)) {
+                x = left;
+            } else {
+                x = right;
+            }
+        }
+
+        H[bucket] = EMPTY_BUCKET_FLAG | x;
     }
 
     return H;

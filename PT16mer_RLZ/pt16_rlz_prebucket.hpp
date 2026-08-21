@@ -322,6 +322,22 @@ private:
         return key;
     }
 
+std::uint32_t update_16mer_key(
+    const input_type& input,
+    const std::size_t new_position,
+    const std::uint32_t prev_key
+) const {
+    const std::uint8_t code =
+        alphatab_[
+            static_cast<unsigned char>(
+                input[new_position]
+            )
+        ];
+
+    return (prev_key << 2U) | code;
+}
+
+
 
     std::uint32_t interval_end(
         const std::size_t position

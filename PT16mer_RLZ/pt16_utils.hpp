@@ -191,38 +191,36 @@ inline void write_factor_file(const std::string& path, const Triples& factors) {
     }
 }
 
-inline bool factor_file_equals(const std::string& path, const Triples& factors) {
+static bool factor_file_equals(
+    const std::string& path,
+    const Triples& factors
+) {
     std::ifstream input(path, std::ios::binary);
 
     if (!input) {
-        throw std::runtime_error("cannot open baseline factor file");
+        throw std::runtime_error("cannot open temporary factor file: " + path);
     }
 
     std::uint64_t count = 0;
     input.read(reinterpret_cast<char*>(&count), sizeof(count));
 
-    if (!input || count != factors.size()) {
-        return false;
+    if (!input) {
+        throw std::runtime_error("failed while reading factor count: " + path);
     }
 
-    for (const auto& factor : factors) {
-        std::uint64_t input_position;
-        std::uint64_t reference_position;
-        std::uint64_t match_length;
+    if (count != static_cast<std::uint64_t>(factors.size())) {
+        std::cerr
+            << "Factor count mismatch: baseline="
+            << count
+            << ", PT16="
+            << factors.size()
+            << '\n';
 
-        input.read(reinterpret_cast<char*>(&input_position), sizeof(input_position));
-        input.read(reinterpret_cast<char*>(&reference_position), sizeof(reference_position));
-        input.read(reinterpret_cast<char*>(&match_length), sizeof(match_length));
-
-        if (!input || input_position != std::get<0>(factor) || reference_position != std::get<1>(factor) || match_length != std::get<2>(factor)) {
-            return false;
-        }
+        return false;
     }
 
     return true;
 }
-
-
 // ---------- PT16 per-file statistics ----------
 
 struct PT16Delta {

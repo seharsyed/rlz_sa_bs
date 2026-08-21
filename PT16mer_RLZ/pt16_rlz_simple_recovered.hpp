@@ -10,7 +10,6 @@
 #include <string>
 #include <tuple>
 #include <vector>
-#include <bit>
 
 #include "parser.hpp"
 
@@ -31,14 +30,10 @@ public:
     static constexpr std::uint32_t low_bits = 16;
     static constexpr std::uint32_t low_mask = bucket_size - 1;
     static constexpr std::uint32_t number_of_buckets = 65536;
-    static constexpr std::uint32_t empty_bucket_flag = 1U << 31;
-    static constexpr std::uint32_t empty_bucket_mask = empty_bucket_flag - 1;
 
     struct Stats {
         std::size_t hits = 0;
         std::size_t misses = 0;
-        std::size_t singleton_hits = 0;
-        std::size_t range_hits = 0;
         std::size_t entries = 0;
         std::size_t approx_bytes = 0;
     };
@@ -82,44 +77,13 @@ public:
             return ::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
         }
 
-        
-// Pack the next 16 characters and select the H bucket.
-const std::uint32_t key = pack_16mer(input, input_pos);
-const std::uint32_t bucket = key >> low_bits;
-
-// Empty bucket: compute the short factor directly.
-if (H_[bucket] & empty_bucket_flag) {
-    // Lower 31 bits store the non-empty bucket with maximum LCP.
-    const std::uint32_t matching_bucket = H_[bucket] & empty_bucket_mask;
-
-    // Compute the common prefix length in bits, then DNA characters.
-    const std::uint32_t difference = (bucket ^ matching_bucket) << 16U;
-    const std::size_t lcp_bits = std::countl_zero(difference);
-    const std::size_t lcp_chars = lcp_bits / 2;
-
-    // Take a reference position from the matching bucket.
-    const std::size_t interval_position = H_[matching_bucket];
-    const std::size_t sa_position = interval_starts_[interval_position];
-    const std::size_t ref_pos = static_cast<std::size_t>((*sa_)[sa_position]);
-
-    ++stats_.misses;
-
-    return {ref_pos, lcp_chars};
-}
-
-// Non-empty bucket: use the existing PT16 lookup.
-const LookupResult result = lookup(key);
-
+        // Pack the next 16 characters and look them up in PT16.
+        const std::uint32_t key = pack_16mer(input, input_pos);
+        const LookupResult result = lookup(key);
 
         // PT16 miss: use ordinary RLZ.
         if (!result.found) {
             return ::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
-        }
-
-        if (result.sa_start == result.sa_end) {
-            ++stats_.singleton_hits;
-        } else {
-            ++stats_.range_hits;
         }
 
         std::size_t offset = kmer_length;
@@ -316,22 +280,13 @@ private:
     const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
 
     const std::uint32_t begin = H_[bucket];
+    const std::uint32_t end = H_[bucket + 1];
 
-    // Find the next non-empty H entry to obtain the end of this L bucket.
-    std::uint32_t next_bucket = bucket + 1;
-
-    while (
-        next_bucket < number_of_buckets &&
-        (H_[next_bucket] & empty_bucket_flag)
-    ) {
-        ++next_bucket;
+    if (begin == end) {
+        ++stats_.misses;
+        return {};
     }
 
-    const std::uint32_t end = H_[next_bucket];
-
-
-    // ---------- Linear scan ----------
-    /*
     for (std::uint32_t position = begin; position < end; ++position) {
         if (L_[position] == low) {
             ++stats_.hits;
@@ -342,29 +297,6 @@ private:
             return {true, sa_start, sa_end};
         }
     }
-    */
-
-
-    // ---------- Binary search ----------
-
-    const auto it = std::lower_bound(
-        L_.begin() + begin,
-        L_.begin() + end,
-        low
-    );
-
-    if (it != L_.begin() + end && *it == low) {
-        ++stats_.hits;
-
-        const std::uint32_t position =
-            static_cast<std::uint32_t>(it - L_.begin());
-
-        const std::uint32_t sa_start = interval_starts_[position];
-        const std::uint32_t sa_end = interval_end(position);
-
-        return {true, sa_start, sa_end};
-    }
-
 
     ++stats_.misses;
     return {};
