@@ -204,22 +204,8 @@ static bool factor_file_equals(
     std::uint64_t count = 0;
     input.read(reinterpret_cast<char*>(&count), sizeof(count));
 
-    if (!input) {
-        throw std::runtime_error("failed while reading factor count: " + path);
-    }
-
-    if (count != static_cast<std::uint64_t>(factors.size())) {
-        std::cerr
-            << "Factor count mismatch: baseline="
-            << count
-            << ", PT16="
-            << factors.size()
-            << '\n';
-
-        return false;
-    }
-
-    return true;
+    return input &&
+        count == static_cast<std::uint64_t>(factors.size());
 }
 // ---------- PT16 per-file statistics ----------
 

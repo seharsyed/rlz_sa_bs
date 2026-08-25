@@ -33,6 +33,7 @@ public:
     static constexpr std::uint32_t number_of_buckets = 65536;
     static constexpr std::uint32_t empty_bucket_flag = 1U << 31;
     static constexpr std::uint32_t empty_bucket_mask = empty_bucket_flag - 1;
+    static constexpr std::uint32_t binary_search_threshold = 64;
 
     struct Stats {
         std::size_t hits = 0;
@@ -44,11 +45,23 @@ public:
     };
 
 private:
+    
     struct LookupResult {
-        bool found = false;
-        std::uint32_t sa_start = 0;
-        std::uint32_t sa_end = 0;
-    };
+    bool found = false;
+    std::uint32_t sa_start = 0;
+    std::uint32_t sa_end = 0;
+    std::size_t ref_pos = 0;
+    std::size_t match_length = 0;
+};
+    struct ShortSuffix {
+    std::uint32_t bucket;
+    std::size_t ref_pos;
+    std::size_t length;
+};
+
+std::vector<ShortSuffix> short_suffixes_;
+
+
 
     const reference_type* ref_ = nullptr;
     const suffix_array_type* sa_ = nullptr;
@@ -73,6 +86,7 @@ public:
     ) : ref_(&ref), sa_(&sa) {
         initialise_alphatab();
         load_hl(pt16_path);
+        build_short_suffixes();
     }
 
 
@@ -83,12 +97,12 @@ public:
         }
 
         
-// Pack the next 16 characters and select the H bucket.
-const std::uint32_t key = pack_16mer(input, input_pos);
-const std::uint32_t bucket = key >> low_bits;
+    // Pack the next 16 characters and select the H bucket.
+    const std::uint32_t key = pack_16mer(input, input_pos);
+    const std::uint32_t bucket = key >> low_bits;
 
-// Empty bucket: compute the short factor directly.
-if (H_[bucket] & empty_bucket_flag) {
+    // Empty bucket: compute the short factor directly.
+    if (H_[bucket] & empty_bucket_flag) {
     // Lower 31 bits store the non-empty bucket with maximum LCP.
     const std::uint32_t matching_bucket = H_[bucket] & empty_bucket_mask;
 
@@ -100,21 +114,29 @@ if (H_[bucket] & empty_bucket_flag) {
     // Take a reference position from the matching bucket.
     const std::size_t interval_position = H_[matching_bucket];
     const std::size_t sa_position = interval_starts_[interval_position];
-    const std::size_t ref_pos = static_cast<std::size_t>((*sa_)[sa_position]);
+    std::size_t ref_pos = static_cast<std::size_t>((*sa_)[sa_position]);
+std::size_t match_length = lcp_chars;
 
+check_short_suffixes(
+    input,
+    input_pos,
+    bucket,
+    ref_pos,
+    match_length
+);
     ++stats_.misses;
 
     return {ref_pos, lcp_chars};
 }
 
 // Non-empty bucket: use the existing PT16 lookup.
-const LookupResult result = lookup(key);
+const LookupResult result = lookup(input, input_pos, key);
 
 
-        // PT16 miss: use ordinary RLZ.
-        if (!result.found) {
-            return ::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
-        }
+        // Non-empty bucket miss: lookup() has already computed the short factor.
+    if (!result.found) {
+    return {result.ref_pos, result.match_length};
+    }
 
         if (result.sa_start == result.sa_end) {
             ++stats_.singleton_hits;
@@ -208,6 +230,50 @@ private:
         alphatab_[static_cast<unsigned char>('T')] = 3; // 11
     }
 
+    void build_short_suffixes() {
+    for (std::size_t length = 8; length < kmer_length; ++length) {
+        const std::size_t ref_pos = ref_->size() - length;
+
+        std::uint32_t bucket = 0;
+
+        for (std::size_t j = 0; j < 8; ++j) {
+            const std::uint8_t code =
+                alphatab_[static_cast<unsigned char>((*ref_)[ref_pos + j])];
+
+            bucket = (bucket << 2U) | code;
+        }
+
+        short_suffixes_.push_back({bucket, ref_pos, length});
+    }
+}
+
+void check_short_suffixes(
+    const input_type& input,
+    const std::size_t input_pos,
+    const std::uint32_t bucket,
+    std::size_t& ref_pos,
+    std::size_t& match_length
+) const {
+    for (const ShortSuffix& suffix : short_suffixes_) {
+        if (suffix.bucket != bucket) {
+            continue;
+        }
+
+        std::size_t length = 8;
+
+        while (
+            length < suffix.length &&
+            input[input_pos + length] == (*ref_)[suffix.ref_pos + length]
+        ) {
+            ++length;
+        }
+
+        if (length > match_length) {
+            match_length = length;
+            ref_pos = suffix.ref_pos;
+        }
+    }
+}
 
     template <typename T>
     static void read_value(std::ifstream& input, T& value) {
@@ -311,7 +377,13 @@ private:
     }
 
 
-    LookupResult lookup(const std::uint32_t key) const {
+
+
+LookupResult lookup(
+    const input_type& input,
+    const std::size_t input_pos,
+    const std::uint32_t key
+) const {
     const std::uint32_t bucket = key >> low_bits;
     const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
 
@@ -328,45 +400,124 @@ private:
     }
 
     const std::uint32_t end = H_[next_bucket];
+    const std::uint32_t bucket_entries = end - begin;
 
+    std::uint32_t insertion_position = begin;
 
-    // ---------- Linear scan ----------
-    /*
-    for (std::uint32_t position = begin; position < end; ++position) {
-        if (L_[position] == low) {
-            ++stats_.hits;
-
-            const std::uint32_t sa_start = interval_starts_[position];
-            const std::uint32_t sa_end = interval_end(position);
-
-            return {true, sa_start, sa_end};
+    // Small bucket: linear scan.
+    if (bucket_entries < binary_search_threshold) {
+        while (
+            insertion_position < end &&
+            L_[insertion_position] < low
+        ) {
+            ++insertion_position;
         }
     }
-    */
 
+    // Large bucket: binary search.
+    else {
+        const auto it = std::lower_bound(
+            L_.begin() + begin,
+            L_.begin() + end,
+            low
+        );
 
-    // ---------- Binary search ----------
-
-    const auto it = std::lower_bound(
-        L_.begin() + begin,
-        L_.begin() + end,
-        low
-    );
-
-    if (it != L_.begin() + end && *it == low) {
-        ++stats_.hits;
-
-        const std::uint32_t position =
+        insertion_position =
             static_cast<std::uint32_t>(it - L_.begin());
-
-        const std::uint32_t sa_start = interval_starts_[position];
-        const std::uint32_t sa_end = interval_end(position);
-
-        return {true, sa_start, sa_end};
     }
 
+    // Exact 16-mer hit.
+    if (
+        insertion_position < end &&
+        L_[insertion_position] == low
+    ) {
+        ++stats_.hits;
+
+        const std::uint32_t sa_start =
+            interval_starts_[insertion_position];
+
+        const std::uint32_t sa_end =
+            interval_end(insertion_position);
+
+        return {true, sa_start, sa_end, 0, 0};
+    }
 
     ++stats_.misses;
-    return {};
+
+    // Non-empty bucket miss:
+    // choose the neighbouring key with the longest common prefix.
+    std::uint32_t best_position;
+    std::size_t lcp_chars;
+
+    // Key is smaller than everything in the bucket.
+    if (insertion_position == begin) {
+        best_position = begin;
+
+        const std::uint32_t candidate_key =
+            (bucket << low_bits) |
+            static_cast<std::uint32_t>(L_[best_position]);
+
+        lcp_chars =
+            std::countl_zero(key ^ candidate_key) / 2;
+    }
+
+    // Key is larger than everything in the bucket.
+    else if (insertion_position == end) {
+        best_position = end - 1;
+
+        const std::uint32_t candidate_key =
+            (bucket << low_bits) |
+            static_cast<std::uint32_t>(L_[best_position]);
+
+        lcp_chars =
+            std::countl_zero(key ^ candidate_key) / 2;
+    }
+
+    // Key lies between two entries.
+    else {
+        const std::uint32_t predecessor = insertion_position - 1;
+        const std::uint32_t successor = insertion_position;
+
+        const std::uint32_t predecessor_key =
+            (bucket << low_bits) |
+            static_cast<std::uint32_t>(L_[predecessor]);
+
+        const std::uint32_t successor_key =
+            (bucket << low_bits) |
+            static_cast<std::uint32_t>(L_[successor]);
+
+        const std::size_t predecessor_lcp =
+            std::countl_zero(key ^ predecessor_key) / 2;
+
+        const std::size_t successor_lcp =
+            std::countl_zero(key ^ successor_key) / 2;
+
+        if (predecessor_lcp >= successor_lcp) {
+            best_position = predecessor;
+            lcp_chars = predecessor_lcp;
+        } else {
+            best_position = successor;
+            lcp_chars = successor_lcp;
+        }
+    }
+
+    const std::size_t sa_position =
+    interval_starts_[best_position];
+
+std::size_t ref_pos =
+    static_cast<std::size_t>((*sa_)[sa_position]);
+
+check_short_suffixes(
+    input,
+    input_pos,
+    bucket,
+    ref_pos,
+    lcp_chars
+);
+
+return {false, 0, 0, ref_pos, lcp_chars};
+
 }
+    
+    
 };
