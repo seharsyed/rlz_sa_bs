@@ -172,7 +172,13 @@ std::cerr << "Table: " << pt16_path << std::endl;
                 pt16 = parser.lzFactorize(input);
             });
 
-            const bool equal = factor_file_equals(baseline_result.factor_file, pt16);
+            // Write PT16 factors after timing so correctness testing does not affect runtime.
+write_factor_file(
+    args.results + ".pt16_" + std::to_string(file_index) + ".bin",
+    pt16
+);
+
+            const bool equal = factor_file_equals(baseline_result.factor_file, pt16, input, reference);
 
             const auto current_stats = parser.stats();
             const PT16Delta file_stats = stats_difference(previous_stats, current_stats);

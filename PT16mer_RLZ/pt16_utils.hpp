@@ -191,21 +191,163 @@ inline void write_factor_file(const std::string& path, const Triples& factors) {
     }
 }
 
-static bool factor_file_equals(
+template <typename Symbol>
+inline bool factor_file_equals(
     const std::string& path,
-    const Triples& factors
+    const Triples& factors,
+    const std::vector<Symbol>& input_sequence,
+    const std::vector<Symbol>& reference
 ) {
     std::ifstream input(path, std::ios::binary);
 
     if (!input) {
-        throw std::runtime_error("cannot open temporary factor file: " + path);
+        throw std::runtime_error("cannot open baseline factor file");
     }
 
     std::uint64_t count = 0;
     input.read(reinterpret_cast<char*>(&count), sizeof(count));
 
-    return input &&
-        count == static_cast<std::uint64_t>(factors.size());
+    // Check 1: same factor count.
+    if (!input) {
+        std::cerr << "CORRECTNESS FAILURE: could not read baseline factor count\n";
+        return false;
+    }
+
+    if (count != factors.size()) {
+        std::cerr
+            << "CORRECTNESS FAILURE\n"
+            << "check=factor_count\n"
+            << "baseline=" << count << '\n'
+            << "pt16=" << factors.size() << '\n';
+        return false;
+    }
+
+    std::size_t expected_input_position = 0;
+
+    for (std::size_t i = 0; i < factors.size(); ++i) {
+        std::uint64_t baseline_input_position = 0;
+        std::uint64_t baseline_reference_position = 0;
+        std::uint64_t baseline_match_length = 0;
+
+        input.read(reinterpret_cast<char*>(&baseline_input_position), sizeof(baseline_input_position));
+        input.read(reinterpret_cast<char*>(&baseline_reference_position), sizeof(baseline_reference_position));
+        input.read(reinterpret_cast<char*>(&baseline_match_length), sizeof(baseline_match_length));
+
+        if (!input) {
+            std::cerr
+                << "CORRECTNESS FAILURE\n"
+                << "check=baseline_factor_read\n"
+                << "factor_index=" << i << '\n';
+            return false;
+        }
+
+        const std::size_t pt16_input_position = std::get<0>(factors[i]);
+        const std::size_t pt16_reference_position = std::get<1>(factors[i]);
+        const std::size_t pt16_match_length = std::get<2>(factors[i]);
+
+        // Check 2: same factor start.
+        if (pt16_input_position != baseline_input_position) {
+            std::cerr
+                << "CORRECTNESS FAILURE\n"
+                << "check=input_position\n"
+                << "factor_index=" << i << '\n'
+                << "baseline=" << baseline_input_position << '\n'
+                << "pt16=" << pt16_input_position << '\n';
+            return false;
+        }
+
+        // Check 3: same greedy factor length.
+        if (pt16_match_length != baseline_match_length) {
+            std::cerr
+                << "CORRECTNESS FAILURE\n"
+                << "check=match_length\n"
+                << "factor_index=" << i << '\n'
+                << "input_position=" << pt16_input_position << '\n'
+                << "baseline=" << baseline_match_length << '\n'
+                << "pt16=" << pt16_match_length << '\n';
+            return false;
+        }
+
+        // Check 4: no gaps or overlaps.
+        if (pt16_input_position != expected_input_position) {
+            std::cerr
+                << "CORRECTNESS FAILURE\n"
+                << "check=tiling\n"
+                << "factor_index=" << i << '\n'
+                << "expected_input_position=" << expected_input_position << '\n'
+                << "actual_input_position=" << pt16_input_position << '\n';
+            return false;
+        }
+
+        if (pt16_match_length == 0) {
+            std::cerr
+                << "CORRECTNESS FAILURE\n"
+                << "check=zero_length_factor\n"
+                << "factor_index=" << i << '\n';
+            return false;
+        }
+
+        expected_input_position += pt16_match_length;
+
+        // Literal factor.
+        if (pt16_match_length == 1) {
+            if (
+                pt16_reference_position !=
+                static_cast<std::size_t>(input_sequence[pt16_input_position])
+            ) {
+                std::cerr
+                    << "CORRECTNESS FAILURE\n"
+                    << "check=literal_value\n"
+                    << "factor_index=" << i << '\n'
+                    << "input_position=" << pt16_input_position << '\n';
+                return false;
+            }
+
+            continue;
+        }
+
+        // Check 5: copy stays inside reference.
+        if (pt16_reference_position + pt16_match_length > reference.size()) {
+            std::cerr
+                << "CORRECTNESS FAILURE\n"
+                << "check=reference_bounds\n"
+                << "factor_index=" << i << '\n'
+                << "ref_pos=" << pt16_reference_position << '\n'
+                << "length=" << pt16_match_length << '\n'
+                << "reference_size=" << reference.size() << '\n';
+            return false;
+        }
+
+        // Check 6: PT16 reference occurrence really matches the input.
+        for (std::size_t j = 0; j < pt16_match_length; ++j) {
+            if (
+                reference[pt16_reference_position + j] !=
+                input_sequence[pt16_input_position + j]
+            ) {
+                std::cerr
+                    << "CORRECTNESS FAILURE\n"
+                    << "check=reference_match\n"
+                    << "factor_index=" << i << '\n'
+                    << "input_position=" << pt16_input_position << '\n'
+                    << "ref_pos=" << pt16_reference_position << '\n'
+                    << "length=" << pt16_match_length << '\n'
+                    << "mismatch_offset=" << j << '\n';
+                return false;
+            }
+        }
+    }
+
+    // Check 7: factors cover the complete input.
+    if (expected_input_position != input_sequence.size()) {
+        std::cerr
+            << "CORRECTNESS FAILURE\n"
+            << "check=final_coverage\n"
+            << "covered=" << expected_input_position << '\n'
+            << "input_size=" << input_sequence.size() << '\n';
+        return false;
+    }
+
+    return true;
 }
 // ---------- PT16 per-file statistics ----------
 
