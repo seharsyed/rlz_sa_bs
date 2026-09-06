@@ -14,3 +14,8 @@ Data/
 *.so
 parser/compare_rlz_cache
 parser/rlz_lp
+*.o
+*.o
+PT16mer_RLZ/cache
+PT16mer_RLZ/pt16
+PT16mer_RLZ/pt16_v2
