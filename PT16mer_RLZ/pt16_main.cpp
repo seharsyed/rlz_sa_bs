@@ -128,6 +128,7 @@ int main(int argc, char** argv) {
 
     std::cerr << "Loading PT16 table..." << std::endl;
 
+    // Should we time load time for parser? 
     PT16RLZParser<Symbol, SAType> parser(reference, suffix_array, pt16_path);
 
     std::cerr << "PT16 loaded." << std::endl;

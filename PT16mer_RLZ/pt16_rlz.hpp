@@ -113,7 +113,10 @@ class PT16RLZParser {
       check_short_suffixes(input, input_pos, bucket, ref_pos, match_length);
       ++stats_.misses;
 
-      return {ref_pos, lcp_chars};
+      // after checking the short suffixes lcp_chars may no longer be valig and
+      // we should return the match_length
+
+      return {ref_pos, match_length};
     }
 
     // Non-empty bucket: use the existing PT16 lookup.
