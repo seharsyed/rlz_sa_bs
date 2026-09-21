@@ -13,7 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "parser.hpp"
+#include "rlz_common.hpp"
 
 template <typename T1, typename T2>
 class PT16RLZParser {
@@ -100,7 +100,7 @@ class PT16RLZParser {
                                 const std::size_t input_pos) {
     // Fewer than 16 characters remain: use ordinary RLZ.
     if (input.size() - input_pos < kmer_length) {
-      return ::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
+      return rlz::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
     }
 
     // Pack the next 16 characters and select the H bucket.
@@ -154,13 +154,13 @@ class PT16RLZParser {
     // Range case: narrow the SA interval from character 17 onward.
     while (nlb < nrb && j < input.size()) {
       const auto lb =
-          ::binarySearchLB<T1, T2>(*ref_, *sa_, nlb, nrb, offset, input[j]);
+          rlz::binarySearchLB(*ref_, *sa_, nlb, nrb, offset, input[j]);
 
       if (!lb) {
         break;
       }
 
-      const auto rb = ::binarySearchRB<T1, T2>(
+      const auto rb = rlz::binarySearchRB(
           *ref_, *sa_, static_cast<std::size_t>(lb.value()), nrb, offset,
           input[j]);
 

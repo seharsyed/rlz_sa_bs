@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-#include "parser.hpp"   // original RLZ parser
+#include "rlz_common.hpp"
 
 /**
  * CachedRLZParser is an add-on wrapper for the RLZ parser.
@@ -110,7 +110,7 @@ public:
      */
     template <typename T>
     static std::vector<T> read_file(const char* filename) {
-        return ::read_file<T>(filename);
+        return rlz::read_file<T>(filename);
     }
 
     /**
@@ -126,7 +126,7 @@ public:
         const std::int64_t offset,
         const T1 c
     ) const {
-        return ::binarySearchLB<T1, T2>(ref, sa, lo, hi, offset, c);
+        return rlz::binarySearchLB(ref, sa, lo, hi, offset, c);
     }
 
     /**
@@ -141,7 +141,7 @@ public:
         const std::int64_t offset,
         const T1 c
     ) const {
-        return ::binarySearchRB<T1, T2>(ref, sa, lo, hi, offset, c);
+        return rlz::binarySearchRB(ref, sa, lo, hi, offset, c);
     }
 
     /**
@@ -175,7 +175,7 @@ public:
         while (j < input.size()) {
             if (nlb == nrb) {
                 // Not cached: there is no interval refinement, only one suffix check.
-                if (safe_ref_symbol(*ref_, *sa_, nlb, offset) != input[j]) {
+                if (rlz::safe_ref_symbol(*ref_, *sa_, nlb, offset) != input[j]) {
                     break;
                 }
             } else {
@@ -186,7 +186,7 @@ public:
                     nlb = cached_interval.new_lb;
                     nrb = cached_interval.new_rb;
                 } else {
-                    const auto opt_lb = ::binarySearchLB<T1, T2>(
+                    const auto opt_lb = rlz::binarySearchLB(
                         *ref_, *sa_,
                         static_cast<std::int64_t>(nlb),
                         static_cast<std::int64_t>(nrb),
@@ -200,7 +200,7 @@ public:
 
                     const std::size_t new_lb = static_cast<std::size_t>(*opt_lb);
 
-                    const auto opt_rb = ::binarySearchRB<T1, T2>(
+                    const auto opt_rb = rlz::binarySearchRB(
                         *ref_, *sa_,
                         static_cast<std::int64_t>(new_lb),
                         static_cast<std::int64_t>(nrb),

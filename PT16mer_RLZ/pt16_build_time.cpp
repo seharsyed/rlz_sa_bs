@@ -1,4 +1,4 @@
-#include "parser.hpp"
+#include "rlz_common.hpp"
 #include "pt16_build.hpp"
 
 #include <chrono>
@@ -23,10 +23,10 @@ int main(int argc, char** argv) {
     const std::string output_path = argv[3];
 
     std::cerr << "Loading reference..." << std::endl;
-    const auto reference = read_file<Symbol>(reference_path.c_str());
+    const auto reference = rlz::read_file<Symbol>(reference_path.c_str());
 
     std::cerr << "Loading suffix array..." << std::endl;
-    const auto suffix_array = read_file<SAType>(suffix_array_path.c_str());
+    const auto suffix_array = rlz::read_file<SAType>(suffix_array_path.c_str());
 
     std::cerr << "Building PT16 table..." << std::endl;
 

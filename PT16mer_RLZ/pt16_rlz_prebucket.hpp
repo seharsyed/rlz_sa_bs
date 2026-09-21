@@ -10,7 +10,7 @@
 #include <tuple>
 #include <vector>
 
-#include "parser.hpp"
+#include "rlz_common.hpp"
 
 
 template <typename T1, typename T2>
@@ -75,7 +75,7 @@ public:
     ) {
         // Fewer than 16 characters remain, so use ordinary RLZ.
         if (input.size() - input_pos < kmer_length) {
-            return ::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
+            return rlz::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
         }
 
         // Use the PT16 result already computed during pre-bucketing.
@@ -83,7 +83,7 @@ public:
 
         if (!result.found) {
             ++stats_.misses;
-            return ::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
+            return rlz::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
         }
 
         ++stats_.hits;
@@ -101,7 +101,7 @@ public:
 
         // Range intervals are narrowed from character 17 onward.
         while (nlb < nrb && j < input.size()) {
-            const auto lb = ::binarySearchLB<T1, T2>(
+            const auto lb = rlz::binarySearchLB(
                 *ref_,
                 *sa_,
                 nlb,
@@ -114,7 +114,7 @@ public:
                 break;
             }
 
-            const auto rb = ::binarySearchRB<T1, T2>(
+            const auto rb = rlz::binarySearchRB(
                 *ref_,
                 *sa_,
                 static_cast<std::size_t>(lb.value()),

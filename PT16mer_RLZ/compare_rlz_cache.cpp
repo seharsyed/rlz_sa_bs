@@ -238,8 +238,8 @@ int main(int argc, char** argv) {
 
     std::cerr << "Loading reference and suffix array...\n";
 
-    auto ref = read_file<Symbol>(args.reference.c_str());
-    auto sa = read_file<SAType>(args.suffix_array.c_str());
+    auto ref = rlz::read_file<Symbol>(args.reference.c_str());
+    auto sa = rlz::read_file<SAType>(args.suffix_array.c_str());
 
     if (ref.empty() || sa.empty()) {
       throw std::runtime_error("reference and suffix array must be non-empty");
@@ -310,7 +310,7 @@ int main(int argc, char** argv) {
         continue;
       }
 
-      auto input = read_file<Symbol>(file.c_str());
+      auto input = rlz::read_file<Symbol>(file.c_str());
 
       if (input.empty()) {
         std::cerr << "  WARNING: read_file() returned empty\n";

@@ -18,7 +18,7 @@
 #include <tuple>
 #include <vector>
 
-#include "parser.hpp"
+#include "rlz_common.hpp"
 
 namespace fs = std::filesystem;
 
@@ -218,17 +218,17 @@ inline Args parse_args(int argc, char** argv) {
 
 template <typename Symbol>
 inline std::vector<Symbol> load_reference(const std::string& path) {
-  return read_file<Symbol>(path.c_str());
+  return rlz::read_file<Symbol>(path.c_str());
 }
 
 template <typename SAType>
 inline std::vector<SAType> load_suffix_array(const std::string& path) {
-  return read_file<SAType>(path.c_str());
+  return rlz::read_file<SAType>(path.c_str());
 }
 
 template <typename Symbol>
 inline std::vector<Symbol> load_input(const std::string& path) {
-  return read_file<Symbol>(path.c_str());
+  return rlz::read_file<Symbol>(path.c_str());
 }
 
 inline std::vector<std::string> load_input_list(const std::string& path) {
