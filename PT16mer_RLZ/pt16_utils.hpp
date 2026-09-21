@@ -2,6 +2,9 @@
 
 #include <sys/resource.h>
 
+#include <algorithm>
+#include <array>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +26,134 @@ using Triples = std::vector<std::tuple<std::size_t, std::size_t, std::size_t>>;
 
 using MatchingStatistics =
     std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+
+// ---------- 16-mer encoding ----------
+
+constexpr std::uint32_t KMER_LENGTH = 16;
+
+// Two-bit code of each DNA character; every other character maps to 0.
+inline std::array<std::uint8_t, 256> build_alphatab() {
+  std::array<std::uint8_t, 256> alphatab{};
+
+  alphatab[static_cast<unsigned char>('A')] = 0;  // 00
+  alphatab[static_cast<unsigned char>('C')] = 1;  // 01
+  alphatab[static_cast<unsigned char>('G')] = 2;  // 10
+  alphatab[static_cast<unsigned char>('T')] = 3;  // 11
+
+  return alphatab;
+}
+
+inline const std::array<std::uint8_t, 256> alphatab = build_alphatab();
+
+// Packs one 16-mer from the reference into a 32-bit key.
+
+inline std::uint32_t encode_16mer(const std::vector<unsigned char>& reference,
+                                  const std::uint32_t position) {
+  std::uint32_t key = 0;
+
+  for (std::uint32_t j = 0; j < KMER_LENGTH; ++j) {
+    const std::uint8_t code =
+        alphatab[static_cast<unsigned char>(reference[position + j])];
+    key = (key << 2U) | code;
+  }
+
+  return key;
+}
+
+// Number of common leading bits between two 16-bit bucket prefixes.
+
+inline std::uint32_t lcp_bits_16(const std::uint32_t first,
+                                 const std::uint32_t second) {
+  const std::uint32_t difference = (first ^ second) << 16U;
+  return std::countl_zero(difference);
+}
+
+// ---------- PT16 buckets ----------
+
+// A 16-mer key is split into a 16-bit bucket (its high bits) and a 16-bit
+// low part.
+constexpr std::uint32_t BUCKET_SIZE = 65536;
+constexpr std::uint32_t LOW_BITS = 16;
+constexpr std::uint32_t LOW_MASK = BUCKET_SIZE - 1;
+constexpr std::uint32_t NUMBER_OF_BUCKETS = 65536;
+constexpr std::uint32_t EMPTY_BUCKET_FLAG = 1U << 31;
+constexpr std::uint16_t LARGE_OFFSET_FLAG = 65535;
+
+/*
+Builds the normal H prefix sums, then marks each empty bucket.
+`count` is the number of PT16 entries in each bucket.
+For an empty bucket b:
+    MSB = 1
+    lower 31 bits = non-empty bucket x with maximum LCP with b.
+*/
+
+inline std::vector<std::uint32_t> build_H(
+    const std::array<std::uint32_t, NUMBER_OF_BUCKETS>& count) {
+  std::vector<std::uint32_t> H(static_cast<std::size_t>(NUMBER_OF_BUCKETS) + 1,
+                               0);
+  std::vector<std::uint32_t> non_empty_buckets;
+
+  H[0] = 0;
+
+  // First construct the ordinary H directory.
+  for (std::uint32_t bucket = 0; bucket < NUMBER_OF_BUCKETS; ++bucket) {
+    H[bucket + 1] = H[bucket] + count[bucket];
+
+    if (count[bucket] != 0) {
+      non_empty_buckets.push_back(bucket);
+    }
+  }
+
+  // Encode every empty bucket.
+  for (std::uint32_t bucket = 0; bucket < NUMBER_OF_BUCKETS; ++bucket) {
+    if (count[bucket] != 0) {
+      continue;
+    }
+
+    // The best LCP candidate must be the nearest non-empty
+    // bucket on the left or right in prefix order.
+    const auto next = std::lower_bound(non_empty_buckets.begin(),
+                                       non_empty_buckets.end(), bucket);
+
+    std::uint32_t x;
+
+    if (next == non_empty_buckets.begin()) {
+      x = *next;
+    } else if (next == non_empty_buckets.end()) {
+      x = non_empty_buckets.back();
+    } else {
+      const std::uint32_t left = *(next - 1);
+      const std::uint32_t right = *next;
+
+      if (lcp_bits_16(bucket, left) >= lcp_bits_16(bucket, right)) {
+        x = left;
+      } else {
+        x = right;
+      }
+    }
+
+    H[bucket] = EMPTY_BUCKET_FLAG | x;
+  }
+
+  return H;
+}
+
+// ---------- Binary output ----------
+
+// Writes the raw bytes of one value.
+template <typename T>
+inline void write_value(std::ofstream& output, const T& value) {
+  output.write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+// Writes the raw bytes of a vector's elements, with no length prefix.
+template <typename T>
+inline void write_vector(std::ofstream& output, const std::vector<T>& values) {
+  if (!values.empty()) {
+    output.write(reinterpret_cast<const char*>(values.data()),
+                 static_cast<std::streamsize>(values.size() * sizeof(T)));
+  }
+}
 
 // ---------- Arguments ----------
 

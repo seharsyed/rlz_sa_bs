@@ -63,7 +63,7 @@ class MSAdapter : public MSImplementation {
  public:
   template <typename... CtorArgs>
   MSAdapter(std::string name, CtorArgs&&... args) : name_(std::move(name)) {
-    build_ms_ = time_ms([&] {
+    build_ms_ = msbench::time_ms([&] {
       index_ = std::make_unique<Index>(std::forward<CtorArgs>(args)...);
     });
   }

@@ -21,9 +21,7 @@
 #include <utility>
 #include <vector>
 
-// Same type as the alias in lrf_ms.hpp: redeclaring it is harmless, and it
-// lets this header stand on its own.
-using MatchingStatistics = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+#include "../pt16_utils.hpp"  // time_ms, MatchingStatistics
 
 /**
  * Utilities for the matching-statistics benchmark: arguments, loading,
@@ -273,14 +271,8 @@ class SymbolTable {
 
 // ---------- Timing ----------
 
-template <typename Fn>
-inline double time_ms(Fn&& fn) {
-  const auto start = std::chrono::steady_clock::now();
-  fn();
-  const auto end = std::chrono::steady_clock::now();
-
-  return std::chrono::duration<double, std::milli>(end - start).count();
-}
+// time_ms is shared with the RLZ benchmark (pt16_utils.hpp).
+using ::time_ms;
 
 struct Timing {
   double first_ms = 0.0;
@@ -297,7 +289,7 @@ inline Timing time_repeated(std::size_t repeats, Fn&& fn) {
   timing.repeats = std::max<std::size_t>(repeats, 1);
 
   for (std::size_t run = 0; run < timing.repeats; ++run) {
-    const double elapsed = time_ms(fn);
+    const double elapsed = msbench::time_ms(fn);
 
     if (run == 0) {
       timing.first_ms = elapsed;
@@ -312,20 +304,8 @@ inline Timing time_repeated(std::size_t repeats, Fn&& fn) {
   return timing;
 }
 
-inline double peak_rss_mb() {
-  struct rusage usage{};
-
-  if (getrusage(RUSAGE_SELF, &usage) != 0) {
-    return 0.0;
-  }
-
-  // ru_maxrss is in bytes on macOS and in kilobytes on Linux.
-#ifdef __APPLE__
-  return static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0);
-#else
-  return static_cast<double>(usage.ru_maxrss) / 1024.0;
-#endif
-}
+// peak_rss_mb is shared with the RLZ benchmark (pt16_utils.hpp).
+using ::peak_rss_mb;
 
 // ---------- Validation results ----------
 
