@@ -22,7 +22,7 @@ namespace fs = std::filesystem;
 using Triples = std::vector<std::tuple<std::size_t, std::size_t, std::size_t>>;
 
 using MatchingStatistics =
-    std::vector<std::tuple<std::size_t, std::size_t>>;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>;
 
 // ---------- Arguments ----------
 

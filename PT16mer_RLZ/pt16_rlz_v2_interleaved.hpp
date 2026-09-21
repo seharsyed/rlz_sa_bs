@@ -11,6 +11,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "parser.hpp"
@@ -25,6 +26,8 @@ class PT16RLZParser {
   using factor_type = std::tuple<std::size_t, std::size_t>;
   using phrase_type = std::tuple<std::size_t, std::size_t, std::size_t>;
   using phrase_vector_type = std::vector<phrase_type>;
+  using factor_vector_type = std::vector<factor_type>;
+  using ms_vector_type = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
 
   static constexpr std::uint32_t kmer_length = 16;
   static constexpr std::uint32_t bucket_size = 65536;
@@ -207,6 +210,22 @@ class PT16RLZParser {
     return spl_vec;
   }
 
+  // Brute-force matching statistics: one PT16 longest-match query per input
+  // position, returned as (reference position, match length) pairs.
+  ms_vector_type computeMS_brute(const input_type& input) {
+    ms_vector_type ms;
+    ms.reserve(input.size());
+
+    for (std::size_t i = 0; i < input.size(); ++i) {
+      const auto [pos, len] = computeLZFactorAt(input, i);
+
+      ms.emplace_back(static_cast<std::uint32_t>(pos),
+                      static_cast<std::uint32_t>(len));
+    }
+
+    return ms;
+  }
+
   const Stats& stats() const { return stats_; }
 
  private:
@@ -293,7 +312,7 @@ class PT16RLZParser {
 
     H_.resize(number_of_buckets + 1);
     H_sa_.resize(number_of_buckets);
-    H_interleaved_.resize(number_of_buckets * 2 + 1);
+    H_interleaved_.reserve(number_of_buckets * 2 + 1);
     L_.resize(entry_count);
 
     input.read(reinterpret_cast<char*>(H_.data()),
