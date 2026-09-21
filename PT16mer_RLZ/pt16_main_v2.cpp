@@ -7,7 +7,7 @@
 
 #include "parser.hpp"
 #include "pt16_build_v2.hpp"
-#include "pt16_rlz_v2.hpp"
+#include "pt16_rlz_v2_interleaved.hpp"
 #include "pt16_utils.hpp"
 
 using Symbol = unsigned char;
