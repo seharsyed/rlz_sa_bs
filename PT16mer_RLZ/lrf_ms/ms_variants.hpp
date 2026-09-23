@@ -214,15 +214,35 @@ class PT16ScanMS {
   PT16ScanMS(const PT16ScanMS&) = delete;
   PT16ScanMS& operator=(const PT16ScanMS&) = delete;
 
+  // The 16-mer key is a ROLLING window here, not a fresh pack_16mer per
+  // position -- same reasoning as PT16SassyMS::scanPass1 (pt16_sassy_ms.hpp):
+  // lookupKmer/pack_16mer exist for lzFactorize's skip-ahead calls, where
+  // consecutive calls are NOT at consecutive positions; MS visits every
+  // position in order, so 15 of the next position's 16 characters are
+  // already in the current key. Only i=0 pays a full encode; every later
+  // key is `(previous key << 2) | new trailing character`.
   MatchingStatistics computeMatchingStatistics(const std::vector<T1>& input) {
     const auto before = parser_->stats();
+    const std::size_t n = input.size();
 
     MatchingStatistics ms;
-    ms.reserve(input.size());
+    ms.reserve(n);
 
-    for (std::size_t i = 0; i < input.size(); ++i) {
-      const auto result = parser_->lookupKmerOrTail(input, i);
-      ms.emplace_back(result.match_position, result.match_length);
+    std::uint32_t key = n >= KMER_LENGTH ? encode_16mer(input, 0) : 0;
+
+    for (std::size_t i = 0; i < n; ++i) {
+      if (n - i >= KMER_LENGTH) {
+        if (i > 0) {
+          key = (key << 2U) |
+                alphatab[static_cast<unsigned char>(input[i + KMER_LENGTH - 1])];
+        }
+
+        const auto result = parser_->lookupKmerByKey(input, i, key);
+        ms.emplace_back(result.match_position, result.match_length);
+      } else {
+        const auto tail = parser_->lookupKmerOrTail(input, i);
+        ms.emplace_back(tail.match_position, tail.match_length);
+      }
     }
 
     diagnostics_ = formatBucketSearchCounts(before, parser_->stats());
@@ -260,9 +280,16 @@ class PT16ScanMS {
     auto count = std::make_unique<std::array<std::uint32_t, NUMBER_OF_BUCKETS>>();
     count->fill(0);
 
+    // Rolling key, same trick as the sequential scan above: only i=0 pays
+    // a full encode.
+    std::uint32_t key = kmer_positions > 0 ? encode_16mer(input, 0) : 0;
+
     for (std::size_t i = 0; i < kmer_positions; ++i) {
-      const std::uint32_t key =
-          encode_16mer(input, static_cast<std::uint32_t>(i));
+      if (i > 0) {
+        key = (key << 2U) |
+              alphatab[static_cast<unsigned char>(input[i + KMER_LENGTH - 1])];
+      }
+
       keys[i] = key;
       ++(*count)[key >> LOW_BITS];
     }
