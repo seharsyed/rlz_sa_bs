@@ -243,6 +243,18 @@ int main(int argc, char** argv) {
 
         std::cerr << std::endl;
 
+        // Diagnostic text from THIS implementation's own compute() call,
+        // if it has any (see MSImplementation::diagnostics). Printed here,
+        // not from inside compute() itself: compute() always finishes
+        // before this row is printed, so text printed directly from
+        // inside it would land under whichever row printed most recently,
+        // not this one.
+        const std::string diagnostics = implementation.diagnostics();
+
+        if (!diagnostics.empty()) {
+          std::cerr << diagnostics;
+        }
+
         if (!result.invariants.ok) {
           std::cerr << "        INVARIANT FAILURE: " << result.invariants
                     << std::endl;

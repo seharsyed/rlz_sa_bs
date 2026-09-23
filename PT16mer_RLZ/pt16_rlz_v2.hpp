@@ -11,6 +11,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "rlz_common.hpp"
@@ -25,6 +26,7 @@ class PT16RLZParser {
   using factor_type = std::tuple<std::size_t, std::size_t>;
   using phrase_type = std::tuple<std::size_t, std::size_t, std::size_t>;
   using phrase_vector_type = std::vector<phrase_type>;
+  using ms_vector_type = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
 
   static constexpr std::uint32_t kmer_length = 16;
   static constexpr std::uint32_t bucket_size = 65536;
@@ -43,6 +45,25 @@ class PT16RLZParser {
     std::size_t range_hits = 0;
     std::size_t entries = 0;
     std::size_t approx_bytes = 0;
+
+    // How every non-empty-bucket dispatch searched its bucket: a linear
+    // scan below binary_search_threshold entries, std::lower_bound at or
+    // above it. Updated by lookup(), so this covers both hits and
+    // non-empty-bucket misses (an empty-bucket miss never searches L_ at
+    // all, so it touches neither counter).
+    std::size_t linear_bucket_searches = 0;
+    std::size_t binary_bucket_searches = 0;
+  };
+
+  /**
+   * The answer to a 16-mer-only lookup (see lookupKmer below): analogous
+   * to PT16SassyLookup::LookupResult, but for this table format.
+   */
+  struct KmerLookupResult {
+    bool found = false;
+    std::uint32_t count = 0;
+    std::uint32_t match_position = 0;
+    std::uint32_t match_length = 0;
   };
 
  private:
@@ -206,6 +227,126 @@ class PT16RLZParser {
     }
 
     return spl_vec;
+  }
+
+  // Brute-force matching statistics: one PT16 longest-match query per input
+  // position, returned as (reference position, match length) pairs.
+  ms_vector_type computeMS_brute(const input_type& input) {
+    ms_vector_type ms;
+    ms.reserve(input.size());
+
+    for (std::size_t i = 0; i < input.size(); ++i) {
+      const auto [pos, len] = computeLZFactorAt(input, i);
+
+      ms.emplace_back(static_cast<std::uint32_t>(pos),
+                      static_cast<std::uint32_t>(len));
+    }
+
+    return ms;
+  }
+
+  /**
+   * A 16-mer-only lookup: the same bucket dispatch, bucket search and
+   * short-suffix fallback as computeLZFactorAt/lookup, but -- like
+   * PT16SassyLookup::lookup, not find_longest_matching_factor -- no SA
+   * interval narrowing beyond the raw H/L entry on a hit.
+   *
+   * This exists to compare the two table formats' pure lookup cost head to
+   * head: this format still needs one suffix-array access to turn a hit's
+   * SA interval into an actual reference position (sa_start_at, then
+   * (*sa_)[...] below), which the self-contained sassy table does not --
+   * it decodes a position (or its first occurrence, for a range) directly
+   * out of the L entry itself.
+   *
+   * Requires input.size() - input_pos >= kmer_length; use
+   * lookupKmerOrTail for a shorter tail.
+   */
+  KmerLookupResult lookupKmer(const input_type& input,
+                              const std::size_t input_pos) const {
+    return lookupKmerByKey(input, input_pos, pack_16mer(input, input_pos));
+  }
+
+  /**
+   * Same as lookupKmer, but with the key already packed elsewhere -- for a
+   * caller that bucketed several positions by table bucket first and
+   * cached each one's key, so the input never needs to be re-read to
+   * repack it (see PT16ScanMS::computeMatchingStatisticsBucketed in
+   * ms_variants.hpp, the counterpart of
+   * PT16SassyMS::computeMatchingStatisticsScanOnlyBucketed).
+   * `input`/`input_pos` are only used if the lookup misses and has to fall
+   * back to the short-suffix check.
+   */
+  KmerLookupResult lookupKmerByKey(const input_type& input,
+                                   const std::size_t input_pos,
+                                   const std::uint32_t key) const {
+    const std::uint32_t bucket = key >> low_bits;
+
+    KmerLookupResult result;
+
+    // ---------- Empty bucket: same short factor as computeLZFactorAt ----------
+
+    if (H_[bucket] & empty_bucket_flag) {
+      const std::uint32_t matching_bucket = H_[bucket] & empty_bucket_mask;
+
+      const std::uint32_t difference = (bucket ^ matching_bucket) << 16U;
+      const std::size_t lcp_chars = std::countl_zero(difference) / 2;
+
+      const std::size_t interval_position = H_[matching_bucket];
+      const std::size_t sa_position = sa_start_at(
+          matching_bucket, static_cast<std::uint32_t>(interval_position));
+
+      std::size_t ref_pos = static_cast<std::size_t>((*sa_)[sa_position]);
+      std::size_t match_length = lcp_chars;
+
+      check_short_suffixes(input, input_pos, bucket, ref_pos, match_length);
+
+      result.match_position = static_cast<std::uint32_t>(ref_pos);
+      result.match_length = static_cast<std::uint32_t>(match_length);
+      ++stats_.misses;
+      return result;
+    }
+
+    // ---------- Non-empty bucket: the existing PT16 lookup ----------
+
+    const LookupResult inner = lookup(input, input_pos, key);
+
+    if (!inner.found) {
+      result.match_position = static_cast<std::uint32_t>(inner.ref_pos);
+      result.match_length = static_cast<std::uint32_t>(inner.match_length);
+      return result;
+    }
+
+    result.found = true;
+    result.match_length = kmer_length;
+    result.count = inner.sa_end - inner.sa_start + 1;
+    result.match_position = static_cast<std::uint32_t>((*sa_)[inner.sa_start]);
+    return result;
+  }
+
+  /**
+   * lookupKmer for a query with all 16 characters, or the same suffix-array
+   * fallback computeLZFactorAt uses for the last few characters of an
+   * input: this format has no self-contained short-tail scheme like
+   * PT16SassyLookup::lookup_tail's zero-padding, so a tail here bypasses
+   * the PT16 table entirely (as it always has) rather than staying inside
+   * it. Tails are rare (at most kmer_length - 1 per input, always at the
+   * very end), so this does not affect what the bulk lookup comparison is
+   * measuring.
+   */
+  KmerLookupResult lookupKmerOrTail(const input_type& input,
+                                    const std::size_t input_pos) const {
+    if (input.size() - input_pos < kmer_length) {
+      const auto [pos, len] =
+          rlz::computeLZFactorAt<T1, T2>(input, *ref_, *sa_, input_pos);
+
+      KmerLookupResult result;
+      result.found = len > 0;
+      result.match_position = static_cast<std::uint32_t>(pos);
+      result.match_length = static_cast<std::uint32_t>(len);
+      return result;
+    }
+
+    return lookupKmer(input, input_pos);
   }
 
   const Stats& stats() const { return stats_; }
@@ -423,6 +564,8 @@ class PT16RLZParser {
     // Small bucket: linear scan.
 
     if (bucket_entries < binary_search_threshold) {
+      ++stats_.linear_bucket_searches;
+
       while (insertion_position < end && L_[insertion_position].low < low) {
         ++insertion_position;
       }
@@ -431,6 +574,8 @@ class PT16RLZParser {
 
     // Large bucket: binary search.
     else {
+      ++stats_.binary_bucket_searches;
+
       const auto it = std::lower_bound(
           L_.begin() + begin, L_.begin() + end, low,
           [](const LowerEntry& entry, const std::uint16_t value) {

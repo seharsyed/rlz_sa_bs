@@ -10,20 +10,13 @@ add_executable(clean_reference clean_reference.cpp)
 add_executable(clean_inputs clean_inputs.cpp)
 
 add_executable(pt16_rlz pt16_main.cpp)
-target_include_directories(
-    pt16_rlz
-    PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../parser
-)
+target_include_directories(pt16_rlz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_executable(pt16_v2 pt16_main_v2.cpp)
+target_include_directories(pt16_v2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(compare_rlz_cache compare_rlz_cache.cpp)
-target_include_directories(
-    compare_rlz_cache
-    PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../parser
-)
+target_include_directories(compare_rlz_cache PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(pt16_build_time pt16_build_time.cpp)
-target_include_directories(pt16_build_time PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../parser)
+target_include_directories(pt16_build_time PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

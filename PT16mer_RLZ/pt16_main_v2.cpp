@@ -8,7 +8,7 @@
 #include "parser.hpp"
 #include "pt16_build_sassy.hpp"
 #include "pt16_build_v2.hpp"
-#include "pt16_rlz_v2_interleaved.hpp"
+#include "pt16_rlz_v2.hpp"
 #include "pt16_sassy.hpp"
 #include "pt16_utils.hpp"
 
@@ -32,13 +32,18 @@ int main(int argc, char** argv) {
 
     std::cerr << "[2] Loading reference..." << std::endl;
     const auto reference = load_reference<Symbol>(args.reference);
-    std::cerr << "    Reference loaded: " << reference.size() << " bytes"
-              << std::endl;
+    std::cerr << "    Reference loaded: " << reference.size() << " bytes ("
+              << static_cast<double>(reference.size()) / (1024.0 * 1024.0)
+              << " MB)" << std::endl;
 
     std::cerr << "[3] Loading suffix array..." << std::endl;
     const auto suffix_array = load_suffix_array<SAType>(args.suffix_array);
-    std::cerr << "    Suffix array loaded: " << suffix_array.size()
-              << " entries" << std::endl;
+    const std::size_t suffix_array_bytes =
+        suffix_array.size() * sizeof(SAType);
+    std::cerr << "    Suffix array loaded: " << suffix_array_bytes
+              << " bytes ("
+              << static_cast<double>(suffix_array_bytes) / (1024.0 * 1024.0)
+              << " MB)" << std::endl;
 
     std::cerr << "[4] Loading input list..." << std::endl;
     const auto files = load_input_list(args.filenames);
@@ -137,7 +142,7 @@ int main(int argc, char** argv) {
     PT16RLZParser<Symbol, SAType> parser(reference, suffix_array, pt16_path);
 
     std::cerr << "PT16 loaded." << std::endl;
-    std::cerr << "Entries: " << parser.stats().entries << std::endl;
+    std::cerr << "PT16 entries: " << parser.stats().entries << std::endl;
     std::cerr << "PT16 memory: "
               << static_cast<double>(parser.stats().approx_bytes) /
                      (1024.0 * 1024.0)
@@ -207,6 +212,19 @@ int main(int argc, char** argv) {
 
     std::cerr << std::endl;
     std::cerr << "PT16 complete." << std::endl;
+    std::cerr << "Total PT16 time: " << total_pt16_ms << " ms" << std::endl;
+
+    std::cerr << "PT16 entries: " << parser.stats().entries << std::endl;
+    std::cerr << "PT16 hits: " << parser.stats().hits << std::endl;
+    std::cerr << "PT16 misses: " << parser.stats().misses << std::endl;
+    std::cerr << "PT16 singleton hits: " << parser.stats().singleton_hits
+              << std::endl;
+    std::cerr << "PT16 range hits: " << parser.stats().range_hits
+              << std::endl;
+    std::cerr << "PT16 memory: "
+              << static_cast<double>(parser.stats().approx_bytes) /
+                     (1024.0 * 1024.0)
+              << " MB" << std::endl;
 
     // ---------- Sassy preprocessing ----------
 
@@ -248,10 +266,10 @@ int main(int argc, char** argv) {
     PT16SassyLookup sassy(sassy_path);
 
     std::cerr << "Sassy loaded." << std::endl;
-    std::cerr << "Entries: " << sassy.stats().entries << std::endl;
-    std::cerr << "Sampled entries: " << sassy.stats().sampled_entries
+    std::cerr << "Sassy entries: " << sassy.stats().entries << std::endl;
+    std::cerr << "Sassy sampled entries: " << sassy.stats().sampled_entries
               << std::endl;
-    std::cerr << "Short suffixes: " << sassy.stats().short_suffixes
+    std::cerr << "Sassy short suffixes: " << sassy.stats().short_suffixes
               << std::endl;
     std::cerr << "Sassy memory: "
               << static_cast<double>(sassy.stats().approx_bytes) /
@@ -324,6 +342,23 @@ int main(int argc, char** argv) {
 
     std::cerr << std::endl;
     std::cerr << "Sassy complete." << std::endl;
+    std::cerr << "Total sassy time: " << total_sassy_ms << " ms" << std::endl;
+
+    std::cerr << "Sassy entries: " << sassy.stats().entries << std::endl;
+    std::cerr << "Sassy sampled entries: " << sassy.stats().sampled_entries
+              << std::endl;
+    std::cerr << "Sassy short suffixes: " << sassy.stats().short_suffixes
+              << std::endl;
+    std::cerr << "Sassy hits: " << sassy.stats().hits << std::endl;
+    std::cerr << "Sassy misses: " << sassy.stats().misses << std::endl;
+    std::cerr << "Sassy singleton hits: " << sassy.stats().singleton_hits
+              << std::endl;
+    std::cerr << "Sassy range hits: " << sassy.stats().range_hits
+              << std::endl;
+    std::cerr << "Sassy memory: "
+              << static_cast<double>(sassy.stats().approx_bytes) /
+                     (1024.0 * 1024.0)
+              << " MB" << std::endl;
 
     // The temporary baseline factor files are needed by both the PT16 and
     // the sassy correctness checks above, so they are only removed now.

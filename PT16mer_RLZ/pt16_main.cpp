@@ -201,6 +201,19 @@ int main(int argc, char** argv) {
 
     std::cerr << std::endl;
     std::cerr << "PT16 complete." << std::endl;
+    std::cerr << "Total PT16 time: " << total_pt16_ms << " ms" << std::endl;
+
+    std::cerr << "PT16 entries: " << parser.stats().entries << std::endl;
+    std::cerr << "PT16 hits: " << parser.stats().hits << std::endl;
+    std::cerr << "PT16 misses: " << parser.stats().misses << std::endl;
+    std::cerr << "PT16 singleton hits: " << parser.stats().singleton_hits
+              << std::endl;
+    std::cerr << "PT16 range hits: " << parser.stats().range_hits
+              << std::endl;
+    std::cerr << "PT16 memory: "
+              << static_cast<double>(parser.stats().approx_bytes) /
+                     (1024.0 * 1024.0)
+              << " MB" << std::endl;
 
     // ---------- Final summary ----------
 

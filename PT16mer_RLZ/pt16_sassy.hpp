@@ -85,6 +85,14 @@ class PT16SassyLookup {
     std::size_t misses = 0;
     std::size_t singleton_hits = 0;
     std::size_t range_hits = 0;
+
+    // How every non-empty-bucket dispatch searched its bucket: a linear
+    // scan below binary_search_threshold entries, std::lower_bound at or
+    // above it. Updated by lower_bound_low, so this covers both hits and
+    // non-empty-bucket misses (an empty-bucket miss never searches L_ at
+    // all, so it touches neither counter).
+    std::size_t linear_bucket_searches = 0;
+    std::size_t binary_bucket_searches = 0;
   };
 
   /**
@@ -534,6 +542,8 @@ class PT16SassyLookup {
                                 const std::uint32_t end,
                                 const std::uint16_t low) const {
     if (end - begin < binary_search_threshold) {
+      ++stats_.linear_bucket_searches;
+
       std::uint32_t at = begin;
 
       while (at < end && sassy_decode_low(L_[at]) < low) {
@@ -542,6 +552,8 @@ class PT16SassyLookup {
 
       return at;
     }
+
+    ++stats_.binary_bucket_searches;
 
     const auto it = std::lower_bound(
         L_.begin() + begin, L_.begin() + end, low,
