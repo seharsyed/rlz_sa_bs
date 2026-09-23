@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(sa_16mer_index)
 
+find_package(OpenMP REQUIRED)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -16,6 +18,7 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../parser
 )
+target_link_libraries(pt16_rlz PRIVATE OpenMP::OpenMP_CXX)
 
 add_executable(compare_rlz_cache compare_rlz_cache.cpp)
 target_include_directories(
@@ -24,6 +27,12 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../parser
 )
+target_link_libraries(compare_rlz_cache PRIVATE OpenMP::OpenMP_CXX)
 
 add_executable(pt16_build_time pt16_build_time.cpp)
-target_include_directories(pt16_build_time PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../parser)
+target_include_directories(
+    pt16_build_time
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../parser
+)

@@ -62,6 +62,14 @@ int main(int argc, char** argv) {
 
         std::cerr << "Baseline files: 0/" << files.size() << std::flush;
 
+        using std::chrono::duration_cast;
+        using std::chrono::high_resolution_clock;
+        using std::chrono::nanoseconds;
+        using std::chrono::milliseconds;
+
+        auto total_start = high_resolution_clock::now();
+
+        //#pragma omp parallel for schedule(dynamic)
         for (std::size_t file_index = 0; file_index < files.size(); ++file_index) {
             const auto input = load_input<Symbol>(files[file_index]);
 
@@ -89,9 +97,12 @@ int main(int argc, char** argv) {
             std::cerr << "\rBaseline files: " << file_index + 1 << "/" << files.size() << std::flush;
         }
 
+        auto total_end = high_resolution_clock::now();
+        double total_time = duration_cast<milliseconds>(total_end - total_start).count();
+
         std::cerr << std::endl;
         std::cerr << "Baseline complete." << std::endl;
-        std::cerr << "Total baseline time: " << total_baseline_ms << " ms" << std::endl;
+        std::cerr << "Total baseline time: " << total_baseline_ms << /*" " << total_time <<*/ " ms" << std::endl;
 
         // ---------- PT16 preprocessing ----------
 
@@ -161,10 +172,11 @@ std::cerr << "Table: " << pt16_path << std::endl;
 
         std::cerr << "PT16 files: 0/" << baseline_results.size() << std::flush;
 
-        for (std::size_t file_index = 0; file_index < baseline_results.size(); ++file_index) {
-            const BaselineResult& baseline_result = baseline_results[file_index];
+        auto pt16_start = high_resolution_clock::now();
+        #pragma omp parallel for schedule(dynamic)
+        for (std::size_t file_index = 0; file_index < files.size(); ++file_index) {
 
-            const auto input = load_input<Symbol>(baseline_result.filename);
+            const auto input = load_input<Symbol>(files[file_index]);
 
             Triples pt16;
 
@@ -178,13 +190,13 @@ write_factor_file(
     pt16
 );
 
-            const bool equal = factor_file_equals(baseline_result.factor_file, pt16, input, reference);
+            const bool equal = factor_file_equals(baseline_results[file_index].factor_file, pt16, input, reference);
 
             const auto current_stats = parser.stats();
             const PT16Delta file_stats = stats_difference(previous_stats, current_stats);
 
             csv.write_row(
-                baseline_result,
+                baseline_results[file_index],
                 pt16_ms,
                 pt16.size(),
                 equal,
@@ -199,10 +211,13 @@ write_factor_file(
             total_pt16_phrases += pt16.size();
             total_pt16_ms += pt16_ms;
 
-            fs::remove(baseline_result.factor_file);
+            fs::remove(baseline_results[file_index].factor_file);
 
-            std::cerr << "\rPT16 files: " << file_index + 1 << "/" << baseline_results.size() << std::flush;
+            std::cerr << "\rPT16 files: " << file_index + 1 << "/" << files.size() << std::flush;
         }
+
+        auto pt16_end = high_resolution_clock::now();
+        auto pt16_time = duration_cast<milliseconds>(pt16_end - pt16_start).count();
 
         std::cerr << std::endl;
         std::cerr << "PT16 complete." << std::endl;
@@ -215,7 +230,7 @@ write_factor_file(
         std::cerr << "========================================" << std::endl;
 
         const BenchmarkSummary summary{
-            baseline_results.size(),
+            files.size(),
             total_input_bytes,
             total_baseline_phrases,
             total_pt16_phrases,
@@ -229,7 +244,7 @@ write_factor_file(
 
         fs::remove_all(temporary_directory);
 
-        const double overall_speedup = total_pt16_ms == 0.0 ? 0.0 : total_baseline_ms / total_pt16_ms;
+        const double overall_speedup = total_pt16_ms == 0.0 ? 0.0 : total_baseline_ms / pt16_time;
 
         const std::size_t total_queries = parser.stats().hits + parser.stats().misses;
         const double total_hit_rate = total_queries == 0
@@ -251,7 +266,7 @@ write_factor_file(
 
         std::cout << "results=" << args.results << std::endl;
         std::cout << "total_baseline_ms=" << total_baseline_ms << std::endl;
-        std::cout << "total_pt16_ms=" << total_pt16_ms << std::endl;
+        std::cout << "total_pt16_ms=" << /*total_pt16_ms << " " <<*/ pt16_time << std::endl;
         std::cout << "overall_speedup=" << overall_speedup << std::endl;
         std::cout << "pt16_hits=" << parser.stats().hits << std::endl;
         std::cout << "pt16_misses=" << parser.stats().misses << std::endl;
