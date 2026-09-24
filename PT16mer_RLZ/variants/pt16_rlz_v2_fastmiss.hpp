@@ -79,6 +79,39 @@ class PT16FastMissParser {
     // short-suffix check (flagged buckets only).
     std::size_t empty_bucket_misses = 0;
     std::size_t short_suffix_checks = 0;
+
+    // Finger lookups (lookupKmerByKey(key, finger)): how many started a
+    // fresh bucket search (a new bucket, or a key below the previous one),
+    // how many continued from the previous insertion point in the same
+    // bucket, and how many L entries those continuations stepped over in
+    // total.
+    std::size_t finger_restarts = 0;
+    std::size_t finger_continues = 0;
+    std::size_t finger_steps = 0;
+  };
+
+  /**
+   * A finger into the table, for a run of lookups with non-decreasing keys
+   * (e.g. an input's 16-mers sorted by key): see lookupKmerByKey(key,
+   * finger). Start each run with a fresh Finger; it is only a position in
+   * this table, so it is cheap to copy and holds nothing to release.
+   */
+  class Finger {
+   public:
+    Finger() = default;
+
+   private:
+    friend class PT16FastMissParser;
+
+    // The previous lookup's bucket (number_of_buckets: none yet), whether
+    // it is empty, its entries [begin, end) in L when it is not, and the
+    // previous key's low part and insertion point there.
+    std::uint32_t bucket = NUMBER_OF_BUCKETS;
+    bool empty = false;
+    std::uint32_t begin = 0;
+    std::uint32_t end = 0;
+    std::uint32_t at = 0;
+    std::uint16_t low = 0;
   };
 
   PT16FastMissParser(const reference_type& ref, const suffix_array_type& sa,
@@ -112,113 +145,78 @@ class PT16FastMissParser {
     const std::uint32_t bucket = key >> low_bits;
     const std::uint32_t h = H_[bucket];
 
-    KmerLookupResult result;
-
-    // ---------- Empty bucket: precomputed answer ----------
-
     if (h & empty_bucket_flag) {
-      std::size_t ref_pos = empty_ref_pos_[bucket];
-      std::size_t match_length = empty_length_[bucket];
-
-      if (has_long_short_suffix(bucket)) {
-        ++stats_.short_suffix_checks;
-        check_short_suffixes(key, ref_pos, match_length);
-      }
-
-      ++stats_.misses;
-      ++stats_.empty_bucket_misses;
-      result.match_position = static_cast<std::uint32_t>(ref_pos);
-      result.match_length = static_cast<std::uint32_t>(match_length);
-      return result;
+      return empty_bucket_result(key, bucket);
     }
-
-    // ---------- Non-empty bucket: search L ----------
 
     const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
     const std::uint32_t begin = h;
     const std::uint32_t end = H_[next_nonempty_bucket(bucket)];
 
-    std::uint32_t position = begin;
+    return bucket_result(key, bucket, begin, end,
+                         lower_bound_low(begin, end, low));
+  }
 
-    if (end - begin < binary_search_threshold) {
-      ++stats_.linear_bucket_searches;
+  /**
+   * Same result as lookupKmerByKey(key), for a run of lookups whose keys
+   * never decrease (the input's 16-mers in sorted order): `finger`
+   * remembers where the previous lookup landed, so a lookup does not
+   * search its bucket from scratch.
+   *
+   * In the previous lookup's bucket, the search walks forward in L from
+   * the previous insertion point -- the key is not smaller, so its
+   * insertion point is not earlier -- and ends at this key's insertion
+   * point, which becomes the next start. Only a key in a new bucket
+   * restarts: its bucket's range is looked up in H and searched as by
+   * lookupKmerByKey(key) (linearly or by binary search, by size). An empty
+   * bucket is answered as by lookupKmerByKey(key).
+   *
+   * A key below the previous one also restarts, so the result is correct
+   * in any order; it is only fast in sorted order. (Same scheme as
+   * PT16SassyLookup::lookup(key, finger).)
+   */
+  KmerLookupResult lookupKmerByKey(const std::uint32_t key,
+                                   Finger& finger) const {
+    const std::uint32_t bucket = key >> low_bits;
+    const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
 
-      while (position < end && L_[position].low < low) {
-        ++position;
-      }
-    } else {
-      ++stats_.binary_bucket_searches;
+    if (bucket == finger.bucket && low >= finger.low) {
+      finger.low = low;
 
-      const auto it = std::lower_bound(
-          L_.begin() + begin, L_.begin() + end, low,
-          [](const Entry& entry, const std::uint16_t value) {
-            return entry.low < value;
-          });
-
-      position = static_cast<std::uint32_t>(it - L_.begin());
-    }
-
-    // ---------- Hit ----------
-
-    if (position < end && L_[position].low == low) {
-      ++stats_.hits;
-
-      const std::uint32_t sa_start = sa_start_at(bucket, position);
-      const std::uint32_t sa_end = interval_end(bucket, position, end);
-
-      result.found = true;
-      result.match_length = kmer_length;
-      result.count = sa_end - sa_start + 1;
-      result.match_position = L_[position].ref_pos;
-      result.positions = std::span<const std::uint32_t>(
-          sa_->data() + sa_start, static_cast<std::size_t>(result.count));
-
-      if (sa_start == sa_end) {
-        ++stats_.singleton_hits;
-      } else {
-        ++stats_.range_hits;
+      if (finger.empty) {
+        return empty_bucket_result(key, bucket);
       }
 
-      return result;
-    }
+      ++stats_.finger_continues;
 
-    // ---------- Miss: neighbour with the longest common prefix ----------
+      std::uint32_t at = finger.at;
 
-    ++stats_.misses;
-
-    std::uint32_t best;
-    std::size_t lcp_chars;
-
-    if (position == begin) {
-      best = begin;
-      lcp_chars = lcp_with(key, bucket, best);
-    } else if (position == end) {
-      best = end - 1;
-      lcp_chars = lcp_with(key, bucket, best);
-    } else {
-      const std::size_t predecessor_lcp = lcp_with(key, bucket, position - 1);
-      const std::size_t successor_lcp = lcp_with(key, bucket, position);
-
-      if (predecessor_lcp >= successor_lcp) {
-        best = position - 1;
-        lcp_chars = predecessor_lcp;
-      } else {
-        best = position;
-        lcp_chars = successor_lcp;
+      while (at < finger.end && L_[at].low < low) {
+        ++at;
       }
+
+      stats_.finger_steps += at - finger.at;
+      finger.at = at;
+
+      return bucket_result(key, bucket, finger.begin, finger.end, at);
     }
 
-    std::size_t ref_pos = L_[best].ref_pos;
+    // ---------- Restart: a new bucket (or a smaller key) ----------
 
-    // lcp_chars >= 8 here, so only a flagged bucket can do better.
-    if (has_long_short_suffix(bucket)) {
-      ++stats_.short_suffix_checks;
-      check_short_suffixes(key, ref_pos, lcp_chars);
+    ++stats_.finger_restarts;
+    finger.bucket = bucket;
+    finger.low = low;
+    finger.empty = (H_[bucket] & empty_bucket_flag) != 0;
+
+    if (finger.empty) {
+      return empty_bucket_result(key, bucket);
     }
 
-    result.match_position = static_cast<std::uint32_t>(ref_pos);
-    result.match_length = static_cast<std::uint32_t>(lcp_chars);
-    return result;
+    finger.begin = H_[bucket];
+    finger.end = H_[next_nonempty_bucket(bucket)];
+    finger.at = lower_bound_low(finger.begin, finger.end, low);
+
+    return bucket_result(key, bucket, finger.begin, finger.end, finger.at);
   }
 
   // Same as PT16RLZParser::lookupTailByKey: `key` is the 1 .. 15
@@ -462,6 +460,134 @@ class PT16FastMissParser {
   }
 
   // ---------- Table helpers (same as PT16RLZParser) ----------
+
+  // ---------- Building a lookup's result ----------
+
+  // An empty bucket: the precomputed answer, finished by the full
+  // short-suffix check only in a flagged bucket.
+  KmerLookupResult empty_bucket_result(const std::uint32_t key,
+                                       const std::uint32_t bucket) const {
+    std::size_t ref_pos = empty_ref_pos_[bucket];
+    std::size_t match_length = empty_length_[bucket];
+
+    if (has_long_short_suffix(bucket)) {
+      ++stats_.short_suffix_checks;
+      check_short_suffixes(key, ref_pos, match_length);
+    }
+
+    ++stats_.misses;
+    ++stats_.empty_bucket_misses;
+
+    KmerLookupResult result;
+    result.match_position = static_cast<std::uint32_t>(ref_pos);
+    result.match_length = static_cast<std::uint32_t>(match_length);
+    return result;
+  }
+
+  // Index of the first entry in [begin, end) whose low part is not below
+  // `low`, or `end`: linear below binary_search_threshold entries,
+  // std::lower_bound at or above it.
+  std::uint32_t lower_bound_low(const std::uint32_t begin,
+                                const std::uint32_t end,
+                                const std::uint16_t low) const {
+    if (end - begin < binary_search_threshold) {
+      ++stats_.linear_bucket_searches;
+
+      std::uint32_t position = begin;
+
+      while (position < end && L_[position].low < low) {
+        ++position;
+      }
+
+      return position;
+    }
+
+    ++stats_.binary_bucket_searches;
+
+    const auto it = std::lower_bound(
+        L_.begin() + begin, L_.begin() + end, low,
+        [](const Entry& entry, const std::uint16_t value) {
+          return entry.low < value;
+        });
+
+    return static_cast<std::uint32_t>(it - L_.begin());
+  }
+
+  // A non-empty bucket, with entries [begin, end) in L, and `position` the
+  // key's insertion point there: a hit if that entry is the key, otherwise
+  // a miss answered by the neighbouring entry with the longest common
+  // prefix.
+  KmerLookupResult bucket_result(const std::uint32_t key,
+                                 const std::uint32_t bucket,
+                                 const std::uint32_t begin,
+                                 const std::uint32_t end,
+                                 const std::uint32_t position) const {
+    const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
+
+    KmerLookupResult result;
+
+    // ---------- Hit ----------
+
+    if (position < end && L_[position].low == low) {
+      ++stats_.hits;
+
+      const std::uint32_t sa_start = sa_start_at(bucket, position);
+      const std::uint32_t sa_end = interval_end(bucket, position, end);
+
+      result.found = true;
+      result.match_length = kmer_length;
+      result.count = sa_end - sa_start + 1;
+      result.match_position = L_[position].ref_pos;
+      result.positions = std::span<const std::uint32_t>(
+          sa_->data() + sa_start, static_cast<std::size_t>(result.count));
+
+      if (sa_start == sa_end) {
+        ++stats_.singleton_hits;
+      } else {
+        ++stats_.range_hits;
+      }
+
+      return result;
+    }
+
+    // ---------- Miss: neighbour with the longest common prefix ----------
+
+    ++stats_.misses;
+
+    std::uint32_t best;
+    std::size_t lcp_chars;
+
+    if (position == begin) {
+      best = begin;
+      lcp_chars = lcp_with(key, bucket, best);
+    } else if (position == end) {
+      best = end - 1;
+      lcp_chars = lcp_with(key, bucket, best);
+    } else {
+      const std::size_t predecessor_lcp = lcp_with(key, bucket, position - 1);
+      const std::size_t successor_lcp = lcp_with(key, bucket, position);
+
+      if (predecessor_lcp >= successor_lcp) {
+        best = position - 1;
+        lcp_chars = predecessor_lcp;
+      } else {
+        best = position;
+        lcp_chars = successor_lcp;
+      }
+    }
+
+    std::size_t ref_pos = L_[best].ref_pos;
+
+    // lcp_chars >= 8 here, so only a flagged bucket can do better.
+    if (has_long_short_suffix(bucket)) {
+      ++stats_.short_suffix_checks;
+      check_short_suffixes(key, ref_pos, lcp_chars);
+    }
+
+    result.match_position = static_cast<std::uint32_t>(ref_pos);
+    result.match_length = static_cast<std::uint32_t>(lcp_chars);
+    return result;
+  }
 
   std::uint32_t next_nonempty_bucket(std::uint32_t bucket) const {
     ++bucket;

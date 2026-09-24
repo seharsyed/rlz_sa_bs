@@ -347,10 +347,48 @@ struct SassyPolicy {
   }
 };
 
+// The "finger" line of a finger search: how many lookups restarted a
+// bucket search, how many continued from the previous insertion point,
+// and how many L entries the continuations stepped over.
+template <typename Stats>
+Diagnostics finger_diagnostics(const Stats& before, const Stats& after) {
+  return counter_diagnostics(
+      "finger",
+      {{"restarts", after.finger_restarts - before.finger_restarts},
+       {"continues", after.finger_continues - before.finger_continues},
+       {"steps", after.finger_steps - before.finger_steps}});
+}
+
+// The fast-miss table searched with a finger
+// (PT16FastMissParser::lookupKmerByKey(key, finger)): in sorted order the
+// keys never decrease, so each lookup walks on from the previous one's
+// insertion point in L instead of searching its bucket from scratch; only
+// a new bucket restarts the search.
+struct FastMissFingerPolicy {
+  using Table = PT16FastMissParser<Symbol, SAType>;
+  using State = Table::Finger;
+  static constexpr bool sorted_only = true;
+
+  static KmerLookupResult lookup(const Table& table, State& finger,
+                                 std::uint32_t key) {
+    return table.lookupKmerByKey(key, finger);
+  }
+
+  static KmerLookupResult tail(const Table& table, std::uint32_t key,
+                               std::uint32_t length) {
+    return table.lookupTailByKey(key, length);
+  }
+
+  static Diagnostics counters(const Table::Stats& before,
+                              const Table::Stats& after) {
+    return finger_diagnostics(before, after) +
+           bucket_search_diagnostics(before, after) +
+           miss_diagnostics(before, after);
+  }
+};
+
 // The sassy table searched with a finger (PT16SassyLookup::lookup(key,
-// finger)): in sorted order the keys never decrease, so each lookup walks
-// on from the previous one's insertion point in L instead of searching
-// its bucket from scratch; only a new bucket restarts the search.
+// finger)), same scheme as FastMissFingerPolicy.
 struct SassyFingerPolicy {
   using Table = PT16SassyLookup;
   using State = PT16SassyLookup::Finger;
@@ -368,12 +406,7 @@ struct SassyFingerPolicy {
 
   static Diagnostics counters(const Table::Stats& before,
                               const Table::Stats& after) {
-    return counter_diagnostics(
-               "finger",
-               {{"restarts", after.finger_restarts - before.finger_restarts},
-                {"continues",
-                 after.finger_continues - before.finger_continues},
-                {"steps", after.finger_steps - before.finger_steps}}) +
+    return finger_diagnostics(before, after) +
            bucket_search_diagnostics(before, after) +
            miss_diagnostics(before, after);
   }
@@ -428,8 +461,14 @@ inline ProberSet build_probers(const std::vector<Symbol>& reference,
   set.probers.push_back(std::make_unique<TableProber<V2Policy>>(
       "pt16-v2", reference, suffix_array, v2_path));
 
-  set.probers.push_back(std::make_unique<TableProber<FastMissPolicy>>(
-      "pt16-v2-fastmiss", reference, suffix_array, v2_path));
+  auto fastmiss = std::make_unique<TableProber<FastMissPolicy>>(
+      "pt16-v2-fastmiss", reference, suffix_array, v2_path);
+  auto fastmiss_table = fastmiss->table();
+  set.probers.push_back(std::move(fastmiss));
+
+  // Same loaded table, searched with a finger (sorted order only).
+  set.probers.push_back(std::make_unique<TableProber<FastMissFingerPolicy>>(
+      "pt16-v2-fastmiss-finger", std::move(fastmiss_table)));
 
   auto sassy = std::make_unique<TableProber<SassyPolicy>>("pt16-sassy",
                                                            sassy_path);

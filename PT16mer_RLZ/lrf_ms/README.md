@@ -111,6 +111,7 @@ computed from.
 | --- | --- |
 | `pt16-v2` | plain v2 (`../pt16_rlz_v2.hpp`), file built by `../pt16_build_v2.hpp` |
 | `pt16-v2-fastmiss` | fast-miss (`../variants/pt16_rlz_v2_fastmiss.hpp`): same v2 file, reference position per entry, precomputed empty buckets, flagged short-suffix buckets |
+| `pt16-v2-fastmiss-finger` | the same loaded fast-miss table, searched with a finger (`PT16FastMissParser::lookupKmerByKey(key, finger)`); **sorted order only**, same scheme as `pt16-sassy-finger` below. |
 | `pt16-sassy` | sassy (`../variants/pt16_sassy.hpp`), `<table>.sassy`: self-contained, no reference or SA reads |
 | `pt16-sassy-finger` | the same loaded sassy table, searched with a finger (`PT16SassyLookup::lookup(key, finger)`); **sorted order only**. Keys never decrease there, so each lookup walks on in `L` from the previous insertion point; only a new bucket restarts the search. Reports `finger: restarts / continues / steps`. |
 

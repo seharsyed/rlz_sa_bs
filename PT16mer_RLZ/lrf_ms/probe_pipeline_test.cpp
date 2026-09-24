@@ -171,11 +171,14 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
     }
   }
 
-  // The finger lookup on its own: the same result as the plain lookup for
-  // keys in any order -- text order (unsorted, so it keeps restarting),
-  // every key twice in a row, and sorted -- since a smaller key restarts.
+  // The finger lookups on their own: the same result as the plain lookup
+  // for keys in any order -- text order (unsorted, so it keeps
+  // restarting), every key twice in a row, and sorted -- since a smaller
+  // key restarts.
   {
     const PT16SassyLookup sassy(table_path + ".sassy");
+    const PT16FastMissParser<Symbol, SAType> fastmiss(reference, sa,
+                                                      table_path);
 
     for (const std::vector<Symbol>& input : inputs) {
       std::vector<std::uint32_t> keys;
@@ -190,21 +193,31 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
         doubled.push_back(key);
       }
 
+      const auto same = [](const KmerLookupResult& a,
+                           const KmerLookupResult& b) {
+        return a.found == b.found && a.match_length == b.match_length &&
+               a.match_position == b.match_position && a.count == b.count &&
+               std::equal(a.positions.begin(), a.positions.end(),
+                          b.positions.begin(), b.positions.end());
+      };
+
       for (const auto* sequence : {&keys, &doubled, &sorted_keys}) {
-        PT16SassyLookup::Finger finger;
+        PT16SassyLookup::Finger sassy_finger;
+        PT16FastMissParser<Symbol, SAType>::Finger fastmiss_finger;
 
         for (std::size_t j = 0; j < sequence->size(); ++j) {
           const std::uint32_t key = (*sequence)[j];
-          const KmerLookupResult plain = sassy.lookup(key);
-          const KmerLookupResult fingered = sassy.lookup(key, finger);
 
-          if (fingered.found != plain.found ||
-              fingered.match_length != plain.match_length ||
-              fingered.match_position != plain.match_position ||
-              fingered.count != plain.count ||
-              !std::equal(fingered.positions.begin(), fingered.positions.end(),
-                          plain.positions.begin(), plain.positions.end())) {
-            fail("finger lookup differs from plain lookup at key " +
+          if (!same(sassy.lookup(key, sassy_finger), sassy.lookup(key))) {
+            fail("sassy finger lookup differs from plain lookup at key " +
+                 std::to_string(j) + " (n=" + std::to_string(input.size()) +
+                 ")");
+            break;
+          }
+
+          if (!same(fastmiss.lookupKmerByKey(key, fastmiss_finger),
+                    fastmiss.lookupKmerByKey(key))) {
+            fail("fastmiss finger lookup differs from plain lookup at key " +
                  std::to_string(j) + " (n=" + std::to_string(input.size()) +
                  ")");
             break;
