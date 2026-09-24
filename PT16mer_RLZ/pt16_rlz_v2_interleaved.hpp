@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -14,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "pt16_utils.hpp"  // EntryComposition, KmerLookupResult
 #include "rlz_common.hpp"
 
 template <typename T1, typename T2>
@@ -36,7 +38,8 @@ class PT16RLZParser {
   static constexpr std::uint32_t number_of_buckets = 65536;
   static constexpr std::uint32_t empty_bucket_flag = 1U << 31;
   static constexpr std::uint32_t empty_bucket_mask = empty_bucket_flag - 1;
-  static constexpr std::uint32_t binary_search_threshold = 64;
+  static constexpr std::uint32_t binary_search_threshold =
+      BINARY_SEARCH_THRESHOLD;
   static constexpr std::uint16_t large_offset_flag = 65535;
 
   struct Stats {
@@ -56,16 +59,11 @@ class PT16RLZParser {
     std::size_t binary_bucket_searches = 0;
   };
 
-  /**
-   * The answer to a 16-mer-only lookup (see lookupKmer below): analogous
-   * to PT16SassyLookup::LookupResult, but for this table format.
-   */
-  struct KmerLookupResult {
-    bool found = false;
-    std::uint32_t count = 0;
-    std::uint32_t match_position = 0;
-    std::uint32_t match_length = 0;
-  };
+  // The shared, format-agnostic type (pt16_utils.hpp) -- PT16SassyLookup's
+  // lookup returns the same one, so code consuming either format's
+  // results (e.g. a chain-extension pass) never needs to know which table
+  // produced them.
+  using KmerLookupResult = ::KmerLookupResult;
 
  private:
   struct LookupResult {
@@ -80,13 +78,13 @@ class PT16RLZParser {
     std::uint16_t low;        // current lower 16 bits of the 16-mer
     std::uint16_t sa_offset;  // relative SA interval start
   };
-  struct ShortSuffix {
-    std::uint32_t bucket;
-    std::size_t ref_pos;
-    std::size_t length;
-  };
-
-  std::vector<ShortSuffix> short_suffixes_;
+  // short_suffix_keys_[L], for L = 1 .. short_suffix_count_: the
+  // reference's last L characters, packed like a 16-mer key (2 bits each
+  // from the top bit down, unused low bits 0). These positions are too
+  // close to the end to have an H/L entry, so check_short_suffixes compares
+  // the query's key against them directly.
+  std::array<std::uint32_t, kmer_length> short_suffix_keys_{};
+  std::size_t short_suffix_count_ = 0;
 
   const reference_type* ref_ = nullptr;
   const suffix_array_type* sa_ = nullptr;
@@ -147,14 +145,14 @@ class PT16RLZParser {
       std::size_t ref_pos = static_cast<std::size_t>((*sa_)[sa_position]);
       std::size_t match_length = lcp_chars;
 
-      check_short_suffixes(input, input_pos, bucket, ref_pos, match_length);
+      check_short_suffixes_empty_bucket(key, ref_pos, match_length);
       ++stats_.misses;
 
       return {ref_pos, match_length};
     }
 
     // Non-empty bucket: use the existing PT16 lookup.
-    const LookupResult result = lookup(input, input_pos, key);
+    const LookupResult result = lookup(key);
 
     // Non-empty bucket miss: lookup() has already computed the short factor.
     if (!result.found) {
@@ -273,11 +271,12 @@ class PT16RLZParser {
    * repack it (see PT16ScanMS::computeMatchingStatisticsBucketed in
    * ms_variants.hpp, the counterpart of
    * PT16SassyMS::computeMatchingStatisticsScanOnlyBucketed).
-   * `input`/`input_pos` are only used if the lookup misses and has to fall
-   * back to the short-suffix check.
+   * `input`/`input_pos` are unused (the short-suffix check works from `key`
+   * too); they are kept so this has the same shape as
+   * PT16SassyLookup::lookup.
    */
-  KmerLookupResult lookupKmerByKey(const input_type& input,
-                                   const std::size_t input_pos,
+  KmerLookupResult lookupKmerByKey([[maybe_unused]] const input_type& input,
+                                   [[maybe_unused]] const std::size_t input_pos,
                                    const std::uint32_t key) const {
     const std::uint32_t bucket = key >> low_bits;
 
@@ -300,7 +299,7 @@ class PT16RLZParser {
       std::size_t ref_pos = static_cast<std::size_t>((*sa_)[sa_position]);
       std::size_t match_length = lcp_chars;
 
-      check_short_suffixes(input, input_pos, bucket, ref_pos, match_length);
+      check_short_suffixes_empty_bucket(key, ref_pos, match_length);
 
       result.match_position = static_cast<std::uint32_t>(ref_pos);
       result.match_length = static_cast<std::uint32_t>(match_length);
@@ -310,7 +309,7 @@ class PT16RLZParser {
 
     // ---------- Non-empty bucket: the existing PT16 lookup ----------
 
-    const LookupResult inner = lookup(input, input_pos, key);
+    const LookupResult inner = lookup(key);
 
     if (!inner.found) {
       result.match_position = static_cast<std::uint32_t>(inner.ref_pos);
@@ -322,6 +321,27 @@ class PT16RLZParser {
     result.match_length = kmer_length;
     result.count = inner.sa_end - inner.sa_start + 1;
     result.match_position = static_cast<std::uint32_t>((*sa_)[inner.sa_start]);
+
+    // The occurrences of a range are exactly sa_[sa_start..sa_end]
+    // (inclusive) -- already contiguous in the suffix array itself,
+    // thanks to lexicographic sorting grouping identical-prefix suffixes
+    // together, so exposing them needs no extra storage, unlike sassy's
+    // sampled_sa_ (this format has no equivalent scratch array; the
+    // suffix array already IS one, for this purpose).
+    result.positions = std::span<const std::uint32_t>(
+        sa_->data() + inner.sa_start, static_cast<std::size_t>(result.count));
+
+    // lookup() above only counts stats_.hits (generic); the
+    // singleton/range split is computeLZFactorAt's job normally, which
+    // this bypasses, so it is repeated here -- same condition, same
+    // stats_ fields, so PT16SassyLookup::lookup's own singleton/range
+    // counters and these stay comparable.
+    if (inner.sa_start == inner.sa_end) {
+      ++stats_.singleton_hits;
+    } else {
+      ++stats_.range_hits;
+    }
+
     return result;
   }
 
@@ -353,6 +373,47 @@ class PT16RLZParser {
 
   const Stats& stats() const { return stats_; }
 
+  /**
+   * Classifies every entry in the table by whether its SA interval has
+   * exactly one occurrence (singleton) or more than one (range). A
+   * structural property of the table itself, independent of any query --
+   * computed once (walks every bucket and every entry, same cost as a
+   * single full scan of the table), not per lookup.
+   */
+  EntryComposition entryComposition() const {
+    EntryComposition result;
+
+    for (std::uint32_t bucket = 0; bucket < number_of_buckets; ++bucket) {
+      if (H_interleaved_[2 * bucket] & empty_bucket_flag) {
+        continue;
+      }
+
+      const std::uint32_t begin = H_interleaved_[2 * bucket];
+
+      std::uint32_t next_bucket = bucket + 1;
+
+      while (next_bucket < number_of_buckets &&
+             (H_interleaved_[2 * next_bucket] & empty_bucket_flag)) {
+        ++next_bucket;
+      }
+
+      const std::uint32_t end = H_interleaved_[2 * next_bucket];
+
+      for (std::uint32_t position = begin; position < end; ++position) {
+        const std::uint32_t sa_start = sa_start_at(bucket, position);
+        const std::uint32_t sa_end = interval_end(bucket, position, end);
+
+        if (sa_start == sa_end) {
+          ++result.singleton_entries;
+        } else {
+          ++result.range_entries;
+        }
+      }
+    }
+
+    return result;
+  }
+
  private:
   // ---------- Build alphatab once ----------
 
@@ -363,42 +424,78 @@ class PT16RLZParser {
     alphatab_[static_cast<unsigned char>('T')] = 3;  // 11
   }
 
+  // Packs the reference's last 1 .. kmer_length-1 characters once (see
+  // short_suffix_keys_), so a miss never reads the reference or the input
+  // to check them.
   void build_short_suffixes() {
-    for (std::size_t length = 8; length < kmer_length; ++length) {
-      const std::size_t ref_pos = ref_->size() - length;
+    short_suffix_count_ =
+        std::min(static_cast<std::size_t>(kmer_length - 1), ref_->size());
 
-      std::uint32_t bucket = 0;
+    for (std::size_t length = 1; length <= short_suffix_count_; ++length) {
+      const std::size_t start = ref_->size() - length;
+      std::uint32_t key = 0;
 
-      for (std::size_t j = 0; j < 8; ++j) {
-        const std::uint8_t code =
-            alphatab_[static_cast<unsigned char>((*ref_)[ref_pos + j])];
-
-        bucket = (bucket << 2U) | code;
+      for (std::size_t j = 0; j < length; ++j) {
+        key = (key << 2U) |
+              alphatab_[static_cast<unsigned char>((*ref_)[start + j])];
       }
 
-      short_suffixes_.push_back({bucket, ref_pos, length});
+      short_suffix_keys_[length] =
+          key << (32U - 2U * static_cast<std::uint32_t>(length));
     }
   }
 
-  void check_short_suffixes(const input_type& input,
-                            const std::size_t input_pos,
-                            const std::uint32_t bucket, std::size_t& ref_pos,
-                            std::size_t& match_length) const {
-    for (const ShortSuffix& suffix : short_suffixes_) {
-      if (suffix.bucket != bucket) {
+  // Empty-bucket miss: raises the match if a short suffix of the reference
+  // shares a longer prefix with the query `key` than the table did. The
+  // table's LCP is < 8 here, so a suffix of any length can beat it and every
+  // one is checked (not only those in the query's bucket), but longest
+  // first: a suffix of length L shares at most L characters, so the loop
+  // stops as soon as L <= match_length.
+  void check_short_suffixes_empty_bucket(const std::uint32_t key,
+                                         std::size_t& ref_pos,
+                                         std::size_t& match_length) const {
+    for (std::size_t length = short_suffix_count_; length > match_length;
+         --length) {
+      // Capped at the suffix's own length: its unused low bits are 0 and
+      // must not count as matches.
+      const std::size_t shared = std::min<std::size_t>(
+          length, static_cast<std::size_t>(
+                      std::countl_zero(key ^ short_suffix_keys_[length])) /
+                      2);
+
+      if (shared > match_length) {
+        match_length = shared;
+        ref_pos = ref_->size() - length;
+      }
+    }
+  }
+
+  // Non-empty-bucket miss: the neighbouring table entry already shares the
+  // query's whole 8-character bucket prefix, so match_length >= 8. Only a
+  // suffix of length >= 8 that lies in the same bucket can beat that --
+  // any other shares < 8 characters -- so the rest are skipped.
+  void check_short_suffixes_in_bucket(const std::uint32_t key,
+                                      std::size_t& ref_pos,
+                                      std::size_t& match_length) const {
+    const std::uint32_t bucket = key >> low_bits;
+    const std::size_t min_length = std::max<std::size_t>(match_length, 7);
+
+    for (std::size_t length = short_suffix_count_; length > min_length;
+         --length) {
+      if ((short_suffix_keys_[length] >> low_bits) != bucket) {
         continue;
       }
 
-      std::size_t length = 8;
+      // Capped at the suffix's own length: its unused low bits are 0 and
+      // must not count as matches.
+      const std::size_t shared = std::min<std::size_t>(
+          length, static_cast<std::size_t>(
+                      std::countl_zero(key ^ short_suffix_keys_[length])) /
+                      2);
 
-      while (length < suffix.length &&
-             input[input_pos + length] == (*ref_)[suffix.ref_pos + length]) {
-        ++length;
-      }
-
-      if (length > match_length) {
-        match_length = length;
-        ref_pos = suffix.ref_pos;
+      if (shared > match_length) {
+        match_length = shared;
+        ref_pos = ref_->size() - length;
       }
     }
   }
@@ -555,8 +652,7 @@ class PT16RLZParser {
     return H_interleaved_[2 * bucket + 1] + sa_offset(position);
   }
 
-  LookupResult lookup(const input_type& input, const std::size_t input_pos,
-                      const std::uint32_t key) const {
+  LookupResult lookup(const std::uint32_t key) const {
     const std::uint32_t bucket = key >> low_bits;
     const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
 
@@ -673,7 +769,7 @@ class PT16RLZParser {
 
     std::size_t ref_pos = static_cast<std::size_t>((*sa_)[sa_position]);
 
-    check_short_suffixes(input, input_pos, bucket, ref_pos, lcp_chars);
+    check_short_suffixes_in_bucket(key, ref_pos, lcp_chars);
 
     return {false, 0, 0, ref_pos, lcp_chars};
   }

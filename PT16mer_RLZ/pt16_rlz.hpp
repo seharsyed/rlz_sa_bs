@@ -12,6 +12,7 @@
 #include <tuple>
 #include <vector>
 
+#include "pt16_utils.hpp"  // BINARY_SEARCH_THRESHOLD
 #include "rlz_common.hpp"
 
 template <typename T1, typename T2>
@@ -32,7 +33,8 @@ class PT16RLZParser {
   static constexpr std::uint32_t number_of_buckets = 65536;
   static constexpr std::uint32_t empty_bucket_flag = 1U << 31;
   static constexpr std::uint32_t empty_bucket_mask = empty_bucket_flag - 1;
-  static constexpr std::uint32_t binary_search_threshold = 64;
+  static constexpr std::uint32_t binary_search_threshold =
+      BINARY_SEARCH_THRESHOLD;
 
   struct Stats {
     std::size_t hits = 0;
@@ -51,13 +53,13 @@ class PT16RLZParser {
     std::size_t ref_pos = 0;
     std::size_t match_length = 0;
   };
-  struct ShortSuffix {
-    std::uint32_t bucket;
-    std::size_t ref_pos;
-    std::size_t length;
-  };
-
-  std::vector<ShortSuffix> short_suffixes_;
+  // short_suffix_keys_[L], for L = 1 .. short_suffix_count_: the
+  // reference's last L characters, packed like a 16-mer key (2 bits each
+  // from the top bit down, unused low bits 0). These positions are too
+  // close to the end to have an H/L entry, so check_short_suffixes compares
+  // the query's key against them directly.
+  std::array<std::uint32_t, kmer_length> short_suffix_keys_{};
+  std::size_t short_suffix_count_ = 0;
 
   const reference_type* ref_ = nullptr;
   const suffix_array_type* sa_ = nullptr;
@@ -110,7 +112,7 @@ class PT16RLZParser {
       std::size_t ref_pos = static_cast<std::size_t>((*sa_)[sa_position]);
       std::size_t match_length = lcp_chars;
 
-      check_short_suffixes(input, input_pos, bucket, ref_pos, match_length);
+      check_short_suffixes_empty_bucket(key, ref_pos, match_length);
       ++stats_.misses;
 
       // after checking the short suffixes lcp_chars may no longer be valig and
@@ -120,7 +122,7 @@ class PT16RLZParser {
     }
 
     // Non-empty bucket: use the existing PT16 lookup.
-    const LookupResult result = lookup(input, input_pos, key);
+    const LookupResult result = lookup(key);
 
     // Non-empty bucket miss: lookup() has already computed the short factor.
     if (!result.found) {
@@ -207,42 +209,78 @@ class PT16RLZParser {
     alphatab_[static_cast<unsigned char>('T')] = 3;  // 11
   }
 
+  // Packs the reference's last 1 .. kmer_length-1 characters once (see
+  // short_suffix_keys_), so a miss never reads the reference or the input
+  // to check them.
   void build_short_suffixes() {
-    for (std::size_t length = 8; length < kmer_length; ++length) {
-      const std::size_t ref_pos = ref_->size() - length;
+    short_suffix_count_ =
+        std::min(static_cast<std::size_t>(kmer_length - 1), ref_->size());
 
-      std::uint32_t bucket = 0;
+    for (std::size_t length = 1; length <= short_suffix_count_; ++length) {
+      const std::size_t start = ref_->size() - length;
+      std::uint32_t key = 0;
 
-      for (std::size_t j = 0; j < 8; ++j) {
-        const std::uint8_t code =
-            alphatab_[static_cast<unsigned char>((*ref_)[ref_pos + j])];
-
-        bucket = (bucket << 2U) | code;
+      for (std::size_t j = 0; j < length; ++j) {
+        key = (key << 2U) |
+              alphatab_[static_cast<unsigned char>((*ref_)[start + j])];
       }
 
-      short_suffixes_.push_back({bucket, ref_pos, length});
+      short_suffix_keys_[length] =
+          key << (32U - 2U * static_cast<std::uint32_t>(length));
     }
   }
 
-  void check_short_suffixes(const input_type& input,
-                            const std::size_t input_pos,
-                            const std::uint32_t bucket, std::size_t& ref_pos,
-                            std::size_t& match_length) const {
-    for (const ShortSuffix& suffix : short_suffixes_) {
-      if (suffix.bucket != bucket) {
+  // Empty-bucket miss: raises the match if a short suffix of the reference
+  // shares a longer prefix with the query `key` than the table did. The
+  // table's LCP is < 8 here, so a suffix of any length can beat it and every
+  // one is checked (not only those in the query's bucket), but longest
+  // first: a suffix of length L shares at most L characters, so the loop
+  // stops as soon as L <= match_length.
+  void check_short_suffixes_empty_bucket(const std::uint32_t key,
+                                         std::size_t& ref_pos,
+                                         std::size_t& match_length) const {
+    for (std::size_t length = short_suffix_count_; length > match_length;
+         --length) {
+      // Capped at the suffix's own length: its unused low bits are 0 and
+      // must not count as matches.
+      const std::size_t shared = std::min<std::size_t>(
+          length, static_cast<std::size_t>(
+                      std::countl_zero(key ^ short_suffix_keys_[length])) /
+                      2);
+
+      if (shared > match_length) {
+        match_length = shared;
+        ref_pos = ref_->size() - length;
+      }
+    }
+  }
+
+  // Non-empty-bucket miss: the neighbouring table entry already shares the
+  // query's whole 8-character bucket prefix, so match_length >= 8. Only a
+  // suffix of length >= 8 that lies in the same bucket can beat that --
+  // any other shares < 8 characters -- so the rest are skipped.
+  void check_short_suffixes_in_bucket(const std::uint32_t key,
+                                      std::size_t& ref_pos,
+                                      std::size_t& match_length) const {
+    const std::uint32_t bucket = key >> low_bits;
+    const std::size_t min_length = std::max<std::size_t>(match_length, 7);
+
+    for (std::size_t length = short_suffix_count_; length > min_length;
+         --length) {
+      if ((short_suffix_keys_[length] >> low_bits) != bucket) {
         continue;
       }
 
-      std::size_t length = 8;
+      // Capped at the suffix's own length: its unused low bits are 0 and
+      // must not count as matches.
+      const std::size_t shared = std::min<std::size_t>(
+          length, static_cast<std::size_t>(
+                      std::countl_zero(key ^ short_suffix_keys_[length])) /
+                      2);
 
-      while (length < suffix.length &&
-             input[input_pos + length] == (*ref_)[suffix.ref_pos + length]) {
-        ++length;
-      }
-
-      if (length > match_length) {
-        match_length = length;
-        ref_pos = suffix.ref_pos;
+      if (shared > match_length) {
+        match_length = shared;
+        ref_pos = ref_->size() - length;
       }
     }
   }
@@ -339,8 +377,7 @@ class PT16RLZParser {
     return static_cast<std::uint32_t>(sa_end);
   }
 
-  LookupResult lookup(const input_type& input, const std::size_t input_pos,
-                      const std::uint32_t key) const {
+  LookupResult lookup(const std::uint32_t key) const {
     const std::uint32_t bucket = key >> low_bits;
     const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
 
@@ -442,7 +479,7 @@ class PT16RLZParser {
 
     std::size_t ref_pos = static_cast<std::size_t>((*sa_)[sa_position]);
 
-    check_short_suffixes(input, input_pos, bucket, ref_pos, lcp_chars);
+    check_short_suffixes_in_bucket(key, ref_pos, lcp_chars);
 
     return {false, 0, 0, ref_pos, lcp_chars};
   }

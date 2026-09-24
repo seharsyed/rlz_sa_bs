@@ -12,10 +12,14 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <iostream>
+#include <span>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "rlz_common.hpp"
@@ -26,6 +30,76 @@ using Triples = std::vector<std::tuple<std::size_t, std::size_t, std::size_t>>;
 
 using MatchingStatistics =
     std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+
+// ---------- Shared 16-mer lookup result ----------
+
+/**
+ * The answer to one 16-mer lookup, format-agnostic: the SAME type
+ * PT16SassyLookup::lookup and PT16RLZParser::lookupKmerByKey both return,
+ * so code consuming these results (e.g. a chain-extension pass) does not
+ * need to know, or care, which table format produced them.
+ *
+ * found = true:  the 16-mer occurs in the reference.
+ *   count == 1:  match_position is its one text position.
+ *   count  > 1:  positions holds all `count` text positions, in ascending
+ *                order, as a view into the owning index's own storage --
+ *                PT16SassyLookup's sampled_sa_ for a sassy result, or
+ *                PT16RLZParser's own suffix array for a v2 result. Valid
+ *                only as long as that index is (nothing here is copied
+ *                out of it), and only until the index runs another
+ *                lookup for sassy's sampled_sa_-backed ranges (unused by
+ *                v2's, since its view is into the immutable suffix
+ *                array, not a per-lookup scratch buffer -- but treat both
+ *                the same way to stay safe either way).
+ *
+ * found = false: match_length/match_position are the best short match (an
+ *   LCP-based miss, or a short-suffix match at the very end of the
+ *   reference); count/positions are unused (0/empty).
+ *
+ * match_position is always set, hit or miss, and for a hit always equals
+ * `count == 1 ? <the one position> : positions.front()` -- so a caller
+ * that only needs ONE occurrence, not the full list, never needs the
+ * count==1 branch at all.
+ */
+struct KmerLookupResult {
+  bool found = false;
+  std::uint32_t count = 0;
+  std::uint32_t match_position = 0;
+  std::span<const std::uint32_t> positions;
+  std::uint32_t match_length = 0;
+};
+
+// ---------- Shared MS-benchmark diagnostics ----------
+//
+// Both structs are shared between the v2 (pt16_rlz_v2*.hpp) and sassy
+// (pt16_sassy.hpp) table formats, and between msbench::MSImplementation
+// (ms_variants.hpp) and PT16SassyMS (pt16_sassy_ms.hpp), which is why they
+// live here rather than in either.
+
+// The classification of "after search" 16-mer lookups, aggregated over a
+// whole scan: how many resolved as a singleton hit, a range hit, or a miss
+// (a "short factor" -- the 16-mer itself does not occur). Populated by the
+// scan-only PT16 MS variants, whose own reported lengths already ARE the
+// raw search result (unlike a variant that narrows/extends beyond it), so
+// this and that variant's own total length are directly comparable. Every
+// scan-only variant reports the identical counts for the same input (same
+// table content, same query set), which is why the benchmark prints this
+// once per file rather than once per implementation.
+struct SearchComposition {
+  bool available = false;
+  std::size_t singleton_hits = 0;
+  std::size_t range_hits = 0;
+  std::size_t misses = 0;
+};
+
+// A structural property of a built PT16 table itself: what fraction of its
+// distinct 16-mer entries are singletons (one occurrence in the reference)
+// vs. ranges (more than one) -- independent of any query, so it is
+// computed once, not per lookup, and printed once for the whole run.
+struct EntryComposition {
+  std::size_t singleton_entries = 0;
+  std::size_t range_entries = 0;
+};
 
 // ---------- 16-mer encoding ----------
 
@@ -60,6 +134,25 @@ inline std::uint32_t encode_16mer(const std::vector<unsigned char>& reference,
   return key;
 }
 
+// Packs the tail text[position, text.size()) -- 1 to KMER_LENGTH - 1
+// characters -- from the top bit like a 16-mer key, leaving the padding as
+// zero bits ('A'). A scan that already has the previous 16-mer key gets the
+// same key more cheaply by rolling it on with `key << 2` per position.
+
+inline std::uint32_t encode_tail(const std::vector<unsigned char>& text,
+                                 const std::size_t position) {
+  const std::size_t length = text.size() - position;
+  std::uint32_t key = 0;
+
+  for (std::size_t j = 0; j < length; ++j) {
+    const std::uint32_t code =
+        alphatab[static_cast<unsigned char>(text[position + j])];
+    key |= code << (30U - 2U * static_cast<std::uint32_t>(j));
+  }
+
+  return key;
+}
+
 // Number of common leading bits between two 16-bit bucket prefixes.
 
 inline std::uint32_t lcp_bits_16(const std::uint32_t first,
@@ -78,6 +171,12 @@ constexpr std::uint32_t LOW_MASK = BUCKET_SIZE - 1;
 constexpr std::uint32_t NUMBER_OF_BUCKETS = 65536;
 constexpr std::uint32_t EMPTY_BUCKET_FLAG = 1U << 31;
 constexpr std::uint16_t LARGE_OFFSET_FLAG = 65535;
+
+// Below this many entries, a bucket search is linear; at or above it,
+// binary (std::lower_bound). Shared by every PT16 lookup implementation
+// (pt16_sassy.hpp, pt16_rlz_v2_interleaved.hpp, pt16_rlz_v2.hpp,
+// pt16_rlz.hpp) so the threshold only needs changing here.
+constexpr std::uint32_t BINARY_SEARCH_THRESHOLD = 64;
 
 /*
 Builds the normal H prefix sums, then marks each empty bucket.

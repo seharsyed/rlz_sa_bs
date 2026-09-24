@@ -280,7 +280,7 @@ class PT16SassyMS {
         } else {
           entries[i].match_length = KMER_LENGTH;
           entries[i].match_position =
-              result.count == 1 ? result.position : result.positions.front();
+              result.count == 1 ? result.match_position : result.positions.front();
           entries[i].count = result.count;
           entries[i].positions = result.positions;
         }
@@ -394,7 +394,7 @@ class PT16SassyMS {
       } else {
         entries[i].match_length = KMER_LENGTH;
         entries[i].match_position =
-            result.count == 1 ? result.position : result.positions.front();
+            result.count == 1 ? result.match_position : result.positions.front();
         entries[i].count = result.count;
         entries[i].positions = result.positions;
       }

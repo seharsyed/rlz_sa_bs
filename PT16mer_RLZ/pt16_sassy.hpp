@@ -110,16 +110,11 @@ class PT16SassyLookup {
    * one place where that prefix occurs (the first occurrence when found).
    * The length is exact; the position is one of possibly many.
    */
-  struct LookupResult {
-    bool found = false;
-
-    std::uint32_t count = 0;
-    std::uint32_t position = 0;
-    std::span<const std::uint32_t> positions;
-
-    std::uint32_t match_position = 0;
-    std::uint32_t match_length = 0;
-  };
+  // The shared, format-agnostic type (pt16_utils.hpp) -- PT16RLZParser's
+  // lookupKmerByKey returns the same one, so code consuming either
+  // format's results (e.g. a chain-extension pass) never needs to know
+  // which table produced them.
+  using LookupResult = KmerLookupResult;
 
   /**
    * The answer to looking up a tail: a query of 1 to 15 characters.
@@ -189,8 +184,8 @@ class PT16SassyLookup {
         ++stats_.range_hits;
       } else {
         result.count = 1;
-        result.position = static_cast<std::uint32_t>(sassy_decode_position(entry));
-        result.match_position = result.position;
+        result.match_position =
+            static_cast<std::uint32_t>(sassy_decode_position(entry));
         ++stats_.singleton_hits;
       }
 
@@ -270,18 +265,18 @@ class PT16SassyLookup {
           " at position " + std::to_string(position));
     }
 
-    const std::uint32_t length =
-        static_cast<std::uint32_t>(text.size() - position);
+    return lookup_tail(encode_tail(text, position),
+                       static_cast<std::uint32_t>(text.size() - position));
+  }
 
-    // Pack the tail from the top bit, leaving the padding as zero bits.
-    std::uint32_t key = 0;
-
-    for (std::uint32_t j = 0; j < length; ++j) {
-      const std::uint32_t code =
-          alphatab[static_cast<unsigned char>(text[position + j])];
-      key |= code << (30U - 2U * j);
-    }
-
+  /**
+   * Same as lookup_tail(text, position), with the tail already packed as
+   * `key` (from the top bit, padding as zero bits -- see encode_tail) and
+   * `length` its 1 to 15 characters. A scan that has the previous 16-mer
+   * key gets `key` by rolling it on with `key << 2` instead of repacking.
+   */
+  TailResult lookup_tail(const std::uint32_t key,
+                         const std::uint32_t length) const {
     const LookupResult padded = lookup(key);
 
     // A match of the padded key may run into the padding; the tail ends
@@ -335,7 +330,7 @@ class PT16SassyLookup {
     std::size_t j = position + KMER_LENGTH;
 
     if (hit.count == 1) {
-      const std::uint32_t match = hit.position;
+      const std::uint32_t match = hit.match_position;
 
       while (j < text.size() && match + offset < reference.size() &&
              reference[match + offset] == text[j]) {
@@ -451,7 +446,8 @@ class PT16SassyLookup {
   static constexpr std::uint32_t empty_bucket_mask = EMPTY_BUCKET_FLAG - 1;
 
   // Buckets with fewer entries than this are searched linearly.
-  static constexpr std::uint32_t binary_search_threshold = 64;
+  static constexpr std::uint32_t binary_search_threshold =
+      BINARY_SEARCH_THRESHOLD;
 
   // There is at most one short suffix per length in
   // [SHORT_SUFFIX_MIN_LENGTH, KMER_LENGTH).
