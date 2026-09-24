@@ -101,6 +101,39 @@ class PT16SassyLookup {
     // than 8 characters (see long_short_buckets_).
     std::size_t empty_bucket_misses = 0;
     std::size_t short_suffix_checks = 0;
+
+    // Finger lookups (lookup(key, finger)): how many started a fresh
+    // bucket search (a new bucket, or a key below the previous one), how
+    // many continued from the previous insertion point in the same
+    // bucket, and how many L entries those continuations stepped over in
+    // total.
+    std::size_t finger_restarts = 0;
+    std::size_t finger_continues = 0;
+    std::size_t finger_steps = 0;
+  };
+
+  /**
+   * A finger into the table, for a run of lookups with non-decreasing keys
+   * (e.g. an input's 16-mers sorted by key): see lookup(key, finger).
+   * Start each run with a fresh Finger; it is only a position in this
+   * table, so it is cheap to copy and holds nothing to release.
+   */
+  class Finger {
+   public:
+    Finger() = default;
+
+   private:
+    friend class PT16SassyLookup;
+
+    // The previous lookup's bucket (NUMBER_OF_BUCKETS: none yet), whether
+    // it is empty, its entries [begin, end) in L when it is not, and the
+    // previous key's low part and insertion point there.
+    std::uint32_t bucket = NUMBER_OF_BUCKETS;
+    bool empty = false;
+    std::uint32_t begin = 0;
+    std::uint32_t end = 0;
+    std::uint32_t at = 0;
+    std::uint16_t low = 0;
   };
 
   /**
@@ -155,90 +188,75 @@ class PT16SassyLookup {
     const std::uint32_t bucket = key >> LOW_BITS;
     const std::uint16_t low = static_cast<std::uint16_t>(key & LOW_MASK);
 
-    LookupResult result;
-
-    // ---------- Empty bucket: no 16-mer starts with these 8 characters ----------
-
     if (H_[bucket] & EMPTY_BUCKET_FLAG) {
-      // Precomputed at load time (build_empty_answers): the nearest
-      // non-empty bucket's match, raised by any short suffix as far as the
-      // bucket's 8 characters go. Only a bucket holding a longer short
-      // suffix needs the query's remaining characters.
-      result.match_length = empty_length_[bucket];
-      result.match_position = empty_position_[bucket];
-
-      if (has_long_short_suffix(bucket)) {
-        ++stats_.short_suffix_checks;
-        match_short_suffixes(key, result);
-      }
-
-      ++stats_.misses;
-      ++stats_.empty_bucket_misses;
-      return result;
+      return empty_bucket_result(key, bucket);
     }
-
-    // ---------- Non-empty bucket: search it for the low 16 bits ----------
 
     const std::uint32_t begin = H_[bucket];
     const std::uint32_t end = bucket_end(bucket);
-    const std::uint32_t at = lower_bound_low(begin, end, low);
 
-    // Exact hit.
-    if (at < end && sassy_decode_low(L_[at]) == low) {
-      const std::uint64_t entry = L_[at];
+    return bucket_result(key, bucket, begin, end,
+                         lower_bound_low(begin, end, low));
+  }
 
-      result.found = true;
-      result.match_length = KMER_LENGTH;
+  /**
+   * Same result as lookup(key), for a run of lookups whose keys never
+   * decrease (the input's 16-mers in sorted order): `finger` remembers
+   * where the previous lookup landed, so a lookup does not search its
+   * bucket from scratch.
+   *
+   * In the previous lookup's bucket, the search walks forward in L from
+   * the previous insertion point -- the key is not smaller, so its
+   * insertion point is not earlier -- and ends at this key's insertion
+   * point, which becomes the next start. Only a key in a new bucket
+   * restarts: its bucket's range is looked up in H and searched as by
+   * lookup(key) (linearly or by binary search, by size). An empty bucket
+   * is answered as by lookup(key).
+   *
+   * A key below the previous one also restarts, so the result is correct
+   * in any order; it is only fast in sorted order.
+   */
+  LookupResult lookup(const std::uint32_t key, Finger& finger) const {
+    const std::uint32_t bucket = key >> LOW_BITS;
+    const std::uint16_t low = static_cast<std::uint16_t>(key & LOW_MASK);
 
-      if (sassy_is_range(entry)) {
-        result.positions = entry_slice(bucket, entry);
-        result.count = static_cast<std::uint32_t>(result.positions.size());
-        result.match_position = result.positions.front();
-        ++stats_.range_hits;
-      } else {
-        result.count = 1;
-        result.match_position =
-            static_cast<std::uint32_t>(sassy_decode_position(entry));
-        ++stats_.singleton_hits;
+    if (bucket == finger.bucket && low >= finger.low) {
+      finger.low = low;
+
+      if (finger.empty) {
+        return empty_bucket_result(key, bucket);
       }
 
-      ++stats_.hits;
-      return result;
+      ++stats_.finger_continues;
+
+      std::uint32_t at = finger.at;
+
+      while (at < finger.end && sassy_decode_low(L_[at]) < low) {
+        ++at;
+      }
+
+      stats_.finger_steps += at - finger.at;
+      finger.at = at;
+
+      return bucket_result(key, bucket, finger.begin, finger.end, at);
     }
 
-    // ---------- Miss: the neighbouring key with the longest common prefix ----------
+    // ---------- Restart: a new bucket (or a smaller key) ----------
 
-    std::uint32_t best;
+    ++stats_.finger_restarts;
+    finger.bucket = bucket;
+    finger.low = low;
+    finger.empty = (H_[bucket] & EMPTY_BUCKET_FLAG) != 0;
 
-    if (at == begin) {
-      best = begin;  // smaller than everything in the bucket
-    } else if (at == end) {
-      best = end - 1;  // larger than everything in the bucket
-    } else {
-      const std::uint32_t predecessor = at - 1;
-      const std::uint32_t successor = at;
-
-      const int predecessor_lcp =
-          std::countl_zero(key ^ key_of(bucket, L_[predecessor]));
-      const int successor_lcp =
-          std::countl_zero(key ^ key_of(bucket, L_[successor]));
-
-      best = predecessor_lcp >= successor_lcp ? predecessor : successor;
+    if (finger.empty) {
+      return empty_bucket_result(key, bucket);
     }
 
-    result.match_length =
-        static_cast<std::uint32_t>(std::countl_zero(key ^ key_of(bucket, L_[best])) / 2);
-    result.match_position = first_position(bucket, best);
+    finger.begin = H_[bucket];
+    finger.end = bucket_end(bucket);
+    finger.at = lower_bound_low(finger.begin, finger.end, low);
 
-    // match_length >= 8 here (the entry shares the bucket's 8 characters),
-    // so only a short suffix longer than 8 in this same bucket can beat it.
-    if (has_long_short_suffix(bucket)) {
-      ++stats_.short_suffix_checks;
-      match_short_suffixes(key, result);
-    }
-
-    ++stats_.misses;
-    return result;
+    return bucket_result(key, bucket, finger.begin, finger.end, finger.at);
   }
 
   /**
@@ -554,6 +572,99 @@ class PT16SassyLookup {
   }
 
   // ---------- Searching a bucket ----------
+
+  // ---------- Building a lookup's result ----------
+
+  // An empty bucket: no 16-mer starts with these 8 characters. Precomputed
+  // at load time (build_empty_answers): the nearest non-empty bucket's
+  // match, raised by any short suffix as far as the bucket's 8 characters
+  // go. Only a bucket holding a longer short suffix needs the query's
+  // remaining characters.
+  LookupResult empty_bucket_result(const std::uint32_t key,
+                                   const std::uint32_t bucket) const {
+    LookupResult result;
+    result.match_length = empty_length_[bucket];
+    result.match_position = empty_position_[bucket];
+
+    if (has_long_short_suffix(bucket)) {
+      ++stats_.short_suffix_checks;
+      match_short_suffixes(key, result);
+    }
+
+    ++stats_.misses;
+    ++stats_.empty_bucket_misses;
+    return result;
+  }
+
+  // A non-empty bucket, with entries [begin, end) in L, and `at` the key's
+  // insertion point there (the first entry whose low part is not below the
+  // key's): a hit if that entry is the key, otherwise a miss answered by
+  // the neighbouring entry with the longest common prefix.
+  LookupResult bucket_result(const std::uint32_t key,
+                             const std::uint32_t bucket,
+                             const std::uint32_t begin,
+                             const std::uint32_t end,
+                             const std::uint32_t at) const {
+    const std::uint16_t low = static_cast<std::uint16_t>(key & LOW_MASK);
+
+    LookupResult result;
+
+    // Exact hit.
+    if (at < end && sassy_decode_low(L_[at]) == low) {
+      const std::uint64_t entry = L_[at];
+
+      result.found = true;
+      result.match_length = KMER_LENGTH;
+
+      if (sassy_is_range(entry)) {
+        result.positions = entry_slice(bucket, entry);
+        result.count = static_cast<std::uint32_t>(result.positions.size());
+        result.match_position = result.positions.front();
+        ++stats_.range_hits;
+      } else {
+        result.count = 1;
+        result.match_position =
+            static_cast<std::uint32_t>(sassy_decode_position(entry));
+        ++stats_.singleton_hits;
+      }
+
+      ++stats_.hits;
+      return result;
+    }
+
+    // Miss: the neighbouring key with the longest common prefix.
+    std::uint32_t best;
+
+    if (at == begin) {
+      best = begin;  // smaller than everything in the bucket
+    } else if (at == end) {
+      best = end - 1;  // larger than everything in the bucket
+    } else {
+      const std::uint32_t predecessor = at - 1;
+      const std::uint32_t successor = at;
+
+      const int predecessor_lcp =
+          std::countl_zero(key ^ key_of(bucket, L_[predecessor]));
+      const int successor_lcp =
+          std::countl_zero(key ^ key_of(bucket, L_[successor]));
+
+      best = predecessor_lcp >= successor_lcp ? predecessor : successor;
+    }
+
+    result.match_length = static_cast<std::uint32_t>(
+        std::countl_zero(key ^ key_of(bucket, L_[best])) / 2);
+    result.match_position = first_position(bucket, best);
+
+    // match_length >= 8 here (the entry shares the bucket's 8 characters),
+    // so only a short suffix longer than 8 in this same bucket can beat it.
+    if (has_long_short_suffix(bucket)) {
+      ++stats_.short_suffix_checks;
+      match_short_suffixes(key, result);
+    }
+
+    ++stats_.misses;
+    return result;
+  }
 
   // Index in L one past the last entry of a non-empty bucket: the first entry
   // of the next non-empty bucket, or entry_count after the last one.

@@ -172,10 +172,22 @@ int main(int argc, char** argv) {
     msbench::ImplementationTotals chain_totals;
     chain_totals.name = "pt16-chain";
 
-    // probe_totals[o * probers.size() + p]: prober p in order o.
+    // One row per (order, prober) the prober supports:
+    // probe_row[o * probers.size() + p] is its index in probe_totals, or
+    // no_row if prober p does not run in order o.
+    constexpr std::size_t no_row = static_cast<std::size_t>(-1);
     std::vector<msbench::ProbeTotals> probe_totals;
+    std::vector<std::size_t> probe_row;
+
     for (const msbench::ProbeOrder order : msbench::probe_orders) {
       for (const auto& prober : probers) {
+        if (!prober->supports(order)) {
+          probe_row.push_back(no_row);
+          continue;
+        }
+
+        probe_row.push_back(probe_totals.size());
+
         msbench::ProbeTotals probe;
         probe.name = prober->name() + "-" + msbench::order_name(order);
         probe.build_ms = prober->build_ms();
@@ -379,7 +391,11 @@ int main(int argc, char** argv) {
           // Every variant probes in it.
           for (std::size_t p = 0; p < probers.size(); ++p) {
             msbench::Prober& prober = *probers[p];
-            const std::size_t row = o * probers.size() + p;
+            const std::size_t row = probe_row[o * probers.size() + p];
+
+            if (row == no_row) {
+              continue;
+            }
 
             std::vector<KmerLookupResult>& target =
                 have_chained ? results : chained;

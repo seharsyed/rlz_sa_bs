@@ -125,6 +125,10 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
       }
 
       for (auto& prober : set.probers) {
+        if (!prober->supports(probe_order)) {
+          continue;
+        }
+
         const std::string row = prober->name() + "-" +
                                 msbench::order_name(probe_order) +
                                 " n=" + std::to_string(n);
@@ -160,6 +164,49 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
                  std::to_string(want[i]) + " got " + std::to_string(length) +
                  "@" + std::to_string(position) +
                  (genuine ? "" : " (not a real match)"));
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // The finger lookup on its own: the same result as the plain lookup for
+  // keys in any order -- text order (unsorted, so it keeps restarting),
+  // every key twice in a row, and sorted -- since a smaller key restarts.
+  {
+    const PT16SassyLookup sassy(table_path + ".sassy");
+
+    for (const std::vector<Symbol>& input : inputs) {
+      std::vector<std::uint32_t> keys;
+      msbench::roll_keys(input, keys);
+
+      std::vector<std::uint32_t> sorted_keys = keys;
+      std::sort(sorted_keys.begin(), sorted_keys.end());
+
+      std::vector<std::uint32_t> doubled;
+      for (const std::uint32_t key : keys) {
+        doubled.push_back(key);
+        doubled.push_back(key);
+      }
+
+      for (const auto* sequence : {&keys, &doubled, &sorted_keys}) {
+        PT16SassyLookup::Finger finger;
+
+        for (std::size_t j = 0; j < sequence->size(); ++j) {
+          const std::uint32_t key = (*sequence)[j];
+          const KmerLookupResult plain = sassy.lookup(key);
+          const KmerLookupResult fingered = sassy.lookup(key, finger);
+
+          if (fingered.found != plain.found ||
+              fingered.match_length != plain.match_length ||
+              fingered.match_position != plain.match_position ||
+              fingered.count != plain.count ||
+              !std::equal(fingered.positions.begin(), fingered.positions.end(),
+                          plain.positions.begin(), plain.positions.end())) {
+            fail("finger lookup differs from plain lookup at key " +
+                 std::to_string(j) + " (n=" + std::to_string(input.size()) +
+                 ")");
             break;
           }
         }

@@ -153,6 +153,17 @@ inline void sorted_order(const std::vector<std::uint32_t>& keys,
 
 // ---------- Probers ----------
 
+// The probe orders, in report order.
+enum class ProbeOrder { bucket, sorted };
+
+inline constexpr std::array<ProbeOrder, 2> probe_orders = {ProbeOrder::bucket,
+                                                           ProbeOrder::sorted};
+
+inline const char* order_name(const ProbeOrder order) {
+  return order == ProbeOrder::bucket ? "bucket" : "sorted";
+}
+
+
 /**
  * One table variant under test: loads its table, then answers every lookup
  * of an input in a given order.
@@ -179,13 +190,22 @@ class Prober {
 
   // Counters from the last probe() call (e.g. bucket search, misses).
   virtual Diagnostics diagnostics() const { return {}; }
+
+  // Whether this variant is run in `order` at all (a stateful variant may
+  // only be meaningful in sorted order).
+  virtual bool supports(ProbeOrder) const { return true; }
 };
 
 /**
  * A Prober over one table type. The Policy adapts the table's own names:
  *
  *   using Table
- *   static KmerLookupResult lookup(const Table&, std::uint32_t key)
+ *   using State          per-probe lookup state, value-initialised at the
+ *                        start of every probe (an empty struct if the
+ *                        lookup is stateless)
+ *   static constexpr bool sorted_only
+ *                        true: only run in sorted order
+ *   static KmerLookupResult lookup(const Table&, State&, std::uint32_t key)
  *   static KmerLookupResult tail(const Table&, std::uint32_t key,
  *                                std::uint32_t length)
  *   static Diagnostics counters(const Table::Stats& before,
@@ -196,13 +216,22 @@ class TableProber final : public Prober {
  public:
   using Table = typename Policy::Table;
 
+  // Loads its own table (timed as build_ms) from the table's constructor
+  // arguments.
   template <typename... TableArgs>
   explicit TableProber(std::string name, TableArgs&&... args)
       : name_(std::move(name)) {
     build_ms_ = msbench::time_ms([&] {
-      table_ = std::make_unique<Table>(std::forward<TableArgs>(args)...);
+      table_ = std::make_shared<Table>(std::forward<TableArgs>(args)...);
     });
   }
+
+  // Shares an already loaded table (e.g. another prober's, see table()),
+  // so two ways of searching the same table do not hold it twice.
+  TableProber(std::string name, std::shared_ptr<Table> table)
+      : name_(std::move(name)), table_(std::move(table)) {}
+
+  const std::shared_ptr<Table>& table() const { return table_; }
 
   const std::string& name() const override { return name_; }
 
@@ -214,8 +243,10 @@ class TableProber final : public Prober {
     const Table& table = *table_;
     const auto before = table.stats();
 
+    typename Policy::State state{};
+
     for (const std::uint32_t i : order) {
-      results[i] = Policy::lookup(table, keys[i]);
+      results[i] = Policy::lookup(table, state, keys[i]);
     }
 
     const std::size_t n = results.size();
@@ -232,18 +263,25 @@ class TableProber final : public Prober {
 
   Diagnostics diagnostics() const override { return diagnostics_; }
 
+  bool supports(const ProbeOrder order) const override {
+    return !Policy::sorted_only || order == ProbeOrder::sorted;
+  }
+
  private:
   std::string name_;
   double build_ms_ = 0.0;
-  std::unique_ptr<Table> table_;
+  std::shared_ptr<Table> table_;
   Diagnostics diagnostics_;
 };
 
 // The plain v2 table (pt16_rlz_v2.hpp).
 struct V2Policy {
   using Table = PT16RLZParser<Symbol, SAType>;
+  struct State {};
+  static constexpr bool sorted_only = false;
 
-  static KmerLookupResult lookup(const Table& table, std::uint32_t key) {
+  static KmerLookupResult lookup(const Table& table, State&,
+                                 std::uint32_t key) {
     return table.lookupKmerByKey(key);
   }
 
@@ -261,8 +299,11 @@ struct V2Policy {
 // The v2 table with the cheaper miss path (variants/pt16_rlz_v2_fastmiss.hpp).
 struct FastMissPolicy {
   using Table = PT16FastMissParser<Symbol, SAType>;
+  struct State {};
+  static constexpr bool sorted_only = false;
 
-  static KmerLookupResult lookup(const Table& table, std::uint32_t key) {
+  static KmerLookupResult lookup(const Table& table, State&,
+                                 std::uint32_t key) {
     return table.lookupKmerByKey(key);
   }
 
@@ -281,8 +322,11 @@ struct FastMissPolicy {
 // The self-contained sassy table (variants/pt16_sassy.hpp).
 struct SassyPolicy {
   using Table = PT16SassyLookup;
+  struct State {};
+  static constexpr bool sorted_only = false;
 
-  static KmerLookupResult lookup(const Table& table, std::uint32_t key) {
+  static KmerLookupResult lookup(const Table& table, State&,
+                                 std::uint32_t key) {
     return table.lookup(key);
   }
 
@@ -303,6 +347,38 @@ struct SassyPolicy {
   }
 };
 
+// The sassy table searched with a finger (PT16SassyLookup::lookup(key,
+// finger)): in sorted order the keys never decrease, so each lookup walks
+// on from the previous one's insertion point in L instead of searching
+// its bucket from scratch; only a new bucket restarts the search.
+struct SassyFingerPolicy {
+  using Table = PT16SassyLookup;
+  using State = PT16SassyLookup::Finger;
+  static constexpr bool sorted_only = true;
+
+  static KmerLookupResult lookup(const Table& table, State& finger,
+                                 std::uint32_t key) {
+    return table.lookup(key, finger);
+  }
+
+  static KmerLookupResult tail(const Table& table, std::uint32_t key,
+                               std::uint32_t length) {
+    return SassyPolicy::tail(table, key, length);
+  }
+
+  static Diagnostics counters(const Table::Stats& before,
+                              const Table::Stats& after) {
+    return counter_diagnostics(
+               "finger",
+               {{"restarts", after.finger_restarts - before.finger_restarts},
+                {"continues",
+                 after.finger_continues - before.finger_continues},
+                {"steps", after.finger_steps - before.finger_steps}}) +
+           bucket_search_diagnostics(before, after) +
+           miss_diagnostics(before, after);
+  }
+};
+
 // ---------- Registry ----------
 
 struct TableBuild {
@@ -318,16 +394,6 @@ struct ProberSet {
   // chained, and every other one's are checked against them.
   std::vector<std::unique_ptr<Prober>> probers;
 };
-
-// The probe orders, in report order.
-enum class ProbeOrder { bucket, sorted };
-
-inline constexpr std::array<ProbeOrder, 2> probe_orders = {ProbeOrder::bucket,
-                                                           ProbeOrder::sorted};
-
-inline const char* order_name(const ProbeOrder order) {
-  return order == ProbeOrder::bucket ? "bucket" : "sorted";
-}
 
 /**
  * Builds each table file once and loads every variant under test.
@@ -365,8 +431,14 @@ inline ProberSet build_probers(const std::vector<Symbol>& reference,
   set.probers.push_back(std::make_unique<TableProber<FastMissPolicy>>(
       "pt16-v2-fastmiss", reference, suffix_array, v2_path));
 
-  set.probers.push_back(
-      std::make_unique<TableProber<SassyPolicy>>("pt16-sassy", sassy_path));
+  auto sassy = std::make_unique<TableProber<SassyPolicy>>("pt16-sassy",
+                                                           sassy_path);
+  auto sassy_table = sassy->table();
+  set.probers.push_back(std::move(sassy));
+
+  // Same loaded table, searched with a finger (sorted order only).
+  set.probers.push_back(std::make_unique<TableProber<SassyFingerPolicy>>(
+      "pt16-sassy-finger", std::move(sassy_table)));
 
   return set;
 }
