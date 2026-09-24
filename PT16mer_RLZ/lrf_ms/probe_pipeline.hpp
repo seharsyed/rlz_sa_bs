@@ -184,6 +184,10 @@ inline void bucket_order(const std::vector<std::uint32_t>& keys,
 // low 16 bits then (stably) high 16 bits. Matches the table's own layout
 // within a bucket too, and puts identical keys next to each other. If
 // `phases` is given, it receives the time of each step of both passes.
+//
+// Not used by the benchmark (see sorted_order_radix): its second pass reads
+// `keys` in the first pass's order, a random access per key. Kept as the
+// reference probe_pipeline_test checks the faster builds against.
 inline void sorted_order(const std::vector<std::uint32_t>& keys,
                          std::vector<std::uint32_t>& order,
                          std::vector<std::uint32_t>& scratch,
@@ -209,7 +213,11 @@ inline void sorted_order(const std::vector<std::uint32_t>& keys,
 }
 
 // The same order as sorted_order (positions sorted by key, ties by
-// position), built most-significant digit first:
+// position), built most-significant digit first. Replaced in the benchmark
+// by sorted_order_radix, which was 4-5x faster in a micro-benchmark:
+// here the per-bucket std::sort was over 80% of the time at realistic
+// density (~76 keys per bucket). Kept as an alternative, checked by
+// probe_pipeline_test.
 //
 //   count    one count per key's high 16 bits, reading keys in text order
 //   prefix   counts to starting offsets
@@ -296,6 +304,108 @@ inline void sorted_order_msd(const std::vector<std::uint32_t>& keys,
                                  {"scatter", ms_between(prefixed, scattered)},
                                  {"sort", ms_between(scattered, sorted)},
                                  {"unpack", ms_between(sorted, unpacked)}});
+  }
+}
+
+// The sorted probe order: positions sorted by key, ties by position (the
+// same order as sorted_order), as an LSD radix sort over packed
+// (key << 32 | position) values with 11-, 11- and 10-bit digits:
+//
+//   count    all three digits' counts from one read of `keys`, then each
+//            to starting offsets
+//   pass-1   bits 0-10: `keys` read in text order, packed values out
+//   pass-2   bits 11-21: the previous pass's packed values read in order
+//   pass-3   bits 22-31: likewise
+//   unpack   order[j] = the position in the last pass's packed[j]
+//
+// Every pass reads its input sequentially -- the key travels inside the
+// packed value, so no pass looks `keys[i]` up in another pass's order (the
+// old two-pass sort's cost) -- and scatters to at most 2048 places, which
+// stay in cache and TLB (16-bit digits scatter to 65536). Each pass is
+// stable, so ties keep text order.
+inline void sorted_order_radix(const std::vector<std::uint32_t>& keys,
+                               std::vector<std::uint32_t>& order,
+                               std::vector<std::uint64_t>& packed,
+                               std::vector<std::uint64_t>& other,
+                               Diagnostics* phases = nullptr) {
+  using clock = std::chrono::steady_clock;
+  const auto ms_between = [](clock::time_point from, clock::time_point to) {
+    return std::chrono::duration<double, std::milli>(to - from).count();
+  };
+
+  constexpr std::array<std::uint32_t, 3> shift = {0, 11, 22};
+  constexpr std::array<std::uint32_t, 3> mask = {(1U << 11) - 1,
+                                                 (1U << 11) - 1,
+                                                 (1U << 10) - 1};
+  constexpr std::uint32_t radix = 1U << 11;
+
+  const std::size_t n = keys.size();
+  const auto start = clock::now();
+
+  std::array<std::array<std::uint32_t, radix>, 3> next{};
+
+  for (const std::uint32_t key : keys) {
+    ++next[0][key & mask[0]];
+    ++next[1][(key >> shift[1]) & mask[1]];
+    ++next[2][key >> shift[2]];
+  }
+
+  for (auto& counts : next) {
+    std::uint32_t offset = 0;
+
+    for (std::uint32_t& c : counts) {
+      const std::uint32_t here = c;
+      c = offset;
+      offset += here;
+    }
+  }
+
+  phase_barrier(next.data());
+  const auto counted = clock::now();
+
+  packed.resize(n);
+  other.resize(n);
+
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::uint32_t key = keys[i];
+    other[next[0][key & mask[0]]++] =
+        (static_cast<std::uint64_t>(key) << 32) | static_cast<std::uint32_t>(i);
+  }
+
+  phase_barrier(other.data());
+  const auto passed_1 = clock::now();
+
+  for (const std::uint64_t value : other) {
+    const std::uint32_t key = static_cast<std::uint32_t>(value >> 32);
+    packed[next[1][(key >> shift[1]) & mask[1]]++] = value;
+  }
+
+  phase_barrier(packed.data());
+  const auto passed_2 = clock::now();
+
+  for (const std::uint64_t value : packed) {
+    const std::uint32_t key = static_cast<std::uint32_t>(value >> 32);
+    other[next[2][key >> shift[2]]++] = value;
+  }
+
+  phase_barrier(other.data());
+  const auto passed_3 = clock::now();
+
+  order.resize(n);
+
+  for (std::size_t j = 0; j < n; ++j) {
+    order[j] = static_cast<std::uint32_t>(other[j]);
+  }
+
+  phase_barrier(order.data());
+  const auto unpacked = clock::now();
+
+  if (phases != nullptr) {
+    *phases = phase_diagnostics({{"count", ms_between(start, counted)},
+                                 {"pass-1", ms_between(counted, passed_1)},
+                                 {"pass-2", ms_between(passed_1, passed_2)},
+                                 {"pass-3", ms_between(passed_2, passed_3)},
+                                 {"unpack", ms_between(passed_3, unpacked)}});
   }
 }
 

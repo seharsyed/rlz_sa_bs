@@ -123,15 +123,26 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
       } else {
         msbench::sorted_order(keys, order, scratch);
 
-        // The MSD build of the same order must give it exactly.
+        // The faster builds of the same order must give it exactly; the
+        // radix one is what the benchmark probes in.
         std::vector<std::uint32_t> msd_order;
+        std::vector<std::uint32_t> radix_order;
         std::vector<std::uint64_t> packed;
+        std::vector<std::uint64_t> other;
         msbench::sorted_order_msd(keys, msd_order, packed);
+        msbench::sorted_order_radix(keys, radix_order, packed, other);
 
         if (msd_order != order) {
           fail("sorted_order_msd differs from sorted_order (n=" +
                std::to_string(n) + ")");
         }
+
+        if (radix_order != order) {
+          fail("sorted_order_radix differs from sorted_order (n=" +
+               std::to_string(n) + ")");
+        }
+
+        order = std::move(radix_order);
       }
 
       for (auto& prober : set.probers) {

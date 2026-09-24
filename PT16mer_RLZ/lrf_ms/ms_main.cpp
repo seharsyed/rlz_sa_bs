@@ -169,18 +169,10 @@ int main(int argc, char** argv) {
     for (const msbench::ProbeOrder order : msbench::probe_orders) {
       add_stage(std::string(msbench::order_name(order)) + "-order");
     }
-    // The sorted order built most-significant digit first
-    // (sorted_order_msd), timed next to sorted-order for comparison and
-    // checked to give the same order; the probes use sorted-order's.
-    add_stage("sorted-order-msd");
     add_stage("chain");
 
     const std::size_t keys_stage = 0;
-    const std::size_t msd_stage = stage_totals.size() - 2;
     const std::size_t chain_stage = stage_totals.size() - 1;
-
-    // Files whose MSD sorted order differed from the LSD one.
-    std::size_t msd_order_mismatches = 0;
 
     msbench::ImplementationTotals chain_totals;
     chain_totals.name = "pt16-chain";
@@ -381,7 +373,9 @@ int main(int argc, char** argv) {
         bool have_chained = false;
 
         std::vector<std::uint32_t> order;
-        std::vector<std::uint32_t> scratch;
+        std::vector<std::uint32_t> scratch;   // bucket order's identity
+        std::vector<std::uint64_t> packed;    // sorted order's (key, position),
+        std::vector<std::uint64_t> other;     // in two buffers
 
         // Probe rows wait for the chain's time before they are written:
         // their pipeline time includes it.
@@ -397,35 +391,17 @@ int main(int argc, char** argv) {
                 if (probe_order == msbench::ProbeOrder::bucket) {
                   msbench::bucket_order(keys, order, scratch, &order_phases);
                 } else {
-                  msbench::sorted_order(keys, order, scratch, &order_phases);
+                  msbench::sorted_order_radix(keys, order, packed, other,
+                                              &order_phases);
                 }
               });
           record_stage(1 + o, order_timing);
           stage_totals[1 + o].diagnostics.accumulate(order_phases);
 
-          // The same sorted order, most-significant digit first: timed as
-          // its own stage, then checked against the LSD one.
-          if (probe_order == msbench::ProbeOrder::sorted) {
-            std::vector<std::uint32_t> msd_order;
-            std::vector<std::uint64_t> packed;
-            Diagnostics msd_phases;
-
-            const msbench::Timing msd_timing =
-                msbench::time_repeated(args.repeats, [&] {
-                  msbench::sorted_order_msd(keys, msd_order, packed,
-                                            &msd_phases);
-                });
-            record_stage(msd_stage, msd_timing);
-            stage_totals[msd_stage].diagnostics.accumulate(msd_phases);
-
-            if (msd_order != order) {
-              ++msd_order_mismatches;
-              file_diverged = true;
-              std::cerr << "    sorted-order-msd: ORDER MISMATCH against "
-                           "sorted-order"
-                        << std::endl;
-            }
-          }
+          // Only the order is probed in; its build buffers can go.
+          scratch = {};
+          packed = {};
+          other = {};
 
           // Every variant probes in it.
           for (std::size_t p = 0; p < probers.size(); ++p) {
@@ -581,12 +557,9 @@ int main(int argc, char** argv) {
     }
 
     if (run_pipeline) {
-      // The MSD sort is an alternative, not part of the pipeline.
       double shared_total = 0.0;
-      for (std::size_t s = 0; s < stage_totals.size(); ++s) {
-        if (s != msd_stage) {
-          shared_total += stage_totals[s].total_min_ms;
-        }
+      for (const auto& stage : stage_totals) {
+        shared_total += stage.total_min_ms;
       }
 
       std::cerr << std::endl
@@ -609,13 +582,6 @@ int main(int argc, char** argv) {
           std::cerr << "   lengths "
                     << equal_count(chain_totals.files_lengths_equal,
                                    chain_totals.files_compared);
-        }
-
-        if (s == msd_stage) {
-          std::cerr << "   (alternative to sorted-order, not probed; order "
-                    << equal_count(processed_files - msd_order_mismatches,
-                                   processed_files)
-                    << ")";
         }
 
         std::cerr << std::endl;
@@ -799,11 +765,6 @@ int main(int argc, char** argv) {
 
         all_ok = all_ok && probe.ok();
       }
-
-      std::cout << "sorted-order-msd.files_order_equal="
-                << processed_files - msd_order_mismatches << "/"
-                << processed_files << std::endl;
-      all_ok = all_ok && msd_order_mismatches == 0;
 
       for (const auto& build : prober_set.table_builds) {
         std::cout << "table." << build.name.substr(0, build.name.find(' '))

@@ -96,7 +96,7 @@ one pipeline, run per file as:
 | --- | --- | --- |
 | `keys` | once | roll every 16-mer key of the input |
 | `bucket-order` | once | positions grouped by table bucket (one counting-sort pass) |
-| `sorted-order` | once | positions fully sorted by key (two LSD counting-sort passes) |
+| `sorted-order` | once | positions fully sorted by key (`sorted_order_radix`): an LSD radix sort over packed `(key << 32 \| position)` values with 11/11/10-bit digits, so every pass reads its input sequentially and scatters to at most 2048 places. Replaced the MSD sort (`sorted_order_msd`: 16-bit pass + per-bucket `std::sort`, which dominated) and the original two-pass LSD sort (`sorted_order`, whose second pass reads the keys in random order); both are kept, and the test checks all three give the same order. |
 | probe | per variant, per order | one table lookup per key in that order, plus the tail positions |
 | `chain` | once | `backwardChainExtend` on the first variant's lookup results |
 
