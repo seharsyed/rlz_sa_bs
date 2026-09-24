@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -88,18 +89,35 @@ inline std::uint32_t first_tail_key(const std::vector<Symbol>& input,
   return input.empty() ? 0 : encode_tail(input, 0);
 }
 
+// Wall time of one counting-sort pass's three steps, in ms.
+struct CountingSortTimes {
+  double count_ms = 0.0;    // clear the counts, then one per key's digit
+  double prefix_ms = 0.0;   // counts to starting offsets
+  double scatter_ms = 0.0;  // each position to its slot in `out`
+};
+
 // One counting-sort pass: `in` reordered stably by digit_of(keys[i]).
 template <typename DigitOf>
-inline void counting_sort_pass(const std::vector<std::uint32_t>& keys,
-                               const std::vector<std::uint32_t>& in,
-                               std::vector<std::uint32_t>& out,
-                               DigitOf digit_of) {
+inline CountingSortTimes counting_sort_pass(
+    const std::vector<std::uint32_t>& keys, const std::vector<std::uint32_t>& in,
+    std::vector<std::uint32_t>& out, DigitOf digit_of) {
+  using clock = std::chrono::steady_clock;
+  const auto ms_between = [](clock::time_point from, clock::time_point to) {
+    return std::chrono::duration<double, std::milli>(to - from).count();
+  };
+
+  CountingSortTimes times;
+  const auto start = clock::now();
+
   auto count = std::make_unique<std::array<std::uint32_t, NUMBER_OF_BUCKETS>>();
   count->fill(0);
 
   for (const std::uint32_t i : in) {
     ++(*count)[digit_of(keys[i])];
   }
+
+  phase_barrier(count->data());
+  const auto counted = clock::now();
 
   std::uint32_t offset = 0;
 
@@ -109,46 +127,176 @@ inline void counting_sort_pass(const std::vector<std::uint32_t>& keys,
     offset += here;
   }
 
+  phase_barrier(count->data());
+  const auto prefixed = clock::now();
+
   out.resize(in.size());
 
   for (const std::uint32_t i : in) {
     out[(*count)[digit_of(keys[i])]++] = i;
   }
+
+  phase_barrier(out.data());
+  const auto scattered = clock::now();
+
+  times.count_ms = ms_between(start, counted);
+  times.prefix_ms = ms_between(counted, prefixed);
+  times.scatter_ms = ms_between(prefixed, scattered);
+  return times;
+}
+
+// `positions` = 0, 1, ..., keys.size() - 1, timed in ms.
+inline double fill_identity(const std::vector<std::uint32_t>& keys,
+                            std::vector<std::uint32_t>& positions) {
+  return msbench::time_ms([&] {
+    positions.resize(keys.size());
+
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+      positions[i] = static_cast<std::uint32_t>(i);
+    }
+
+    phase_barrier(positions.data());
+  });
 }
 
 // Positions grouped by table bucket (the key's top LOW_BITS), in text order
-// within a bucket: one counting-sort pass.
+// within a bucket: one counting-sort pass. If `phases` is given, it
+// receives the time of each step.
 inline void bucket_order(const std::vector<std::uint32_t>& keys,
                          std::vector<std::uint32_t>& order,
-                         std::vector<std::uint32_t>& identity) {
-  identity.resize(keys.size());
+                         std::vector<std::uint32_t>& identity,
+                         Diagnostics* phases = nullptr) {
+  const double identity_ms = fill_identity(keys, identity);
 
-  for (std::size_t i = 0; i < keys.size(); ++i) {
-    identity[i] = static_cast<std::uint32_t>(i);
+  const CountingSortTimes pass =
+      counting_sort_pass(keys, identity, order,
+                         [](std::uint32_t key) { return key >> LOW_BITS; });
+
+  if (phases != nullptr) {
+    *phases = phase_diagnostics({{"identity", identity_ms},
+                                 {"count", pass.count_ms},
+                                 {"prefix", pass.prefix_ms},
+                                 {"scatter", pass.scatter_ms}});
   }
-
-  counting_sort_pass(keys, identity, order,
-                     [](std::uint32_t key) { return key >> LOW_BITS; });
-  phase_barrier(order.data());
 }
 
 // Positions fully sorted by their 32-bit key: two LSD counting-sort passes,
 // low 16 bits then (stably) high 16 bits. Matches the table's own layout
-// within a bucket too, and puts identical keys next to each other.
+// within a bucket too, and puts identical keys next to each other. If
+// `phases` is given, it receives the time of each step of both passes.
 inline void sorted_order(const std::vector<std::uint32_t>& keys,
                          std::vector<std::uint32_t>& order,
-                         std::vector<std::uint32_t>& scratch) {
-  order.resize(keys.size());
+                         std::vector<std::uint32_t>& scratch,
+                         Diagnostics* phases = nullptr) {
+  const double identity_ms = fill_identity(keys, order);
 
-  for (std::size_t i = 0; i < keys.size(); ++i) {
-    order[i] = static_cast<std::uint32_t>(i);
+  const CountingSortTimes low =
+      counting_sort_pass(keys, order, scratch,
+                         [](std::uint32_t key) { return key & LOW_MASK; });
+  const CountingSortTimes high =
+      counting_sort_pass(keys, scratch, order,
+                         [](std::uint32_t key) { return key >> LOW_BITS; });
+
+  if (phases != nullptr) {
+    *phases = phase_diagnostics({{"identity", identity_ms},
+                                 {"low-count", low.count_ms},
+                                 {"low-prefix", low.prefix_ms},
+                                 {"low-scatter", low.scatter_ms},
+                                 {"high-count", high.count_ms},
+                                 {"high-prefix", high.prefix_ms},
+                                 {"high-scatter", high.scatter_ms}});
+  }
+}
+
+// The same order as sorted_order (positions sorted by key, ties by
+// position), built most-significant digit first:
+//
+//   count    one count per key's high 16 bits, reading keys in text order
+//   prefix   counts to starting offsets
+//   scatter  each (key << 32 | position) to its bucket's slot in `packed`
+//            -- the high pass of sorted_order, but it carries the key
+//            along, so nothing below reads `keys` again
+//   sort     each bucket's slice of `packed` sorted (std::sort): slices
+//            are small and contiguous, and sorting the packed values
+//            orders them by key, then by position
+//   unpack   order[j] = the position in packed[j]
+//
+// The high pass is the only one that walks the whole input, and it reads
+// `keys` sequentially -- unlike sorted_order's second pass, which reads
+// them in the first pass's order.
+inline void sorted_order_msd(const std::vector<std::uint32_t>& keys,
+                             std::vector<std::uint32_t>& order,
+                             std::vector<std::uint64_t>& packed,
+                             Diagnostics* phases = nullptr) {
+  using clock = std::chrono::steady_clock;
+  const auto ms_between = [](clock::time_point from, clock::time_point to) {
+    return std::chrono::duration<double, std::milli>(to - from).count();
+  };
+
+  const std::size_t n = keys.size();
+  const auto start = clock::now();
+
+  auto next = std::make_unique<std::array<std::uint32_t, NUMBER_OF_BUCKETS>>();
+  next->fill(0);
+
+  for (const std::uint32_t key : keys) {
+    ++(*next)[key >> LOW_BITS];
   }
 
-  counting_sort_pass(keys, order, scratch,
-                     [](std::uint32_t key) { return key & LOW_MASK; });
-  counting_sort_pass(keys, scratch, order,
-                     [](std::uint32_t key) { return key >> LOW_BITS; });
+  phase_barrier(next->data());
+  const auto counted = clock::now();
+
+  std::uint32_t offset = 0;
+
+  for (std::uint32_t& c : *next) {
+    const std::uint32_t here = c;
+    c = offset;
+    offset += here;
+  }
+
+  phase_barrier(next->data());
+  const auto prefixed = clock::now();
+
+  packed.resize(n);
+
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::uint32_t key = keys[i];
+    packed[(*next)[key >> LOW_BITS]++] =
+        (static_cast<std::uint64_t>(key) << 32) | static_cast<std::uint32_t>(i);
+  }
+
+  phase_barrier(packed.data());
+  const auto scattered = clock::now();
+
+  // After the scatter, next[b] is where bucket b ends.
+  std::uint32_t begin = 0;
+
+  for (const std::uint32_t end : *next) {
+    if (end - begin > 1) {
+      std::sort(packed.begin() + begin, packed.begin() + end);
+    }
+    begin = end;
+  }
+
+  phase_barrier(packed.data());
+  const auto sorted = clock::now();
+
+  order.resize(n);
+
+  for (std::size_t j = 0; j < n; ++j) {
+    order[j] = static_cast<std::uint32_t>(packed[j]);
+  }
+
   phase_barrier(order.data());
+  const auto unpacked = clock::now();
+
+  if (phases != nullptr) {
+    *phases = phase_diagnostics({{"count", ms_between(start, counted)},
+                                 {"prefix", ms_between(counted, prefixed)},
+                                 {"scatter", ms_between(prefixed, scattered)},
+                                 {"sort", ms_between(scattered, sorted)},
+                                 {"unpack", ms_between(sorted, unpacked)}});
+  }
 }
 
 // ---------- Probers ----------
@@ -458,8 +606,12 @@ inline ProberSet build_probers(const std::vector<Symbol>& reference,
                                                        sassy_path);
                               })});
 
-  set.probers.push_back(std::make_unique<TableProber<V2Policy>>(
-      "pt16-v2", reference, suffix_array, v2_path));
+  // pt16-v2 (V2Policy) left out for now, to keep runs short: fast-miss
+  // answers the same lookups on the same v2 file, faster. The v2 file is
+  // still written, since fast-miss loads it. To bring it back, restore:
+  //
+  // set.probers.push_back(std::make_unique<TableProber<V2Policy>>(
+  //     "pt16-v2", reference, suffix_array, v2_path));
 
   auto fastmiss = std::make_unique<TableProber<FastMissPolicy>>(
       "pt16-v2-fastmiss", reference, suffix_array, v2_path);

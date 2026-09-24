@@ -122,6 +122,16 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
         msbench::bucket_order(keys, order, scratch);
       } else {
         msbench::sorted_order(keys, order, scratch);
+
+        // The MSD build of the same order must give it exactly.
+        std::vector<std::uint32_t> msd_order;
+        std::vector<std::uint64_t> packed;
+        msbench::sorted_order_msd(keys, msd_order, packed);
+
+        if (msd_order != order) {
+          fail("sorted_order_msd differs from sorted_order (n=" +
+               std::to_string(n) + ")");
+        }
       }
 
       for (auto& prober : set.probers) {

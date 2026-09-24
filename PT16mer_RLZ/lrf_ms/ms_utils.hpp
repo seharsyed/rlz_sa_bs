@@ -863,6 +863,10 @@ struct StageTotals {
   double total_min_ms = 0.0;
   double total_first_ms = 0.0;
 
+  // The stage's own steps (e.g. a sort's count / prefix / scatter),
+  // summed over every file.
+  Diagnostics diagnostics;
+
   void accumulate(const Timing& timing) {
     total_min_ms += timing.min_ms;
     total_first_ms += timing.first_ms;
