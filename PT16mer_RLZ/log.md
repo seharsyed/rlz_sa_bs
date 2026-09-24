@@ -12,7 +12,7 @@ lex 100 first with the same reference as above
 using diff reference
  GCA_001012175.1_CFSAN026787_02.0.txt.sa
  ```bash
- ./pt16_v2 --reference ../../RLZ_DATA/cleaned-references/GCA_000005845.2_ASM584v2.cleaned --suffix-array ../../RLZ_DATA/cleaned-references/GCA_000005845.2_ASM584v2.cleaned.sa --filenames ../../RLZ_DATA/cleaned_input_list_100_first.txt --results results/pt16_v2_ecoli100.csv
+ ./pt16_v2 --reference ../../RLZ_DATA/cleaned_inputs/GCA_001012175.1_CFSAN026787_02.0.txt --suffix-array ../../RLZ_DATA/cleaned-references/GCA_001012175.1_CFSAN026787_02.0.txt.sa --filenames ../../RLZ_DATA/cleaned_input_list_100_first.txt --results results/pt16_v2_ecoli100.csv
  ```
  ```bash
  ./pt16_v2 --reference ../../RLZ_DATA/cleaned-references/GCA_000005845.2_ASM584v2.cleaned --suffix-array ../../RLZ_DATA/cleaned-references/GCA_000005845.2_ASM584v2.cleaned.sa --filenames ../../RLZ_DATA/input-list-100-lex.txt --results results/pt16_v2_ecoli100.csv
@@ -26,6 +26,17 @@ yet another reff
  ```bash
  ./pt16_v2 --reference ../../RLZ_DATA/cleaned-references/GCA_000005845.2_ASM584v2.cleaned --suffix-array ../../RLZ_DATA/cleaned-references/GCA_000005845.2_ASM584v2.cleaned.sa --filenames ../../RLZ_DATA/ --results results/pt16_v2_ecoli100.csv
  ```
+
+```bash
+cd PT16mer_RLZ
+./ms_main \
+  --reference ../../RLZ_DATA/cleaned-references/GCA_000005845.2_ASM584v2.cleaned \
+  --suffix-array ../../RLZ_DATA/cleaned-references/GCA_000005845.2_ASM584v2.cleaned.sa \
+  --filenames ../../RLZ_DATA/ecoli-input-lists/cleaned_input_list_100_first.txt \
+  --results results/ms_ecoli100.csv \
+  --no-invariants
+```
+
 
 100 first
 ```text

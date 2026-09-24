@@ -60,10 +60,6 @@ struct Args {
   // Also prove that no longer match exists (binary search in the SA).
   bool verify_maximality = false;
 
-  // O(|input| * |reference|) reference check, only below brute_limit.
-  bool verify_brute = false;
-  std::size_t brute_limit = 20000;
-
   bool stop_on_mismatch = false;
 };
 
@@ -80,8 +76,6 @@ inline void print_usage(const char* program) {
       << "  [--sample N --seed S]     check N random positions (default "
          "10000)\n"
       << "  [--verify-maximality]     prove the length cannot be extended\n"
-      << "  [--verify-brute]          compare with a brute-force computation\n"
-      << "  [--brute-limit N]         size limit for --verify-brute\n"
       << "  [--stop-on-mismatch]      stop after the first divergent file\n";
 }
 
@@ -140,10 +134,6 @@ inline Args parse_args(int argc, char** argv) {
       args.seed = parse_number(option, require_value(i, argc, argv));
     } else if (option == "--verify-maximality") {
       args.verify_maximality = true;
-    } else if (option == "--verify-brute") {
-      args.verify_brute = true;
-    } else if (option == "--brute-limit") {
-      args.brute_limit = parse_number(option, require_value(i, argc, argv));
     } else if (option == "--stop-on-mismatch") {
       args.stop_on_mismatch = true;
     } else if (option == "--help" || option == "-h") {
@@ -758,10 +748,22 @@ struct ImplementationTotals {
   std::size_t invariant_failures = 0;
   std::size_t position_failures = 0;
 
+  // Length digest summed over every file (max_len is the maximum).
+  std::uint64_t total_len = 0;
+  std::uint32_t max_len = 0;
+  std::size_t zero_len_count = 0;
+
+  // The implementation's per-call diagnostics (phase times, lookup
+  // counters), summed over every file.
+  Diagnostics diagnostics;
+
   void accumulate(const FileRunResult& result) {
     total_min_ms += result.timing.min_ms;
     total_first_ms += result.timing.first_ms;
     total_entries += result.digest.entries;
+    total_len += result.digest.total_len;
+    max_len = std::max(max_len, result.digest.max_len);
+    zero_len_count += result.digest.zero_len_count;
 
     if (result.lengths.checked) {
       ++files_compared;

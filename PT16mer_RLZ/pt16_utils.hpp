@@ -377,6 +377,125 @@ inline double time_ms(Fn&& fn) {
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+// Forces every write through `p` to happen before this point. Without it,
+// once a lookup is inlined the compiler may move a phase's stores (e.g. the
+// whole probe loop's writes into `results`) past the next clock::now(),
+// making that phase look free and charging its cost to a later one. Put
+// one after each timed phase, on that phase's output.
+inline void phase_barrier(const void* p) {
+  asm volatile("" : : "r"(p) : "memory");
+}
+
+// Per-call diagnostics from one MS implementation: an ordered list of
+// lines, each a label and named values. Kept structured rather than as
+// text so a benchmark can sum them over every file (accumulate) and print
+// one summary per implementation at the end (format).
+struct Diagnostics {
+  struct Line {
+    std::string label;  // "phases", "bucket search", "misses", ...
+    // Phase times in ms: printed with each one's share of their sum,
+    // then the sum. Otherwise the values are plain counters.
+    bool is_phases = false;
+    std::vector<std::pair<std::string, double>> values;
+  };
+
+  std::vector<Line> lines;
+
+  bool empty() const { return lines.empty(); }
+
+  // Appends one more phase to the phases line (starting one if there is
+  // none), e.g. a step run after the scan that produced the line.
+  void add_phase(const char* name, const double ms) {
+    for (Line& line : lines) {
+      if (line.is_phases) {
+        line.values.emplace_back(name, ms);
+        return;
+      }
+    }
+
+    lines.insert(lines.begin(), Line{"phases", true, {{name, ms}}});
+  }
+
+  // Adds `other` value by value. Both come from the same implementation,
+  // so they have the same shape; an empty side is just taken over.
+  void accumulate(const Diagnostics& other) {
+    if (lines.empty()) {
+      lines = other.lines;
+      return;
+    }
+
+    for (std::size_t l = 0; l < lines.size() && l < other.lines.size(); ++l) {
+      auto& values = lines[l].values;
+      const auto& other_values = other.lines[l].values;
+
+      for (std::size_t v = 0; v < values.size() && v < other_values.size();
+           ++v) {
+        values[v].second += other_values[v].second;
+      }
+    }
+  }
+
+  // One line per Line, each indented by `indent` and ending in '\n'.
+  std::string format(const std::string& indent = "        ") const {
+    std::ostringstream out;
+    out << std::fixed;
+
+    for (const Line& line : lines) {
+      out << indent << line.label << ":";
+
+      if (line.is_phases) {
+        double total_ms = 0.0;
+        for (const auto& [name, ms] : line.values) total_ms += ms;
+
+        const char* separator = " ";
+        for (const auto& [name, ms] : line.values) {
+          out << separator << name << ' ' << std::setprecision(3) << ms
+              << " ms (" << std::setprecision(1)
+              << (total_ms > 0.0 ? 100.0 * ms / total_ms : 0.0) << "%)";
+          separator = "  ";
+        }
+
+        out << "  total " << std::setprecision(3) << total_ms << " ms";
+      } else {
+        for (const auto& [name, value] : line.values) {
+          out << ' ' << name << '=' << std::setprecision(0) << value;
+        }
+      }
+
+      out << '\n';
+    }
+
+    return out.str();
+  }
+};
+
+// Concatenates two calls' lines (e.g. a phase line and a counter line).
+inline Diagnostics operator+(Diagnostics first, const Diagnostics& second) {
+  first.lines.insert(first.lines.end(), second.lines.begin(),
+                     second.lines.end());
+  return first;
+}
+
+// One "phases" line: each phase's time, shown with its share of their sum.
+// Shared by the bucketed and sorted scans so their lines read the same way.
+inline Diagnostics phase_diagnostics(
+    std::initializer_list<std::pair<const char*, double>> phases) {
+  Diagnostics::Line line{"phases", true, {}};
+  for (const auto& [name, ms] : phases) line.values.emplace_back(name, ms);
+  return {{std::move(line)}};
+}
+
+// One line of plain counters, e.g. "bucket search: linear=.. binary=..".
+inline Diagnostics counter_diagnostics(
+    const char* label,
+    std::initializer_list<std::pair<const char*, std::size_t>> counters) {
+  Diagnostics::Line line{label, false, {}};
+  for (const auto& [name, value] : counters) {
+    line.values.emplace_back(name, static_cast<double>(value));
+  }
+  return {{std::move(line)}};
+}
+
 inline double peak_rss_mb() {
   struct rusage usage{};
 

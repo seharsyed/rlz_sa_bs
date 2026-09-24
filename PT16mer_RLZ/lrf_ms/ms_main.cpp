@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
@@ -18,8 +19,10 @@ using msbench::Symbol;
  * each input file is processed on its own: the baseline runs, its
  * lengths are kept, every variant runs and is compared against those
  * lengths, and the file is released before the next one is loaded. Times
- * accumulate per implementation, so the end of the run gives both the
- * per-file detail and the whole-collection total for each variant.
+ * and diagnostics accumulate per implementation, so the end of the run
+ * gives the whole-collection totals and diagnostics for each variant
+ * (per-file rows still go to the results CSV); stderr only reports a
+ * failure per file.
  *
  * Peak memory is therefore one input plus the baseline's lengths (four
  * bytes per position) plus one variant's MatchingStatistics, rather than
@@ -102,6 +105,19 @@ int main(int argc, char** argv) {
     std::cerr << "Peak RSS after build: " << msbench::peak_rss_mb() << " MB"
               << std::endl;
 
+    // A structural property of the built table (e.g. singleton vs. range
+    // entry counts), not of any query, so it does not vary between
+    // implementations sharing the same table format -- print only the
+    // first non-empty one, once, rather than once per implementation.
+    for (const auto& implementation : implementations) {
+      const std::string composition = implementation->indexComposition();
+
+      if (!composition.empty()) {
+        std::cerr << composition;
+        break;
+      }
+    }
+
     // ---------- Output files ----------
 
     std::cerr << std::endl;
@@ -126,6 +142,10 @@ int main(int argc, char** argv) {
 
     std::size_t processed_files = 0;
     std::size_t total_input_bytes = 0;
+
+    // The raw-search classification (see search_composition below), summed
+    // over every file for the summary.
+    SearchComposition search_totals;
     bool stopped_early = false;
 
     for (std::size_t file_index = 0; file_index < files.size(); ++file_index) {
@@ -134,7 +154,7 @@ int main(int argc, char** argv) {
       // Loading is deliberately outside every timed region.
       const auto input = msbench::load_input<Symbol>(filename);
 
-      std::cerr << "\n[" << file_index + 1 << "/" << files.size() << "] "
+      std::cerr << "[" << file_index + 1 << "/" << files.size() << "] "
                 << filename << "  (" << input.size() << " bytes)" << std::endl;
 
       // The baseline's lengths for THIS file only, released with the
@@ -142,6 +162,18 @@ int main(int argc, char** argv) {
       std::vector<std::uint32_t> baseline_lengths;
       double baseline_min_ms = 0.0;
       bool file_diverged = false;
+
+      // The raw-search classification is identical across every scan-only
+      // PT16 variant for this file (same table content, same queries), so
+      // only the first one that offers it is kept, and added once to
+      // search_totals after the loop below -- not once per implementation.
+      // Only the classification itself, not a length: the scan-only
+      // floor's own average length is not the true average phrase length
+      // (every hit is capped at 16 there, whatever the true match reaches),
+      // so it is not reported at all -- see the baseline's own
+      // avg_phrase_length in the summary for that.
+      bool search_composition_captured = false;
+      SearchComposition search_composition;  // global namespace (pt16_utils.hpp)
 
       for (std::size_t k = 0; k < implementations.size(); ++k) {
         msbench::MSImplementation& implementation = *implementations[k];
@@ -170,7 +202,14 @@ int main(int argc, char** argv) {
                 msbench::validate_invariants(ms, input, reference, alphabet);
           }
 
-          if (result.invariants.ok) {
+          // Gated the same as validate_invariants above (not just on its
+          // result): Validation defaults to .ok = true, so with
+          // --no-invariants skipping the check above, result.invariants
+          // was still reading as "ok" here and this ran anyway -- for
+          // every position (or up to --sample of them), a binary search
+          // over the whole suffix array. That made --no-invariants not
+          // actually skip the expensive part.
+          if (args.check_invariants && result.invariants.ok) {
             result.positions =
                 args.verify_full
                     ? msbench::verify_all_positions(ms, input, reference,
@@ -182,26 +221,17 @@ int main(int argc, char** argv) {
                                               args.verify_maximality);
           }
 
-          if (args.verify_brute && result.invariants.ok) {
-            if (input.size() <= args.brute_limit &&
-                reference.size() <= args.brute_limit) {
-              const msbench::Validation brute =
-                  msbench::verify_against_brute_force(ms, input, reference);
-
-              if (!brute.ok) {
-                result.invariants = brute;
-              }
-            } else if (file_index == 0 && k == 0) {
-              std::cerr << "    (brute-force check skipped: over "
-                           "--brute-limit)"
-                        << std::endl;
-            }
-          }
-
           if (is_baseline) {
             baseline_lengths = msbench::extract_lengths(ms);
             baseline_min_ms = result.timing.min_ms;
-          } else {
+          } else if (implementation.exactExpected()) {
+            // Skipped entirely for a variant documented as NOT exact by
+            // design (a scan-only floor, or one-step chainExtend): it is
+            // never going to equal the baseline, so comparing it was
+            // never a correctness question, only a per-file, per-run
+            // O(n) scan (and a LENGTH MISMATCH report) that cost time
+            // without telling us anything the doc comment doesn't
+            // already say.
             result.lengths = msbench::compare_lengths(baseline_lengths, ms);
           }
 
@@ -213,63 +243,50 @@ int main(int argc, char** argv) {
           // ms is released here, before the next implementation runs.
         }
 
+        if (!search_composition_captured) {
+          const SearchComposition composition = implementation.searchComposition();
+
+          if (composition.available) {
+            search_composition_captured = true;
+            search_composition = composition;
+          }
+        }
+
         result.baseline_min_ms = baseline_min_ms;
 
         csv.write_row(result);
         checksums.write(result);
         totals[k].accumulate(result);
 
-        // ---------- Per-implementation report for this file ----------
-
-        std::cerr << "    " << std::left << std::setw(16)
-                  << implementation.name() << std::right << std::fixed
-                  << std::setprecision(3) << std::setw(10)
-                  << result.timing.min_ms << " ms";
-
-        if (!is_baseline) {
-          std::cerr << "  speedup " << std::setprecision(2) << result.speedup()
-                    << "x";
-        }
-
-        std::cerr << "  len_hash=" << msbench::to_hex(result.digest.len_hash);
-
-        if (is_baseline) {
-          std::cerr << "  total_len=" << result.digest.total_len
-                    << " max_len=" << result.digest.max_len
-                    << " zero_len=" << result.digest.zero_len_count;
-        } else {
-          std::cerr << "  lengths=" << (result.lengths.equal ? "EQUAL" : "DIFFER");
-        }
-
-        std::cerr << std::endl;
-
-        // Diagnostic text from THIS implementation's own compute() call,
-        // if it has any (see MSImplementation::diagnostics). Printed here,
-        // not from inside compute() itself: compute() always finishes
-        // before this row is printed, so text printed directly from
-        // inside it would land under whichever row printed most recently,
-        // not this one.
-        const std::string diagnostics = implementation.diagnostics();
-
-        if (!diagnostics.empty()) {
-          std::cerr << diagnostics;
-        }
+        // Summed over every file and printed once per implementation in
+        // the summary at the end, rather than per file.
+        totals[k].diagnostics.accumulate(implementation.diagnostics());
 
         if (!result.invariants.ok) {
-          std::cerr << "        INVARIANT FAILURE: " << result.invariants
+          std::cerr << "    " << implementation.name()
+                    << ": INVARIANT FAILURE: " << result.invariants
                     << std::endl;
         }
 
         if (!result.positions.ok) {
-          std::cerr << "        POSITION FAILURE: " << result.positions
+          std::cerr << "    " << implementation.name()
+                    << ": POSITION FAILURE: " << result.positions
                     << std::endl;
         }
 
         if (result.lengths.checked && !result.lengths.equal) {
-          std::cerr << "        LENGTH MISMATCH: " << result.lengths.describe()
+          std::cerr << "    " << implementation.name()
+                    << ": LENGTH MISMATCH: " << result.lengths.describe()
                     << std::endl;
           file_diverged = true;
         }
+      }
+
+      if (search_composition_captured) {
+        search_totals.available = true;
+        search_totals.singleton_hits += search_composition.singleton_hits;
+        search_totals.range_hits += search_composition.range_hits;
+        search_totals.misses += search_composition.misses;
       }
 
       ++processed_files;
@@ -297,16 +314,31 @@ int main(int argc, char** argv) {
     const double megabytes =
         static_cast<double>(total_input_bytes) / (1024.0 * 1024.0);
 
-    std::cerr << std::left << std::setw(16) << "implementation" << std::right
-              << std::setw(12) << "build ms" << std::setw(14) << "total ms"
-              << std::setw(10) << "MB/s" << std::setw(10) << "speedup"
-              << std::setw(16) << "lengths" << std::endl;
+    // Implementation names vary a lot in length (e.g. "lrf-ms" vs.
+    // "pt16-v2-bucket-chain-multi"); a fixed width overflows for the
+    // longer ones and breaks every column after it. Width it to the
+    // longest name actually registered instead, with a little breathing
+    // room before the next column.
+    std::size_t name_width = std::string("implementation").size();
+
+    for (const msbench::ImplementationTotals& implementation : totals) {
+      name_width = std::max(name_width, implementation.name.size());
+    }
+
+    name_width += 2;
+
+    std::cerr << std::left << std::setw(static_cast<int>(name_width))
+              << "implementation" << std::right << std::setw(12)
+              << "build ms" << std::setw(14) << "total ms" << std::setw(10)
+              << "MB/s" << std::setw(10) << "speedup" << std::setw(16)
+              << "lengths" << std::endl;
 
     for (const msbench::ImplementationTotals& implementation : totals) {
       const double seconds = implementation.total_min_ms / 1000.0;
 
-      std::cerr << std::left << std::setw(16) << implementation.name
-                << std::right << std::fixed << std::setprecision(2)
+      std::cerr << std::left << std::setw(static_cast<int>(name_width))
+                << implementation.name << std::right << std::fixed
+                << std::setprecision(2)
                 << std::setw(12) << implementation.build_ms << std::setw(14)
                 << implementation.total_min_ms << std::setw(10)
                 << (seconds == 0.0 ? 0.0 : megabytes / seconds) << std::setw(10)
@@ -317,12 +349,70 @@ int main(int argc, char** argv) {
 
       if (implementation.is_baseline) {
         std::cerr << "baseline";
+      } else if (implementation.files_compared == 0) {
+        // Never checked: a variant documented as not exact by design
+        // (see MSImplementation::exactExpected), not a file count of 0.
+        std::cerr << "not compared";
       } else {
         std::cerr << (std::to_string(implementation.files_lengths_equal) + "/" +
                       std::to_string(implementation.files_compared) + " equal");
       }
 
       std::cerr << std::endl;
+    }
+
+    // ---------- Per-implementation diagnostics, summed over files ----------
+
+    std::cerr << std::endl;
+    std::cerr << "========================================" << std::endl;
+    std::cerr << "[10] DIAGNOSTICS (summed over " << processed_files
+              << " files)" << std::endl;
+    std::cerr << "========================================" << std::endl;
+
+    for (const msbench::ImplementationTotals& implementation : totals) {
+      std::cerr << implementation.name << std::endl;
+
+      if (implementation.is_baseline) {
+        // The TRUE average phrase length (total length / input length):
+        // the baseline computes complete, unextended matching statistics,
+        // unlike the scan-only PT16 variants, whose hits are capped at 16.
+        const double avg_phrase_length =
+            total_input_bytes == 0
+                ? 0.0
+                : static_cast<double>(implementation.total_len) /
+                      static_cast<double>(total_input_bytes);
+
+        std::cerr << "        total_len=" << implementation.total_len
+                  << " max_len=" << implementation.max_len
+                  << " zero_len=" << implementation.zero_len_count
+                  << " avg_phrase_length=" << std::fixed
+                  << std::setprecision(3) << avg_phrase_length << std::endl;
+      }
+
+      std::cerr << implementation.diagnostics.format();
+    }
+
+    // How the raw search's lookups classified, over every file. Identical
+    // across the scan-only PT16 variants (same table content, same
+    // queries), so printed once. No length here -- a raw-search hit is
+    // always reported at exactly 16 regardless of how far the true match
+    // extends; see the baseline's avg_phrase_length above for that.
+    if (search_totals.available) {
+      const std::size_t total_queries = search_totals.singleton_hits +
+                                        search_totals.range_hits +
+                                        search_totals.misses;
+      const auto percent = [&](const std::size_t count) {
+        return total_queries == 0 ? 0.0
+                                  : 100.0 * static_cast<double>(count) /
+                                        static_cast<double>(total_queries);
+      };
+
+      std::cerr << "search (shared across pt16 variants): " << std::fixed
+                << std::setprecision(1)
+                << "singleton=" << percent(search_totals.singleton_hits)
+                << "%  range=" << percent(search_totals.range_hits)
+                << "%  short=" << percent(search_totals.misses) << "%"
+                << std::endl;
     }
 
     // ---------- Machine-readable summary ----------

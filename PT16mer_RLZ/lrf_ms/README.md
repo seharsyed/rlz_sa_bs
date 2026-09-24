@@ -75,18 +75,21 @@ else is compared and speedup-ratio'd against.
 | Name | What it computes | Table format |
 | --- | --- | --- |
 | `lrf-ms` | Baseline. Classical algorithm: suffix range narrowing plus an LRF-array skip that resolves most consecutive positions in O(1), no table lookup at all. | none (ISA/LCP/LRF/RMQ, built once) |
-| `pt16-brute` | One full PT16 query per position, including suffix-array interval narrowing/extension — a real (if unfinished) MS answer. | non-sassy H/L (`pt16_build_v2.hpp`) |
-| `pt16-v2-scan` | The *mandatory first scan* alone: one 16-mer lookup per position, no narrowing. A lower bound on `pt16-brute`'s cost. | same table as `pt16-brute` |
-| `pt16-v2-bucket-scan` | Same scan, but lookups are grouped and run in table-bucket order (by the input's own leading-8-character prefix) instead of input order, for cache locality. | same table as `pt16-brute` |
-| `pt16-sassy-scan` | Same idea as `pt16-v2-scan`, over the self-contained sassy table (needs neither the reference nor the suffix array to answer a lookup). | sassy (`pt16_build_sassy.hpp`, `<table>.sassy`) |
-| `pt16-sassy-bucket-scan` | Bucketed version of `pt16-sassy-scan`. | same table as `pt16-sassy-scan` |
+| `pt16-v2-bucket-chain-multi` | One 16-mer lookup per position, run grouped by table bucket, then multi-step chain extension. | non-sassy H/L (`pt16_build_v2.hpp`) |
+| `pt16-v2-sorted-chain-multi` | Same, with the lookups fully sorted by their 32-bit key (`sortedKmerScan`). | same |
+| `pt16-v2-fastmiss-sorted-chain-multi` | As `pt16-v2-sorted-chain-multi`, with the cheaper miss path of `PT16FastMissParser`. | v2 table, own copy (`<table>.fastmiss`) |
+| `pt16-v2-fastmiss-bucket-chain-multi` | As `pt16-v2-bucket-chain-multi`, with the fast-miss lookup. | same as above |
+| `pt16-sassy-chain-multi` | Bucketed lookups over the self-contained sassy table, then multi-step chain extension. | sassy (`pt16_build_sassy.hpp`, `<table>.sassy`) |
+| `pt16-sassy-sorted-chain-multi` | Same, with fully sorted lookups. | same |
 
-None of the `*-scan`/`*-bucket-scan` variants are complete MS answers — every
-hit is reported at exactly 16, with no chain extension past that — so their
-`lengths=DIFFER` against baseline is expected, not a bug; they exist purely
-to measure the unavoidable lookup floor each table format pays. What's been
-found testing this on real and synthetic data so far (not exhaustively, and
-not yet on genome-scale real data at the time of writing):
+Only variants that compute the full, exact matching statistics are
+registered: every row above is proven exact against brute force
+(`chain_extend_test.cpp`), so it must report `lengths=N/N equal`. The
+scan-only rows (raw 16-mer lookups capped at 16) and the one-step
+`pt16-sassy-chain` were dropped from the timed runs; their classes remain in
+`ms_variants.hpp` / `pt16_sassy_ms.hpp` / `pt16_fastmiss_ms.hpp`. What was
+found with the scan-only rows (not exhaustively, and not yet on genome-scale
+real data at the time of writing):
 
 - Bucketing consistently beats input-order scanning for both table formats,
   often enough to flip a variant from slower-than-baseline to faster.
@@ -105,19 +108,19 @@ for how to check them against your own data.
 
 ## Reading the diagnostics
 
-Every PT16 variant prints extra lines right after its own summary row (each
-implementation's `diagnostics()`, collected during its `compute()` call and
-printed by `ms_main.cpp` afterwards — never printed live from inside
-`compute()`, which would attach it to whichever row happened to print most
-recently instead of its own):
+Nothing is printed per implementation per file (the per-file rows go to
+the results CSV). Each implementation's `diagnostics()` is collected after
+every `compute()` call, summed over all files, and printed once per
+implementation under `[10] DIAGNOSTICS`, after the collection totals:
 
 ```
-    pt16-sassy-bucket-scan    13.893 ms  speedup 1.33x  len_hash=... lengths=DIFFER
-        phases: prebucket 1.39 ms  bucket 0.46 ms  probe 11.41 ms  tail 0.00 ms
-        bucket search: linear=200000 binary=0
+pt16-sassy-chain-multi
+        phases: prebucket 0.215 ms (5.1%)  bucket 0.422 ms (9.9%)  probe 3.620 ms (85.0%)  tail 0.003 ms (0.1%)  total 4.260 ms
+        bucket search: linear=149792 binary=0
 ```
 
-- **`phases`** (bucket-scan variants only): the scan's own four stages —
+- **`phases`** (bucketed variants; the sorted ones report `keys`,
+  `radix-low`, `radix-high`, `probe`, `tail` instead): the scan's own four stages —
   `prebucket` (pack every 16-mer, tally per-bucket counts), `bucket`
   (prefix-sum + counting-sort placement), `probe` (the lookups themselves,
   now in bucket order — the phase bucketing exists to speed up), `tail`
@@ -127,8 +130,8 @@ recently instead of its own):
 - **`bucket search`**: how many of this call's non-empty-bucket dispatches
   searched their bucket linearly vs. with `std::lower_bound` (the switch is
   at 64 entries). Free counters (plain increments already on a taken
-  branch), reported for every PT16 variant including `pt16-brute`. Useful
-  for checking whether a format's average bucket size sits mostly below or
+  branch), reported by the bucketed v2 and sassy variants (fastmiss
+  reports `misses` instead). Useful for checking whether a format's average bucket size sits mostly below or
   above that threshold on your data — the answer changes which cost model
   (bandwidth-bound linear scan vs. probe-count-bound binary search)
   actually applies.
@@ -150,9 +153,11 @@ add_implementation<MyVariant<Symbol, SAType>>(implementations, "my-variant",
 ```
 
 The constructor is what gets timed into `build_ms()`. Optionally add
-`std::string diagnostics() const` (returning your own extra text, newline
-per line) and `MSAdapter` will forward it automatically via
-`if constexpr` — no interface class to inherit from.
+`Diagnostics diagnostics() const` (lines of phase times or counters, built
+with `phase_diagnostics` / `counter_diagnostics` from `pt16_utils.hpp`) and
+`MSAdapter` will forward it automatically via `if constexpr` — no interface
+class to inherit from. `ms_main` sums it over every file and prints it once
+per variant under `[10] DIAGNOSTICS`.
 
 ## Parallelizing over inputs
 

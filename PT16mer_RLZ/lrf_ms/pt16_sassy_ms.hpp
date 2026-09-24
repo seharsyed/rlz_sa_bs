@@ -15,11 +15,14 @@
 #include "../pt16_sassy.hpp"
 
 /**
- * Matching statistics over the self-contained sassy PT16 table
- * (pt16_sassy.hpp). This is the initialization step only: the constructor
- * builds and loads the table, matching PT16MS's shape in ms_variants.hpp so
- * this can be registered the same way once computeMatchingStatistics is
- * written.
+ * Table construction and raw lookup access over the self-contained sassy
+ * PT16 table (pt16_sassy.hpp). Matching statistics themselves are never
+ * computed inside this class: it only builds/loads the table and exposes
+ * scan methods (scanPass1, bucketedScan) that produce a KmerLookupResult
+ * per input position; turning that into matching statistics is left to
+ * chain_extend.hpp/ms_tools.hpp (format-agnostic) so every chain-extension
+ * variant runs on whichever scan is currently fastest, not a copy of it
+ * hand-rolled in here that would drift as the scan gets tuned further.
  *
  * PT16SassyLookup does not keep its own copy of the reference (lookup and
  * find_longest_matching_factor both take it as an argument instead), so this
@@ -44,74 +47,6 @@ class PT16SassyMS {
   PT16SassyMS& operator=(const PT16SassyMS&) = delete;
 
   /**
-   * A first, deliberately incomplete sketch. Extends a hit by at most one
-   * character, and only by following a chain of exact 16-mer occurrences:
-   * it compares the reference POSITIONS lookup() returns, never reference
-   * CHARACTERS -- the reference is not read at all here.
-   *
-   * Why comparing positions is enough: if the 16-mer at i occurs at
-   * reference position p, and the 16-mer at i+1 occurs at p+1, then
-   * input[i..i+16) == ref[p..p+16) (the first fact) and in particular
-   * input[i+16] == ref[p+16] (the last character of the second fact), so
-   * input[i..i+17) == ref[p..p+17): the match at i is at least 17 long.
-   * This holds regardless of how many OTHER occurrences either 16-mer has,
-   * so the successor check also looks inside a range, not just a singleton.
-   *
-   * What is NOT yet done (left for a later pass; every length reported here
-   * is always a valid lower bound on the true matching statistic, so none
-   * of this can make an already-reported answer wrong):
-   *   - extending a chain by more than one step;
-   *   - resolving a RANGE at the current position (left at length 16).
-   */
-  MatchingStatistics computeMatchingStatistics(
-      const std::vector<unsigned char>& input) {
-    const std::size_t n = input.size();
-
-    std::vector<ScanEntry> entries = scanPass1(input);
-
-    // ---------- Pass 2: extend a singleton hit by one character, if the
-    // ---------- next position's own occurrences include position + 1.
-
-    for (std::size_t i = 0; i < n; ++i) {
-      ScanEntry& entry = entries[i];
-
-      if (!entry.resolved && entry.count == 1 && i + 1 < n) {
-        const std::uint32_t wanted = entry.match_position + 1;
-        const ScanEntry& next = entries[i + 1];
-        bool extends = false;
-
-        if (next.count == 1) {
-          extends = next.match_position == wanted;
-        } else {
-          for (const std::uint32_t candidate : next.positions) {
-            if (candidate == wanted) {
-              extends = true;
-              break;
-            }
-          }
-        }
-
-        if (extends) {
-          ++entry.match_length;
-        }
-      }
-
-      entry.resolved = true;
-    }
-
-    // ---------- Collect ----------
-
-    MatchingStatistics ms;
-    ms.reserve(n);
-
-    for (const ScanEntry& entry : entries) {
-      ms.emplace_back(entry.match_position, entry.match_length);
-    }
-
-    return ms;
-  }
-
-  /**
    * The mandatory first scan alone: one lookup()/lookup_tail() per input
    * position, no pass 2 (no chain extension), so every hit is reported at
    * exactly 16 -- whatever lookup itself found, untouched.
@@ -129,7 +64,11 @@ class PT16SassyMS {
 
     const std::vector<ScanEntry> entries = scanPass1(input);
 
-    diagnostics_ = formatBucketSearchCounts(before, lookup_->stats());
+    const PT16SassyLookup::Stats after = lookup_->stats();
+    diagnostics_ = bucketSearchDiagnostics(before, after);
+    search_composition_ = {true, after.singleton_hits - before.singleton_hits,
+                           after.range_hits - before.range_hits,
+                           after.misses - before.misses};
 
     MatchingStatistics ms;
     ms.reserve(entries.size());
@@ -168,17 +107,12 @@ class PT16SassyMS {
    */
   MatchingStatistics computeMatchingStatisticsScanOnlyBucketed(
       const std::vector<unsigned char>& input) {
-    const PT16SassyLookup::Stats before = lookup_->stats();
+    const std::vector<KmerLookupResult> results = bucketedScan(input);
 
-    const std::vector<ScanEntry> entries = scanPass1Bucketed(input);
+    MatchingStatistics ms(results.size());
 
-    diagnostics_ = formatBucketedScanTimings(before, lookup_->stats());
-
-    MatchingStatistics ms;
-    ms.reserve(entries.size());
-
-    for (const ScanEntry& entry : entries) {
-      ms.emplace_back(entry.match_position, entry.match_length);
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      ms[i] = {results[i].match_position, results[i].match_length};
     }
 
     return ms;
@@ -198,16 +132,19 @@ class PT16SassyMS {
     return bucket_scan_timings_;
   }
 
-  // The last call's diagnostic text (built, not printed, by
-  // computeMatchingStatisticsScanOnly/ScanOnlyBucketed above), ready for
-  // whoever prints the benchmark's per-implementation row to print this
-  // right after it -- see PT16SassyScanMS/PT16SassyBucketScanMS::
-  // diagnostics() and ms_main.cpp. Building a string instead of printing
-  // directly means it can be attached to the right implementation's row
-  // instead of always leaking out before it (this runs inside
-  // computeMatchingStatistics, which finishes before that row is ever
-  // printed).
-  const std::string& lastDiagnostics() const { return diagnostics_; }
+  // The last call's diagnostics (from computeMatchingStatisticsScanOnly/
+  // ScanOnlyBucketed above), forwarded by PT16SassyScanMS/
+  // PT16SassyBucketScanMS::diagnostics() for ms_main.cpp to sum per
+  // implementation.
+  const Diagnostics& lastDiagnostics() const { return diagnostics_; }
+
+  // The last call's raw-lookup classification (singleton/range/miss),
+  // identical whichever of the two compute methods above populated it
+  // (lookup order does not change the classification). See
+  // SearchComposition (pt16_utils.hpp) for what this is for.
+  const SearchComposition& lastSearchComposition() const {
+    return search_composition_;
+  }
 
   // The reference held for a later pass (extending beyond what pure
   // position-chaining can resolve will need it, since PT16SassyLookup keeps
@@ -215,6 +152,132 @@ class PT16SassyMS {
   const std::vector<unsigned char>& reference() const { return *reference_; }
 
   const PT16SassyLookup& lookup() const { return *lookup_; }
+
+  /**
+   * The bucketed scan itself, returning the FULL KmerLookupResult per
+   * position (in original text-position order) instead of collapsing it to
+   * (position, length) -- the sassy counterpart of PT16ScanMS::bucketedScan
+   * (ms_variants.hpp), and now the ONLY scan a chain-extension variant
+   * builds on for this table format: it is both bucket-ordered (established
+   * fastest for raw lookup speed) and rolling-key (one encode_16mer total,
+   * not one per position), unlike the free-standing sassyScan helper this
+   * replaced, which re-encoded every 16-mer from scratch. See that method's
+   * doc comment on computeMatchingStatisticsScanOnlyBucketed above for the
+   * bucketing idea; this is the same three-pass mechanics (group by bucket,
+   * counting-sort into `order`, then look up bucket by bucket), just
+   * writing a KmerLookupResult per slot -- lookup_->lookup(key) already
+   * returns one fully populated, hit or not, so no found/not-found
+   * branching is needed here (contrast the old ScanEntry-based version this
+   * replaced).
+   */
+  std::vector<KmerLookupResult> bucketedScan(
+      const std::vector<unsigned char>& input) {
+    using clock = std::chrono::steady_clock;
+
+    const PT16SassyLookup::Stats before = lookup_->stats();
+
+    const std::size_t n = input.size();
+    std::vector<KmerLookupResult> results(n);
+
+    bucket_scan_timings_ = BucketScanTimings{};
+
+    const std::size_t kmer_positions =
+        n >= KMER_LENGTH ? n - KMER_LENGTH + 1 : 0;
+
+    // ---------- Prebucket: pack every key, count per table bucket ----------
+
+    const auto prebucket_start = clock::now();
+
+    std::vector<std::uint32_t> keys(kmer_positions);
+    auto count = std::make_unique<std::array<std::uint32_t, NUMBER_OF_BUCKETS>>();
+    count->fill(0);
+
+    // Rolling key: only i=0 pays a full encode_16mer.
+    std::uint32_t key = kmer_positions > 0 ? encode_16mer(input, 0) : 0;
+
+    for (std::size_t i = 0; i < kmer_positions; ++i) {
+      if (i > 0) {
+        key = (key << 2U) |
+              alphatab[static_cast<unsigned char>(input[i + KMER_LENGTH - 1])];
+      }
+
+      keys[i] = key;
+      ++(*count)[key >> LOW_BITS];
+    }
+
+    phase_barrier(keys.data());
+    phase_barrier(count->data());
+    bucket_scan_timings_.prebucket_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clock::now() - prebucket_start)
+            .count();
+
+    // ---------- Bucket: prefix sum + counting-sort placement ----------
+
+    const auto bucket_start = clock::now();
+
+    std::vector<std::uint32_t> offsets(
+        static_cast<std::size_t>(NUMBER_OF_BUCKETS) + 1, 0);
+
+    for (std::uint32_t bucket = 0; bucket < NUMBER_OF_BUCKETS; ++bucket) {
+      offsets[bucket + 1] = offsets[bucket] + (*count)[bucket];
+    }
+
+    std::vector<std::uint32_t> cursor(offsets.begin(),
+                                      offsets.begin() + NUMBER_OF_BUCKETS);
+    std::vector<std::uint32_t> order(kmer_positions);
+
+    for (std::size_t i = 0; i < kmer_positions; ++i) {
+      const std::uint32_t bucket = keys[i] >> LOW_BITS;
+      order[cursor[bucket]++] = static_cast<std::uint32_t>(i);
+    }
+
+    phase_barrier(order.data());
+    bucket_scan_timings_.bucket_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clock::now() - bucket_start)
+            .count();
+
+    // ---------- Probe: the lookups themselves, in bucket order ----------
+
+    const auto probe_start = clock::now();
+
+    for (std::size_t slot = 0; slot < kmer_positions; ++slot) {
+      const std::uint32_t i = order[slot];
+      results[i] = lookup_->lookup(keys[i]);
+    }
+
+    phase_barrier(results.data());
+    bucket_scan_timings_.probe_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clock::now() - probe_start)
+            .count();
+
+    // ---------- Tail: not reordered (at most 15 of them) ----------
+
+    const auto tail_start = clock::now();
+
+    for (std::size_t i = kmer_positions; i < n; ++i) {
+      const auto tail = lookup_->lookup_tail(input, i);
+      results[i].found = false;
+      results[i].match_position = tail.match_position;
+      results[i].match_length = tail.match_length;
+    }
+
+    phase_barrier(results.data());
+    bucket_scan_timings_.tail_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            clock::now() - tail_start)
+            .count();
+
+    const PT16SassyLookup::Stats after = lookup_->stats();
+    diagnostics_ = bucketedScanDiagnostics(before, after);
+    search_composition_ = {true, after.singleton_hits - before.singleton_hits,
+                           after.range_hits - before.range_hits,
+                           after.misses - before.misses};
+
+    return results;
+  }
 
  private:
   // One position's raw 16-mer/tail lookup, kept only long enough to check
@@ -279,8 +342,7 @@ class PT16SassyMS {
                        0, {}};
         } else {
           entries[i].match_length = KMER_LENGTH;
-          entries[i].match_position =
-              result.count == 1 ? result.match_position : result.positions.front();
+          entries[i].match_position = result.match_position;
           entries[i].count = result.count;
           entries[i].positions = result.positions;
         }
@@ -295,172 +357,39 @@ class PT16SassyMS {
     return entries;
   }
 
-  // Grouping pass + bucket-ordered lookup pass behind
-  // computeMatchingStatisticsScanOnlyBucketed. See that method's doc
-  // comment for the idea; this is the mechanics. No internal timing, for
-  // the same reason as scanPass1.
-  //
-  // Pass A: one linear scan over the 16-mer positions, packing each key
-  // (encode_16mer, same as scanPass1) and counting how many land in each
-  // of the NUMBER_OF_BUCKETS table buckets (key >> LOW_BITS -- the same
-  // split PT16SassyLookup::lookup uses internally).
-  //
-  // Pass B: prefix-sum those counts into slot offsets, then a second
-  // linear scan places each position into its bucket's slice of `order`
-  // (an ordinary counting sort, the same scheme build_H uses over the
-  // reference at build time, here run over the input instead).
-  //
-  // Pass C: walk `order` bucket by bucket and look up the key already
-  // stored for each slot -- the input itself is never read again -- and
-  // write each result back into `entries` at its ORIGINAL position.
-  //
-  // Timed in 4 phases (one clock::now() pair each, not per lookup):
-  // prebucket (pack + count), bucket (prefix sum + placement), probe (the
-  // lookups), tail. See BucketScanTimings.
-  std::vector<ScanEntry> scanPass1Bucketed(
-      const std::vector<unsigned char>& input) {
-    using clock = std::chrono::steady_clock;
-
-    const std::size_t n = input.size();
-    std::vector<ScanEntry> entries(n);
-
-    bucket_scan_timings_ = BucketScanTimings{};
-
-    const std::size_t kmer_positions =
-        n >= KMER_LENGTH ? n - KMER_LENGTH + 1 : 0;
-
-    // ---------- Prebucket: pack every key, count per table bucket ----------
-
-    const auto prebucket_start = clock::now();
-
-    std::vector<std::uint32_t> keys(kmer_positions);
-    auto count = std::make_unique<std::array<std::uint32_t, NUMBER_OF_BUCKETS>>();
-    count->fill(0);
-
-    // Rolling key, same trick as scanPass1: only i=0 pays a full encode.
-    std::uint32_t key = kmer_positions > 0 ? encode_16mer(input, 0) : 0;
-
-    for (std::size_t i = 0; i < kmer_positions; ++i) {
-      if (i > 0) {
-        key = (key << 2U) |
-              alphatab[static_cast<unsigned char>(input[i + KMER_LENGTH - 1])];
-      }
-
-      keys[i] = key;
-      ++(*count)[key >> LOW_BITS];
-    }
-
-    bucket_scan_timings_.prebucket_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            clock::now() - prebucket_start)
-            .count();
-
-    // ---------- Bucket: prefix sum + counting-sort placement ----------
-
-    const auto bucket_start = clock::now();
-
-    std::vector<std::uint32_t> offsets(
-        static_cast<std::size_t>(NUMBER_OF_BUCKETS) + 1, 0);
-
-    for (std::uint32_t bucket = 0; bucket < NUMBER_OF_BUCKETS; ++bucket) {
-      offsets[bucket + 1] = offsets[bucket] + (*count)[bucket];
-    }
-
-    std::vector<std::uint32_t> cursor(offsets.begin(),
-                                      offsets.begin() + NUMBER_OF_BUCKETS);
-    std::vector<std::uint32_t> order(kmer_positions);
-
-    for (std::size_t i = 0; i < kmer_positions; ++i) {
-      const std::uint32_t bucket = keys[i] >> LOW_BITS;
-      order[cursor[bucket]++] = static_cast<std::uint32_t>(i);
-    }
-
-    bucket_scan_timings_.bucket_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            clock::now() - bucket_start)
-            .count();
-
-    // ---------- Probe: the lookups themselves, in bucket order ----------
-
-    const auto probe_start = clock::now();
-
-    for (std::size_t slot = 0; slot < kmer_positions; ++slot) {
-      const std::uint32_t i = order[slot];
-      const auto result = lookup_->lookup(keys[i]);
-
-      if (!result.found) {
-        entries[i] = {true, result.match_length, result.match_position, 0,
-                     {}};
-      } else {
-        entries[i].match_length = KMER_LENGTH;
-        entries[i].match_position =
-            result.count == 1 ? result.match_position : result.positions.front();
-        entries[i].count = result.count;
-        entries[i].positions = result.positions;
-      }
-    }
-
-    bucket_scan_timings_.probe_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            clock::now() - probe_start)
-            .count();
-
-    // ---------- Tail: same as scanPass1, not reordered (at most 15 of them) ----------
-
-    const auto tail_start = clock::now();
-
-    for (std::size_t i = kmer_positions; i < n; ++i) {
-      const auto tail = lookup_->lookup_tail(input, i);
-      entries[i] = {true, tail.match_length, tail.match_position, 0, {}};
-    }
-
-    bucket_scan_timings_.tail_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            clock::now() - tail_start)
-            .count();
-
-    return entries;
-  }
-
   // One line: how many of this call's bucket dispatches searched their
   // bucket linearly vs. with std::lower_bound (see
   // PT16SassyLookup::Stats::linear_bucket_searches/binary_bucket_searches).
-  static std::string formatBucketSearchCounts(
+  static Diagnostics bucketSearchDiagnostics(
       const PT16SassyLookup::Stats& before,
       const PT16SassyLookup::Stats& after) {
-    std::ostringstream out;
-
-    out << "        bucket search: linear="
-        << (after.linear_bucket_searches - before.linear_bucket_searches)
-        << " binary="
-        << (after.binary_bucket_searches - before.binary_bucket_searches)
-        << "\n";
-
-    return out.str();
+    return counter_diagnostics(
+        "bucket search",
+        {{"linear",
+          after.linear_bucket_searches - before.linear_bucket_searches},
+         {"binary",
+          after.binary_bucket_searches - before.binary_bucket_searches}});
   }
 
   // Same, plus the 4-phase timing breakdown from the bucketed scan.
-  std::string formatBucketedScanTimings(
+  Diagnostics bucketedScanDiagnostics(
       const PT16SassyLookup::Stats& before,
       const PT16SassyLookup::Stats& after) const {
     const auto& t = bucket_scan_timings_;
-    std::ostringstream out;
 
-    out << "        phases: prebucket "
-        << static_cast<double>(t.prebucket_ns) / 1e6 << " ms"
-        << "  bucket " << static_cast<double>(t.bucket_ns) / 1e6 << " ms"
-        << "  probe " << static_cast<double>(t.probe_ns) / 1e6 << " ms"
-        << "  tail " << static_cast<double>(t.tail_ns) / 1e6 << " ms\n";
-
-    out << formatBucketSearchCounts(before, after);
-
-    return out.str();
+    return phase_diagnostics(
+               {{"prebucket", static_cast<double>(t.prebucket_ns) / 1e6},
+                {"bucket", static_cast<double>(t.bucket_ns) / 1e6},
+                {"probe", static_cast<double>(t.probe_ns) / 1e6},
+                {"tail", static_cast<double>(t.tail_ns) / 1e6}}) +
+           bucketSearchDiagnostics(before, after);
   }
 
   const std::vector<unsigned char>* reference_ = nullptr;
   std::unique_ptr<PT16SassyLookup> lookup_;
   BucketScanTimings bucket_scan_timings_;
-  std::string diagnostics_;
+  Diagnostics diagnostics_;
+  SearchComposition search_composition_;
 };
 
 /**
@@ -486,7 +415,15 @@ class PT16SassyScanMS {
     return impl_.computeMatchingStatisticsScanOnly(input);
   }
 
-  std::string diagnostics() const { return impl_.lastDiagnostics(); }
+  Diagnostics diagnostics() const { return impl_.lastDiagnostics(); }
+
+  SearchComposition searchComposition() const {
+    return impl_.lastSearchComposition();
+  }
+
+  // Scan-only: every hit is capped at exactly 16, never extended, so this
+  // never matches the baseline's real matching statistics by design.
+  bool exactExpected() const { return false; }
 
  private:
   PT16SassyMS impl_;
@@ -514,7 +451,15 @@ class PT16SassyBucketScanMS {
     return impl_.computeMatchingStatisticsScanOnlyBucketed(input);
   }
 
-  std::string diagnostics() const { return impl_.lastDiagnostics(); }
+  Diagnostics diagnostics() const { return impl_.lastDiagnostics(); }
+
+  SearchComposition searchComposition() const {
+    return impl_.lastSearchComposition();
+  }
+
+  // Scan-only: every hit is capped at exactly 16, never extended, so this
+  // never matches the baseline's real matching statistics by design.
+  bool exactExpected() const { return false; }
 
  private:
   PT16SassyMS impl_;
