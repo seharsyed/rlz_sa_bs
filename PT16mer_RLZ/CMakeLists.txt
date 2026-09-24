@@ -27,3 +27,11 @@ target_include_directories(
 
 add_executable(pt16_build_time pt16_build_time.cpp)
 target_include_directories(pt16_build_time PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../parser)
+
+add_executable(pt16_rlz_only pt16_only_main.cpp)
+target_include_directories(
+    pt16_rlz_only
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../parser
+)
