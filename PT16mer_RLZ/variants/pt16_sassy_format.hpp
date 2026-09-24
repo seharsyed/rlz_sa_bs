@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "pt16_utils.hpp"  // KMER_LENGTH, LOW_BITS, alphatab
+#include "../pt16_utils.hpp"  // KMER_LENGTH, LOW_BITS, alphatab
 
 // ---------- Short suffixes ----------
 

@@ -496,6 +496,20 @@ inline Diagnostics counter_diagnostics(
   return {{std::move(line)}};
 }
 
+// The "misses" line: a lookup's Stats with misses / empty_bucket_misses /
+// short_suffix_checks (PT16FastMissParser, PT16SassyLookup), as the
+// difference between two snapshots.
+template <typename Stats>
+Diagnostics miss_diagnostics(const Stats& before, const Stats& after) {
+  return counter_diagnostics(
+      "misses",
+      {{"total", after.misses - before.misses},
+       {"empty-bucket",
+        after.empty_bucket_misses - before.empty_bucket_misses},
+       {"full-short-suffix-checks",
+        after.short_suffix_checks - before.short_suffix_checks}});
+}
+
 inline double peak_rss_mb() {
   struct rusage usage{};
 

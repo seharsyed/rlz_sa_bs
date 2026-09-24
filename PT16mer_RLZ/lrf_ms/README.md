@@ -130,11 +130,15 @@ pt16-sassy-chain-multi
 - **`bucket search`**: how many of this call's non-empty-bucket dispatches
   searched their bucket linearly vs. with `std::lower_bound` (the switch is
   at 64 entries). Free counters (plain increments already on a taken
-  branch), reported by the bucketed v2 and sassy variants (fastmiss
-  reports `misses` instead). Useful for checking whether a format's average bucket size sits mostly below or
+  branch), reported by the bucketed v2 and sassy variants. Useful for checking whether a format's average bucket size sits mostly below or
   above that threshold on your data — the answer changes which cost model
   (bandwidth-bound linear scan vs. probe-count-bound binary search)
   actually applies.
+- **`misses`** (fastmiss and sassy variants): `total` misses, how many
+  landed in an `empty-bucket` (answered from arrays precomputed at load
+  time), and how many ran the `full-short-suffix-checks` because their
+  bucket holds a short suffix longer than 8 characters. Every other miss
+  skips the short suffixes entirely.
 
 ## Adding a new variant
 

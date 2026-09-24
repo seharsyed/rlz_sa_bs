@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "pt16_sassy_format.hpp"  // PackedShortSuffix, sassy_encode_*
-#include "pt16_utils.hpp"         // PT16 constants and shared helpers
+#include "../pt16_utils.hpp"         // PT16 constants and shared helpers
 
 // ---------- PT16 H/L representation ----------
 

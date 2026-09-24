@@ -794,6 +794,7 @@ class PT16SassySortedScanMS {
   std::vector<KmerLookupResult> sortedScan(
       const std::vector<unsigned char>& input) {
     const PT16SassyLookup& lookup = impl_.lookup();
+    const PT16SassyLookup::Stats before = lookup.stats();
 
     std::vector<KmerLookupResult> results = sortedKmerScan(
         input,
@@ -810,6 +811,9 @@ class PT16SassySortedScanMS {
           return result;
         },
         &timings_);
+
+    diagnostics_ = sortedScanDiagnostics(timings_) +
+                   miss_diagnostics(before, lookup.stats());
 
     const std::size_t n = input.size();
     const std::size_t kmer_positions =
@@ -831,9 +835,7 @@ class PT16SassySortedScanMS {
     return ms;
   }
 
-  Diagnostics diagnostics() const {
-    return sortedScanDiagnostics(timings_);
-  }
+  Diagnostics diagnostics() const { return diagnostics_; }
 
   SearchComposition searchComposition() const { return search_composition_; }
 
@@ -845,6 +847,7 @@ class PT16SassySortedScanMS {
   PT16SassyMS impl_;
   SearchComposition search_composition_;
   SortedScanTimings timings_;
+  Diagnostics diagnostics_;
 };
 
 /**

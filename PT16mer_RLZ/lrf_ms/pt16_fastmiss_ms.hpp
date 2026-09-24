@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "../pt16_build_v2.hpp"
-#include "../pt16_rlz_v2_fastmiss.hpp"
+#include "../variants/pt16_rlz_v2_fastmiss.hpp"
 #include "../pt16_utils.hpp"
 #include "ms_tools.hpp"
 #include "sorted_kmer_scan.hpp"
@@ -34,18 +34,6 @@ std::unique_ptr<PT16FastMissParser<T1, T2>> make_fastmiss_parser(
 
   return std::make_unique<PT16FastMissParser<T1, T2>>(reference, suffix_array,
                                                       table_path);
-}
-
-// The miss line both scan orders report after their phase line.
-template <typename Stats>
-Diagnostics fastmiss_diagnostics(const Stats& before, const Stats& after) {
-  return counter_diagnostics(
-      "misses",
-      {{"total", after.misses - before.misses},
-       {"empty-bucket",
-        after.empty_bucket_misses - before.empty_bucket_misses},
-       {"full-short-suffix-checks",
-        after.short_suffix_checks - before.short_suffix_checks}});
 }
 
 /**
@@ -84,7 +72,7 @@ class PT16FastMissSortedScanMS {
     const auto after = parser.stats();
 
     diagnostics_ = sortedScanDiagnostics(timings_) +
-                   fastmiss_diagnostics(before, after);
+                   miss_diagnostics(before, after);
 
     search_composition_ = {true, after.singleton_hits - before.singleton_hits,
                            after.range_hits - before.range_hits,
@@ -278,7 +266,7 @@ class PT16FastMissBucketScanMS {
                                   {"bucket", bucket_ms},
                                   {"probe", probe_ms},
                                   {"tail", tail_ms}}) +
-                   fastmiss_diagnostics(before, after);
+                   miss_diagnostics(before, after);
 
     search_composition_ = {true, after.singleton_hits - before.singleton_hits,
                            after.range_hits - before.range_hits,

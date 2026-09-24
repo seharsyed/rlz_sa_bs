@@ -21,7 +21,7 @@
 
 #include "../pt16_build_v2.hpp"
 #include "../pt16_rlz_v2.hpp"
-#include "../pt16_rlz_v2_fastmiss.hpp"
+#include "../variants/pt16_rlz_v2_fastmiss.hpp"
 #include "pt16_fastmiss_ms.hpp"
 
 using Symbol = unsigned char;

@@ -6,10 +6,10 @@
 #include <vector>
 
 #include "parser.hpp"
-#include "pt16_build_sassy.hpp"
+#include "variants/pt16_build_sassy.hpp"
 #include "pt16_build_v2.hpp"
 #include "pt16_rlz_v2.hpp"
-#include "pt16_sassy.hpp"
+#include "variants/pt16_sassy.hpp"
 #include "pt16_utils.hpp"
 
 using Symbol = unsigned char;

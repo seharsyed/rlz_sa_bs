@@ -14,8 +14,8 @@
 #include <utility>
 #include <vector>
 
-#include "pt16_utils.hpp"  // KmerLookupResult, EntryComposition, constants
-#include "rlz_common.hpp"
+#include "../pt16_utils.hpp"  // KmerLookupResult, EntryComposition, constants
+#include "../rlz_common.hpp"
 
 /**
  * PT16FastMissParser: the v2 H/L table (same file, same lookup results as

@@ -11,8 +11,8 @@
 #include <string>
 #include <vector>
 
-#include "../pt16_build_sassy.hpp"
-#include "../pt16_sassy.hpp"
+#include "../variants/pt16_build_sassy.hpp"
+#include "../variants/pt16_sassy.hpp"
 
 /**
  * Table construction and raw lookup access over the self-contained sassy
@@ -65,7 +65,8 @@ class PT16SassyMS {
     const std::vector<ScanEntry> entries = scanPass1(input);
 
     const PT16SassyLookup::Stats after = lookup_->stats();
-    diagnostics_ = bucketSearchDiagnostics(before, after);
+    diagnostics_ = bucketSearchDiagnostics(before, after) +
+                   miss_diagnostics(before, after);
     search_composition_ = {true, after.singleton_hits - before.singleton_hits,
                            after.range_hits - before.range_hits,
                            after.misses - before.misses};
@@ -382,7 +383,8 @@ class PT16SassyMS {
                 {"bucket", static_cast<double>(t.bucket_ns) / 1e6},
                 {"probe", static_cast<double>(t.probe_ns) / 1e6},
                 {"tail", static_cast<double>(t.tail_ns) / 1e6}}) +
-           bucketSearchDiagnostics(before, after);
+           bucketSearchDiagnostics(before, after) +
+           miss_diagnostics(before, after);
   }
 
   const std::vector<unsigned char>* reference_ = nullptr;

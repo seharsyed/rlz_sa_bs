@@ -15,8 +15,8 @@
 #include <utility>
 #include <vector>
 
-#include "pt16_utils.hpp"  // EntryComposition, KmerLookupResult
-#include "rlz_common.hpp"
+#include "../pt16_utils.hpp"  // EntryComposition, KmerLookupResult
+#include "../rlz_common.hpp"
 
 template <typename T1, typename T2>
 class PT16RLZParser {
