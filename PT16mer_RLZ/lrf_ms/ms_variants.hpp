@@ -905,77 +905,27 @@ class PT16SassySortedChainMS {
  */
 inline Implementations build_implementations(
     const std::vector<Symbol>& reference,
-    const std::vector<SAType>& suffix_array, const std::string& pt16_table) {
+    const std::vector<SAType>& suffix_array,
+    [[maybe_unused]] const std::string& pt16_table) {
   Implementations implementations;
 
   add_implementation<LRFMS<Symbol, SAType>>(implementations, "lrf-ms",
                                             reference, suffix_array);
 
-  // --- Add variants below this line ---
-
-  // pt16-brute (PT16MS) removed for now -- one PT16 longest-match query
-  // with full SA narrowing per input position is the slowest variant
-  // here, and correctness against brute force is already established
-  // by lrf_ms/chain_extend_test.cpp/ms_test.cpp, so paying for it again
-  // in every timed experiment run is no longer needed. It was also the
-  // only source of the "PT16 index: N distinct 16-mers -- X% singleton,
-  // Y% range" line (indexComposition()) printed after [6] BUILD; that
-  // line will not print while this stays commented out.
+  // --- Add full implementations below this line ---
   //
-  // add_implementation<PT16MS<Symbol, SAType>>(implementations,
-  //                                            "pt16-brute", reference,
-  //                                            suffix_array, pt16_table);
-
-  // Only variants that compute the full, exact matching statistics are
-  // registered. The scan-only rows (pt16-v2-bucket-scan,
-  // pt16-v2-sorted-scan, pt16-v2-fastmiss-sorted-scan,
-  // pt16-v2-fastmiss-bucket-scan, pt16-sassy-bucket-scan,
-  // pt16-sassy-sorted-scan: raw 16-mer lookups, every hit capped at 16)
-  // and pt16-sassy-chain (one-step chain extension, short of the true
-  // match whenever it is longer than 17) were removed from the timed runs;
-  // their classes are still here for tests and ad-hoc comparisons.
+  // The PT16 table variants are not registered here: they share one
+  // pipeline (keys, bucket/sorted order, probe, chain -- see
+  // probe_pipeline.hpp), and ms_main runs the shared stages once per file
+  // and only the probe per variant. Register a new table variant in
+  // build_probers (probe_pipeline.hpp) instead. This list is for
+  // implementations that compute complete matching statistics on their
+  // own, like the baseline.
   //
-  // Every row below is a raw lookup-result list fed through multi-step
-  // chain extension (ms_tools.hpp), proven exact against brute force
-  // (lrf_ms/chain_extend_test.cpp), so each is expected to match
-  // baseline's lengths exactly. They differ only in the table format and
-  // the order the lookups are run in.
-
-  // v2 table, lookups grouped by table bucket (one counting-sort pass).
-  add_implementation<PT16V2BucketChainMS<Symbol, SAType>>(
-      implementations, "pt16-v2-bucket-chain-multi", reference, suffix_array,
-      pt16_table);
-
-  // v2 table, lookups fully sorted by the 32-bit key (sortedKmerScan,
-  // sorted_kmer_scan.hpp), matching the table's own within-bucket order.
-  add_implementation<PT16V2SortedChainMS<Symbol, SAType>>(
-      implementations, "pt16-v2-sorted-chain-multi", reference, suffix_array,
-      pt16_table);
-
-  // The v2 table with a cheaper miss path (PT16FastMissParser,
-  // pt16_rlz_v2_fastmiss.hpp): reference position stored per entry, empty
-  // buckets precomputed, short-suffix check only in flagged buckets. Same
-  // sorted / bucketed orders as the two v2 rows above, so the difference
-  // is the lookup alone.
-  add_implementation<PT16FastMissSortedChainMS<Symbol, SAType>>(
-      implementations, "pt16-v2-fastmiss-sorted-chain-multi", reference,
-      suffix_array, pt16_table + ".fastmiss");
-
-  add_implementation<PT16FastMissBucketChainMS<Symbol, SAType>>(
-      implementations, "pt16-v2-fastmiss-bucket-chain-multi", reference,
-      suffix_array, pt16_table + ".fastmiss");
-
-  // Sassy table (self-contained, sampled SA positions), lookups grouped
-  // by table bucket.
-  add_implementation<PT16SassyBackwardChainMS>(
-      implementations, "pt16-sassy-chain-multi", reference, suffix_array,
-      pt16_table + ".sassy");
-
-  // Sassy table, lookups fully sorted -- same sortedKmerScan as
-  // pt16-v2-sorted-chain-multi, only the lookup adapter differs.
-  add_implementation<PT16SassySortedChainMS>(
-      implementations, "pt16-sassy-sorted-chain-multi", reference,
-      suffix_array, pt16_table + ".sassy");
+  // The classes that used to be registered here (PT16V2BucketChainMS,
+  // PT16SassyBackwardChainMS, PT16FastMissSortedChainMS, ... and their
+  // scan-only counterparts) are still defined below and in
+  // pt16_sassy_ms.hpp / pt16_fastmiss_ms.hpp, for the tests.
 
   return implementations;
 }

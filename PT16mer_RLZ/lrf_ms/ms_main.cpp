@@ -6,8 +6,10 @@
 #include <string>
 #include <vector>
 
+#include "ms_tools.hpp"
 #include "ms_utils.hpp"
 #include "ms_variants.hpp"
+#include "probe_pipeline.hpp"
 
 using msbench::SAType;
 using msbench::Symbol;
@@ -15,19 +17,40 @@ using msbench::Symbol;
 /**
  * Matching-statistics benchmark.
  *
- * Every implementation registered in ms_variants.hpp is built once, then
- * each input file is processed on its own: the baseline runs, its
- * lengths are kept, every variant runs and is compared against those
- * lengths, and the file is released before the next one is loaded. Times
- * and diagnostics accumulate per implementation, so the end of the run
- * gives the whole-collection totals and diagnostics for each variant
- * (per-file rows still go to the results CSV); stderr only reports a
- * failure per file.
+ * Two kinds of implementation are built once, then each input file is
+ * processed on its own and released before the next one is loaded:
  *
- * Peak memory is therefore one input plus the baseline's lengths (four
- * bytes per position) plus one variant's MatchingStatistics, rather than
- * every implementation's output for every file at once.
+ *   Full implementations (ms_variants.hpp, the baseline first) each
+ *   compute complete matching statistics; the baseline's lengths are kept
+ *   for the file and everything else is compared against them.
+ *
+ *   The PT16 table variants share one pipeline (probe_pipeline.hpp): the
+ *   16-mer keys are rolled once, each probe order (bucket, sorted) is
+ *   built once and every variant probes in it, and the chain runs once,
+ *   on the first variant's lookup results. Only the probe is timed per
+ *   variant; every other variant's lookups are checked against the
+ *   chained ones, and the chain's output is checked like a full
+ *   implementation's. A probe row's pipeline time (keys + its order + its
+ *   probe + the chain) is what its speedup is computed from.
+ *
+ * Times and diagnostics accumulate over files, so the end of the run gives
+ * the whole-collection totals and diagnostics; per-file rows go to the
+ * results CSV, and stderr only reports a failure per file.
+ *
+ * Peak memory is one input plus the baseline's lengths (four bytes per
+ * position) plus, for the pipeline, the keys and one order (four bytes
+ * each), two lookup-result lists (the chained one and the one being
+ * checked) and one MatchingStatistics.
  */
+
+namespace {
+
+// Percentage of `part` in `whole`, 0 if whole is 0.
+double percent(const double part, const double whole) {
+  return whole == 0.0 ? 0.0 : 100.0 * part / whole;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
   try {
@@ -82,9 +105,10 @@ int main(int argc, char** argv) {
     std::cerr << "[6] BUILD" << std::endl;
     std::cerr << "========================================" << std::endl;
 
+    const std::string table_path = msbench::pt16_table_path(args);
+
     msbench::Implementations implementations =
-        msbench::build_implementations(reference, suffix_array,
-                                       msbench::pt16_table_path(args));
+        msbench::build_implementations(reference, suffix_array, table_path);
 
     if (implementations.empty()) {
       throw std::runtime_error("no implementations registered");
@@ -102,19 +126,60 @@ int main(int argc, char** argv) {
                 << implementations[k]->build_ms() << " ms" << std::endl;
     }
 
+    msbench::ProberSet prober_set =
+        msbench::build_probers(reference, suffix_array, table_path);
+    auto& probers = prober_set.probers;
+
+    for (const msbench::TableBuild& build : prober_set.table_builds) {
+      std::cerr << "    " << build.name << ": write " << build.build_ms
+                << " ms" << std::endl;
+    }
+
+    for (const auto& prober : probers) {
+      std::cerr << "    " << prober->name() << ": load " << prober->build_ms()
+                << " ms" << std::endl;
+    }
+
     std::cerr << "Peak RSS after build: " << msbench::peak_rss_mb() << " MB"
               << std::endl;
 
-    // A structural property of the built table (e.g. singleton vs. range
-    // entry counts), not of any query, so it does not vary between
-    // implementations sharing the same table format -- print only the
-    // first non-empty one, once, rather than once per implementation.
+    // A structural property of a built index, not of any query: printed
+    // once, from the first implementation that offers one.
     for (const auto& implementation : implementations) {
       const std::string composition = implementation->indexComposition();
 
       if (!composition.empty()) {
         std::cerr << composition;
         break;
+      }
+    }
+
+    // Pipeline totals: the shared stages, the chain's output (checked like
+    // a full implementation), and one row per (variant, order).
+    const bool run_pipeline = !probers.empty();
+
+    std::vector<msbench::StageTotals> stage_totals;
+    stage_totals.push_back({"keys"});
+    for (const msbench::ProbeOrder order : msbench::probe_orders) {
+      stage_totals.push_back({std::string(msbench::order_name(order)) +
+                              "-order"});
+    }
+    stage_totals.push_back({"chain"});
+
+    const std::size_t keys_stage = 0;
+    const std::size_t chain_stage = stage_totals.size() - 1;
+
+    msbench::ImplementationTotals chain_totals;
+    chain_totals.name = "pt16-chain";
+
+    // probe_totals[o * probers.size() + p]: prober p in order o.
+    std::vector<msbench::ProbeTotals> probe_totals;
+    for (const msbench::ProbeOrder order : msbench::probe_orders) {
+      for (const auto& prober : probers) {
+        msbench::ProbeTotals probe;
+        probe.name = prober->name() + "-" + msbench::order_name(order);
+        probe.build_ms = prober->build_ms();
+        probe_totals.push_back(std::move(probe));
       }
     }
 
@@ -142,11 +207,10 @@ int main(int argc, char** argv) {
 
     std::size_t processed_files = 0;
     std::size_t total_input_bytes = 0;
-
-    // The raw-search classification (see search_composition below), summed
-    // over every file for the summary.
-    SearchComposition search_totals;
     bool stopped_early = false;
+
+    // How the 16-mer lookups classified, summed over every file.
+    SearchComposition search_totals;
 
     for (std::size_t file_index = 0; file_index < files.size(); ++file_index) {
       const std::string& filename = files[file_index];
@@ -163,130 +227,221 @@ int main(int argc, char** argv) {
       double baseline_min_ms = 0.0;
       bool file_diverged = false;
 
-      // The raw-search classification is identical across every scan-only
-      // PT16 variant for this file (same table content, same queries), so
-      // only the first one that offers it is kept, and added once to
-      // search_totals after the loop below -- not once per implementation.
-      // Only the classification itself, not a length: the scan-only
-      // floor's own average length is not the true average phrase length
-      // (every hit is capped at 16 there, whatever the true match reaches),
-      // so it is not reported at all -- see the baseline's own
-      // avg_phrase_length in the summary for that.
-      bool search_composition_captured = false;
-      SearchComposition search_composition;  // global namespace (pt16_utils.hpp)
+      // Checks one complete MatchingStatistics (a full implementation's or
+      // the chain's) and records it: digest, invariants, positions, lengths
+      // against the baseline (or keeps them, for the baseline itself),
+      // dump, CSV, checksums, totals, and a stderr line per failure. Runs
+      // after timing, so checking never affects a measurement.
+      const auto record_ms = [&](msbench::FileRunResult& result,
+                                 const MatchingStatistics& ms,
+                                 const bool compare_lengths,
+                                 msbench::ImplementationTotals& row_totals) {
+        result.digest = msbench::digest_ms(ms);
 
-      for (std::size_t k = 0; k < implementations.size(); ++k) {
-        msbench::MSImplementation& implementation = *implementations[k];
-        const bool is_baseline = k == 0;
-
-        msbench::FileRunResult result;
-        result.filename = filename;
-        result.input_bytes = input.size();
-        result.implementation = implementation.name();
-        result.is_baseline = is_baseline;
-        result.build_ms = implementation.build_ms();
-
-        {
-          MatchingStatistics ms;
-
-          result.timing = msbench::time_repeated(
-              args.repeats, [&] { ms = implementation.compute(input); });
-
-          // Everything below runs after timing, so checking never
-          // affects the measurement.
-
-          result.digest = msbench::digest_ms(ms);
-
-          if (args.check_invariants) {
-            result.invariants =
-                msbench::validate_invariants(ms, input, reference, alphabet);
-          }
-
-          // Gated the same as validate_invariants above (not just on its
-          // result): Validation defaults to .ok = true, so with
-          // --no-invariants skipping the check above, result.invariants
-          // was still reading as "ok" here and this ran anyway -- for
-          // every position (or up to --sample of them), a binary search
-          // over the whole suffix array. That made --no-invariants not
-          // actually skip the expensive part.
-          if (args.check_invariants && result.invariants.ok) {
-            result.positions =
-                args.verify_full
-                    ? msbench::verify_all_positions(ms, input, reference,
-                                                    suffix_array,
-                                                    args.verify_maximality)
-                    : msbench::verify_sampled(ms, input, reference,
-                                              suffix_array, args.sample,
-                                              args.seed,
-                                              args.verify_maximality);
-          }
-
-          if (is_baseline) {
-            baseline_lengths = msbench::extract_lengths(ms);
-            baseline_min_ms = result.timing.min_ms;
-          } else if (implementation.exactExpected()) {
-            // Skipped entirely for a variant documented as NOT exact by
-            // design (a scan-only floor, or one-step chainExtend): it is
-            // never going to equal the baseline, so comparing it was
-            // never a correctness question, only a per-file, per-run
-            // O(n) scan (and a LENGTH MISMATCH report) that cost time
-            // without telling us anything the doc comment doesn't
-            // already say.
-            result.lengths = msbench::compare_lengths(baseline_lengths, ms);
-          }
-
-          if (!args.dump_directory.empty()) {
-            msbench::dump_ms(args.dump_directory, file_index, filename,
-                             implementation.name(), ms);
-          }
-
-          // ms is released here, before the next implementation runs.
+        if (args.check_invariants) {
+          result.invariants =
+              msbench::validate_invariants(ms, input, reference, alphabet);
         }
 
-        if (!search_composition_captured) {
-          const SearchComposition composition = implementation.searchComposition();
+        // Gated on --no-invariants too: Validation defaults to ok, and
+        // position verification is the expensive part.
+        if (args.check_invariants && result.invariants.ok) {
+          result.positions =
+              args.verify_full
+                  ? msbench::verify_all_positions(ms, input, reference,
+                                                  suffix_array,
+                                                  args.verify_maximality)
+                  : msbench::verify_sampled(ms, input, reference,
+                                            suffix_array, args.sample,
+                                            args.seed, args.verify_maximality);
+        }
 
-          if (composition.available) {
-            search_composition_captured = true;
-            search_composition = composition;
-          }
+        if (result.is_baseline) {
+          baseline_lengths = msbench::extract_lengths(ms);
+          baseline_min_ms = result.timing.min_ms;
+        } else if (compare_lengths) {
+          result.lengths = msbench::compare_lengths(baseline_lengths, ms);
+        }
+
+        if (!args.dump_directory.empty()) {
+          msbench::dump_ms(args.dump_directory, file_index, filename,
+                           result.implementation, ms);
         }
 
         result.baseline_min_ms = baseline_min_ms;
 
         csv.write_row(result);
         checksums.write(result);
-        totals[k].accumulate(result);
-
-        // Summed over every file and printed once per implementation in
-        // the summary at the end, rather than per file.
-        totals[k].diagnostics.accumulate(implementation.diagnostics());
+        row_totals.accumulate(result);
 
         if (!result.invariants.ok) {
-          std::cerr << "    " << implementation.name()
+          std::cerr << "    " << result.implementation
                     << ": INVARIANT FAILURE: " << result.invariants
                     << std::endl;
         }
 
         if (!result.positions.ok) {
-          std::cerr << "    " << implementation.name()
-                    << ": POSITION FAILURE: " << result.positions
-                    << std::endl;
+          std::cerr << "    " << result.implementation
+                    << ": POSITION FAILURE: " << result.positions << std::endl;
         }
 
         if (result.lengths.checked && !result.lengths.equal) {
-          std::cerr << "    " << implementation.name()
+          std::cerr << "    " << result.implementation
                     << ": LENGTH MISMATCH: " << result.lengths.describe()
                     << std::endl;
           file_diverged = true;
         }
+      };
+
+      const auto new_result = [&](const std::string& name,
+                                  const msbench::RowKind kind) {
+        msbench::FileRunResult result;
+        result.filename = filename;
+        result.input_bytes = input.size();
+        result.implementation = name;
+        result.kind = kind;
+        return result;
+      };
+
+      // ---------- Full implementations (the baseline first) ----------
+
+      for (std::size_t k = 0; k < implementations.size(); ++k) {
+        msbench::MSImplementation& implementation = *implementations[k];
+
+        msbench::FileRunResult result =
+            new_result(implementation.name(), msbench::RowKind::full);
+        result.is_baseline = k == 0;
+        result.build_ms = implementation.build_ms();
+
+        MatchingStatistics ms;
+
+        result.timing = msbench::time_repeated(
+            args.repeats, [&] { ms = implementation.compute(input); });
+
+        // A variant documented as not exact by design is never compared.
+        record_ms(result, ms, implementation.exactExpected(), totals[k]);
+        totals[k].diagnostics.accumulate(implementation.diagnostics());
       }
 
-      if (search_composition_captured) {
+      // ---------- PT16 pipeline ----------
+
+      if (run_pipeline) {
+        const std::size_t n = input.size();
+        const std::size_t kmer_positions = msbench::kmer_positions_of(n);
+
+        const auto record_stage = [&](const std::size_t stage,
+                                      const msbench::Timing& timing) {
+          msbench::FileRunResult result =
+              new_result(stage_totals[stage].name, msbench::RowKind::stage);
+          result.timing = timing;
+          result.baseline_min_ms = baseline_min_ms;
+          csv.write_row(result);
+          stage_totals[stage].accumulate(timing);
+        };
+
+        // Keys, once.
+        std::vector<std::uint32_t> keys;
+        const msbench::Timing keys_timing = msbench::time_repeated(
+            args.repeats, [&] { msbench::roll_keys(input, keys); });
+        record_stage(keys_stage, keys_timing);
+
+        const std::uint32_t tail_key = msbench::first_tail_key(input, keys);
+
+        // `chained` holds the first variant's first results: what the
+        // chain runs on and every other probe is checked against (their
+        // positions spans point into that variant's table, which lives
+        // for the whole run). Every later probe writes into `results`.
+        std::vector<KmerLookupResult> chained(n);
+        std::vector<KmerLookupResult> results(n);
+        bool have_chained = false;
+
+        std::vector<std::uint32_t> order;
+        std::vector<std::uint32_t> scratch;
+
+        // Probe rows wait for the chain's time before they are written:
+        // their pipeline time includes it.
+        std::vector<std::pair<std::size_t, msbench::FileRunResult>> pending;
+
+        for (std::size_t o = 0; o < msbench::probe_orders.size(); ++o) {
+          const msbench::ProbeOrder probe_order = msbench::probe_orders[o];
+
+          // The order, once.
+          const msbench::Timing order_timing =
+              msbench::time_repeated(args.repeats, [&] {
+                if (probe_order == msbench::ProbeOrder::bucket) {
+                  msbench::bucket_order(keys, order, scratch);
+                } else {
+                  msbench::sorted_order(keys, order, scratch);
+                }
+              });
+          record_stage(1 + o, order_timing);
+
+          // Every variant probes in it.
+          for (std::size_t p = 0; p < probers.size(); ++p) {
+            msbench::Prober& prober = *probers[p];
+            const std::size_t row = o * probers.size() + p;
+
+            std::vector<KmerLookupResult>& target =
+                have_chained ? results : chained;
+
+            msbench::FileRunResult result =
+                new_result(probe_totals[row].name, msbench::RowKind::probe);
+            result.build_ms = prober.build_ms();
+
+            result.timing = msbench::time_repeated(args.repeats, [&] {
+              prober.probe(keys, order, tail_key, target);
+            });
+
+            result.pipeline_ms = keys_timing.min_ms + order_timing.min_ms +
+                                 result.timing.min_ms;
+
+            // After timing: the chained results only need their positions
+            // checked; every other probe is compared against them.
+            result.lookups = msbench::compare_lookups(
+                chained, target, input, reference);
+            have_chained = true;
+
+            probe_totals[row].diagnostics.accumulate(prober.diagnostics());
+            pending.emplace_back(row, std::move(result));
+          }
+
+          // The order is dropped before the next one is built.
+        }
+
+        results = {};
+
+        // The chain, once, on the chained variant's results.
+        MatchingStatistics ms;
+        const msbench::Timing chain_timing = msbench::time_repeated(
+            args.repeats, [&] { ms = backwardChainExtend(chained); });
+        record_stage(chain_stage, chain_timing);
+
+        msbench::FileRunResult chain_result =
+            new_result(chain_totals.name, msbench::RowKind::chain);
+        chain_result.timing = chain_timing;
+        record_ms(chain_result, ms, true, chain_totals);
+
+        const SearchComposition composition =
+            msbench::classify_lookups(chained, kmer_positions);
         search_totals.available = true;
-        search_totals.singleton_hits += search_composition.singleton_hits;
-        search_totals.range_hits += search_composition.range_hits;
-        search_totals.misses += search_composition.misses;
+        search_totals.singleton_hits += composition.singleton_hits;
+        search_totals.range_hits += composition.range_hits;
+        search_totals.misses += composition.misses;
+
+        for (auto& [row, result] : pending) {
+          result.pipeline_ms += chain_timing.min_ms;
+          result.baseline_min_ms = baseline_min_ms;
+
+          csv.write_row(result);
+          probe_totals[row].accumulate(result);
+
+          if (!result.lookups.equal) {
+            std::cerr << "    " << result.implementation
+                      << ": LOOKUP MISMATCH: " << result.lookups.describe()
+                      << std::endl;
+            file_diverged = true;
+          }
+        }
       }
 
       ++processed_files;
@@ -307,61 +462,132 @@ int main(int argc, char** argv) {
     std::cerr << "[9] COLLECTION TOTALS" << std::endl;
     std::cerr << "========================================" << std::endl;
 
-    csv.write_summary(totals, processed_files, total_input_bytes,
+    std::vector<msbench::ImplementationTotals> summary_totals = totals;
+    if (run_pipeline) {
+      summary_totals.push_back(chain_totals);
+    }
+
+    csv.write_summary(summary_totals, processed_files, total_input_bytes,
                       reference.size(), alphabet.distinct());
 
     const double baseline_total = totals.front().total_min_ms;
     const double megabytes =
         static_cast<double>(total_input_bytes) / (1024.0 * 1024.0);
 
-    // Implementation names vary a lot in length (e.g. "lrf-ms" vs.
-    // "pt16-v2-bucket-chain-multi"); a fixed width overflows for the
-    // longer ones and breaks every column after it. Width it to the
-    // longest name actually registered instead, with a little breathing
-    // room before the next column.
+    const auto mb_per_s = [&](const double total_ms) {
+      return total_ms == 0.0 ? 0.0 : megabytes / (total_ms / 1000.0);
+    };
+    const auto speedup = [&](const double total_ms) {
+      return total_ms == 0.0 ? 0.0 : baseline_total / total_ms;
+    };
+    const auto equal_count = [](std::size_t equal, std::size_t compared) {
+      return std::to_string(equal) + "/" + std::to_string(compared) + " equal";
+    };
+
+    // Widths follow the longest name actually printed.
     std::size_t name_width = std::string("implementation").size();
 
-    for (const msbench::ImplementationTotals& implementation : totals) {
+    for (const auto& implementation : totals) {
       name_width = std::max(name_width, implementation.name.size());
+    }
+    for (const auto& probe : probe_totals) {
+      name_width = std::max(name_width, probe.name.size());
+    }
+    for (const auto& stage : stage_totals) {
+      name_width = std::max(name_width, stage.name.size());
     }
 
     name_width += 2;
+    const int name_w = static_cast<int>(name_width);
 
-    std::cerr << std::left << std::setw(static_cast<int>(name_width))
-              << "implementation" << std::right << std::setw(12)
-              << "build ms" << std::setw(14) << "total ms" << std::setw(10)
-              << "MB/s" << std::setw(10) << "speedup" << std::setw(16)
-              << "lengths" << std::endl;
+    std::cerr << std::left << std::setw(name_w) << "implementation"
+              << std::right << std::setw(12) << "build ms" << std::setw(14)
+              << "total ms" << std::setw(10) << "MB/s" << std::setw(10)
+              << "speedup" << std::setw(16) << "lengths" << std::endl;
 
-    for (const msbench::ImplementationTotals& implementation : totals) {
-      const double seconds = implementation.total_min_ms / 1000.0;
-
-      std::cerr << std::left << std::setw(static_cast<int>(name_width))
-                << implementation.name << std::right << std::fixed
-                << std::setprecision(2)
+    for (const auto& implementation : totals) {
+      std::cerr << std::left << std::setw(name_w) << implementation.name
+                << std::right << std::fixed << std::setprecision(2)
                 << std::setw(12) << implementation.build_ms << std::setw(14)
                 << implementation.total_min_ms << std::setw(10)
-                << (seconds == 0.0 ? 0.0 : megabytes / seconds) << std::setw(10)
-                << (implementation.total_min_ms == 0.0
-                        ? 0.0
-                        : baseline_total / implementation.total_min_ms)
-                << std::setw(16);
+                << mb_per_s(implementation.total_min_ms) << std::setw(10)
+                << speedup(implementation.total_min_ms) << std::setw(16);
 
       if (implementation.is_baseline) {
         std::cerr << "baseline";
       } else if (implementation.files_compared == 0) {
-        // Never checked: a variant documented as not exact by design
-        // (see MSImplementation::exactExpected), not a file count of 0.
         std::cerr << "not compared";
       } else {
-        std::cerr << (std::to_string(implementation.files_lengths_equal) + "/" +
-                      std::to_string(implementation.files_compared) + " equal");
+        std::cerr << equal_count(implementation.files_lengths_equal,
+                                 implementation.files_compared);
       }
 
       std::cerr << std::endl;
     }
 
-    // ---------- Per-implementation diagnostics, summed over files ----------
+    if (run_pipeline) {
+      double shared_total = 0.0;
+      for (const auto& stage : stage_totals) {
+        shared_total += stage.total_min_ms;
+      }
+
+      std::cerr << std::endl
+                << "PT16 pipeline: shared stages, run once per file"
+                << std::endl;
+      std::cerr << std::left << std::setw(name_w) << "stage" << std::right
+                << std::setw(14) << "total ms" << std::setw(10) << "share"
+                << std::endl;
+
+      for (std::size_t s = 0; s < stage_totals.size(); ++s) {
+        const auto& stage = stage_totals[s];
+
+        std::cerr << std::left << std::setw(name_w) << stage.name
+                  << std::right << std::fixed << std::setprecision(2)
+                  << std::setw(14) << stage.total_min_ms << std::setw(9)
+                  << std::setprecision(1)
+                  << percent(stage.total_min_ms, shared_total) << "%";
+
+        if (s == chain_stage) {
+          std::cerr << "   lengths "
+                    << equal_count(chain_totals.files_lengths_equal,
+                                   chain_totals.files_compared);
+        }
+
+        std::cerr << std::endl;
+      }
+
+      std::cerr << std::endl
+                << "PT16 pipeline: per variant and order (pipeline = keys + "
+                   "order + probe + chain)"
+                << std::endl;
+      std::cerr << std::left << std::setw(name_w) << "variant" << std::right
+                << std::setw(12) << "load ms" << std::setw(14) << "probe ms"
+                << std::setw(15) << "pipeline ms" << std::setw(10) << "MB/s"
+                << std::setw(10) << "speedup" << std::setw(16) << "lookups"
+                << std::endl;
+
+      for (const auto& probe : probe_totals) {
+        std::cerr << std::left << std::setw(name_w) << probe.name
+                  << std::right << std::fixed << std::setprecision(2)
+                  << std::setw(12) << probe.build_ms << std::setw(14)
+                  << probe.total_min_ms << std::setw(15)
+                  << probe.total_pipeline_ms << std::setw(10)
+                  << mb_per_s(probe.total_pipeline_ms) << std::setw(10)
+                  << speedup(probe.total_pipeline_ms) << std::setw(16)
+                  << equal_count(probe.files_lookups_equal,
+                                 probe.files_compared)
+                  << std::endl;
+      }
+
+      std::cerr << "table files:";
+      for (const auto& build : prober_set.table_builds) {
+        std::cerr << "  " << build.name << " " << std::setprecision(2)
+                  << build.build_ms << " ms";
+      }
+      std::cerr << std::endl;
+    }
+
+    // ---------- Diagnostics, summed over files ----------
 
     std::cerr << std::endl;
     std::cerr << "========================================" << std::endl;
@@ -369,13 +595,12 @@ int main(int argc, char** argv) {
               << " files)" << std::endl;
     std::cerr << "========================================" << std::endl;
 
-    for (const msbench::ImplementationTotals& implementation : totals) {
+    for (const auto& implementation : totals) {
       std::cerr << implementation.name << std::endl;
 
       if (implementation.is_baseline) {
-        // The TRUE average phrase length (total length / input length):
-        // the baseline computes complete, unextended matching statistics,
-        // unlike the scan-only PT16 variants, whose hits are capped at 16.
+        // The true average phrase length (total length / input length):
+        // the baseline computes complete matching statistics.
         const double avg_phrase_length =
             total_input_bytes == 0
                 ? 0.0
@@ -392,35 +617,37 @@ int main(int argc, char** argv) {
       std::cerr << implementation.diagnostics.format();
     }
 
-    // How the raw search's lookups classified, over every file. Identical
-    // across the scan-only PT16 variants (same table content, same
-    // queries), so printed once. No length here -- a raw-search hit is
-    // always reported at exactly 16 regardless of how far the true match
-    // extends; see the baseline's avg_phrase_length above for that.
-    if (search_totals.available) {
-      const std::size_t total_queries = search_totals.singleton_hits +
-                                        search_totals.range_hits +
-                                        search_totals.misses;
-      const auto percent = [&](const std::size_t count) {
-        return total_queries == 0 ? 0.0
-                                  : 100.0 * static_cast<double>(count) /
-                                        static_cast<double>(total_queries);
-      };
+    for (const auto& probe : probe_totals) {
+      if (!probe.diagnostics.empty()) {
+        std::cerr << probe.name << std::endl << probe.diagnostics.format();
+      }
+    }
 
-      std::cerr << "search (shared across pt16 variants): " << std::fixed
-                << std::setprecision(1)
-                << "singleton=" << percent(search_totals.singleton_hits)
-                << "%  range=" << percent(search_totals.range_hits)
-                << "%  short=" << percent(search_totals.misses) << "%"
-                << std::endl;
+    // How the 16-mer lookups classified, over every file: the same for
+    // every correct variant, so printed once.
+    if (search_totals.available) {
+      const double total_queries =
+          static_cast<double>(search_totals.singleton_hits +
+                              search_totals.range_hits + search_totals.misses);
+
+      std::cerr << "16-mer lookups: " << std::fixed << std::setprecision(1)
+                << "singleton="
+                << percent(static_cast<double>(search_totals.singleton_hits),
+                           total_queries)
+                << "%  range="
+                << percent(static_cast<double>(search_totals.range_hits),
+                           total_queries)
+                << "%  miss="
+                << percent(static_cast<double>(search_totals.misses),
+                           total_queries)
+                << "%" << std::endl;
     }
 
     // ---------- Machine-readable summary ----------
 
     bool all_ok = !stopped_early;
 
-    for (const msbench::ImplementationTotals& implementation : totals) {
-      const double seconds = implementation.total_min_ms / 1000.0;
+    const auto print_implementation = [&](const auto& implementation) {
       const std::string prefix = implementation.name + ".";
 
       std::cout << prefix << "build_ms=" << implementation.build_ms
@@ -430,14 +657,6 @@ int main(int argc, char** argv) {
       std::cout << prefix << "total_first_ms=" << implementation.total_first_ms
                 << std::endl;
       std::cout << prefix << "total_entries=" << implementation.total_entries
-                << std::endl;
-      std::cout << prefix
-                << "MB_per_s=" << (seconds == 0.0 ? 0.0 : megabytes / seconds)
-                << std::endl;
-      std::cout << prefix << "speedup_vs_baseline="
-                << (implementation.total_min_ms == 0.0
-                        ? 0.0
-                        : baseline_total / implementation.total_min_ms)
                 << std::endl;
       std::cout << prefix
                 << "files_lengths_equal=" << implementation.files_lengths_equal
@@ -455,11 +674,71 @@ int main(int argc, char** argv) {
                 << std::endl;
 
       all_ok = all_ok && implementation.ok();
+    };
+
+    for (const auto& implementation : totals) {
+      print_implementation(implementation);
+      std::cout << implementation.name
+                << ".MB_per_s=" << mb_per_s(implementation.total_min_ms)
+                << std::endl;
+      std::cout << implementation.name << ".speedup_vs_baseline="
+                << speedup(implementation.total_min_ms) << std::endl;
+    }
+
+    if (run_pipeline) {
+      // The chain row's time is the chain stage alone.
+      print_implementation(chain_totals);
+
+      for (const auto& stage : stage_totals) {
+        std::cout << "stage." << stage.name
+                  << ".total_min_ms=" << stage.total_min_ms << std::endl;
+        csv.write_summary_value("stage." + stage.name, "total_min_ms",
+                                stage.total_min_ms);
+      }
+
+      for (const auto& probe : probe_totals) {
+        const std::string prefix = probe.name + ".";
+
+        std::cout << prefix << "load_ms=" << probe.build_ms << std::endl;
+        std::cout << prefix << "probe_min_ms=" << probe.total_min_ms
+                  << std::endl;
+        std::cout << prefix << "probe_first_ms=" << probe.total_first_ms
+                  << std::endl;
+        std::cout << prefix << "pipeline_ms=" << probe.total_pipeline_ms
+                  << std::endl;
+        std::cout << prefix
+                  << "MB_per_s=" << mb_per_s(probe.total_pipeline_ms)
+                  << std::endl;
+        std::cout << prefix << "speedup_vs_baseline="
+                  << speedup(probe.total_pipeline_ms) << std::endl;
+        std::cout << prefix
+                  << "files_lookups_equal=" << probe.files_lookups_equal << "/"
+                  << probe.files_compared << std::endl;
+
+        csv.write_summary_value(probe.name, "probe_min_ms",
+                                probe.total_min_ms);
+        csv.write_summary_value(probe.name, "pipeline_ms",
+                                probe.total_pipeline_ms);
+        csv.write_summary_value(probe.name, "speedup_vs_baseline",
+                                speedup(probe.total_pipeline_ms));
+        csv.write_summary_value(
+            probe.name, "files_lookups_equal",
+            std::to_string(probe.files_lookups_equal) + "/" +
+                std::to_string(probe.files_compared));
+
+        all_ok = all_ok && probe.ok();
+      }
+
+      for (const auto& build : prober_set.table_builds) {
+        std::cout << "table." << build.name.substr(0, build.name.find(' '))
+                  << ".write_ms=" << build.build_ms << std::endl;
+      }
     }
 
     std::cout << "results=" << args.results << std::endl;
     std::cout << "checksums=" << args.checksums << std::endl;
     std::cout << "implementations=" << implementations.size() << std::endl;
+    std::cout << "probers=" << probers.size() << std::endl;
     std::cout << "processed_files=" << processed_files << std::endl;
     std::cout << "total_input_bytes=" << total_input_bytes << std::endl;
     std::cout << "reference_bytes=" << reference.size() << std::endl;

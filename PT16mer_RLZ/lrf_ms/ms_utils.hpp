@@ -710,25 +710,91 @@ inline Validation verify_against_brute_force(
   return {};
 }
 
+// One PT16 variant's lookup results for a file, checked against the
+// variant whose results are chained (see compare_lookups in
+// probe_pipeline.hpp).
+struct LookupComparison {
+  bool checked = false;
+  bool equal = true;
+  std::size_t mismatches = 0;
+  std::size_t first_mismatch = 0;
+  std::string first_reason;
+
+  std::string describe() const {
+    return std::to_string(mismatches) + " positions differ, first at " +
+           std::to_string(first_mismatch) + " (" + first_reason + ")";
+  }
+};
+
 // ---------- Per-file results ----------
+
+// What a results row is:
+//   full    an implementation computing complete matching statistics
+//           on its own (the baseline)
+//   stage   one shared PT16 pipeline stage (keys, an order, the chain)
+//   probe   one PT16 variant probing in one order
+//   chain   the PT16 pipeline's matching statistics (the chain's output),
+//           checked like a full implementation's
+enum class RowKind { full, stage, probe, chain };
+
+inline const char* row_kind_name(const RowKind kind) {
+  switch (kind) {
+    case RowKind::full:
+      return "full";
+    case RowKind::stage:
+      return "stage";
+    case RowKind::probe:
+      return "probe";
+    case RowKind::chain:
+      return "chain";
+  }
+  return "?";
+}
 
 struct FileRunResult {
   std::string filename;
   std::size_t input_bytes = 0;
   std::string implementation;
   bool is_baseline = false;
+  RowKind kind = RowKind::full;
 
   double build_ms = 0.0;
   Timing timing;
   double baseline_min_ms = 0.0;
 
+  // A probe row's whole PT16 pipeline for this file: keys + its order +
+  // its probe + the chain. What its speedup is computed from.
+  double pipeline_ms = 0.0;
+
+  // full and chain rows: the matching statistics and their checks.
   Digest digest;
   Validation invariants;
   Validation positions;
   LengthComparison lengths;
 
+  // probe rows: the lookups, checked against the chained variant's.
+  LookupComparison lookups;
+
+  // The time a speedup / MB/s is computed from (0 for a stage row, which
+  // is only part of a computation).
+  double compared_ms() const {
+    switch (kind) {
+      case RowKind::full:
+        return timing.min_ms;
+      case RowKind::probe:
+        return pipeline_ms;
+      default:
+        return 0.0;
+    }
+  }
+
   double speedup() const {
-    return timing.min_ms == 0.0 ? 0.0 : baseline_min_ms / timing.min_ms;
+    const double ms = compared_ms();
+    return ms == 0.0 ? 0.0 : baseline_min_ms / ms;
+  }
+
+  bool has_ms() const {
+    return kind == RowKind::full || kind == RowKind::chain;
   }
 };
 
@@ -790,6 +856,50 @@ struct ImplementationTotals {
   }
 };
 
+// A shared PT16 pipeline stage (keys, an order, the chain), summed over
+// every file.
+struct StageTotals {
+  std::string name;
+  double total_min_ms = 0.0;
+  double total_first_ms = 0.0;
+
+  void accumulate(const Timing& timing) {
+    total_min_ms += timing.min_ms;
+    total_first_ms += timing.first_ms;
+  }
+};
+
+// One PT16 variant probing in one order, summed over every file.
+struct ProbeTotals {
+  std::string name;  // "<variant>-<order>"
+  double build_ms = 0.0;
+
+  double total_min_ms = 0.0;    // the probe alone
+  double total_first_ms = 0.0;
+  double total_pipeline_ms = 0.0;  // keys + order + probe + chain
+
+  std::size_t files_compared = 0;
+  std::size_t files_lookups_equal = 0;
+
+  Diagnostics diagnostics;
+
+  void accumulate(const FileRunResult& result) {
+    total_min_ms += result.timing.min_ms;
+    total_first_ms += result.timing.first_ms;
+    total_pipeline_ms += result.pipeline_ms;
+
+    if (result.lookups.checked) {
+      ++files_compared;
+
+      if (result.lookups.equal) {
+        ++files_lookups_equal;
+      }
+    }
+  }
+
+  bool ok() const { return files_lookups_equal == files_compared; }
+};
+
 // ---------- Output files ----------
 
 class CSVWriter {
@@ -799,34 +909,78 @@ class CSVWriter {
       throw std::runtime_error("cannot create results file: " + path);
     }
 
-    output_ << "file,input_bytes,implementation,is_baseline,build_ms,first_ms,"
-               "min_ms,baseline_min_ms,speedup,MB_per_s,entries,total_len,"
-               "max_len,zero_len,lengths_equal,divergent_positions,"
-               "invariants_ok,positions_ok,peak_RSS_MB\n";
+    output_ << "file,input_bytes,implementation,kind,is_baseline,build_ms,"
+               "first_ms,min_ms,pipeline_ms,baseline_min_ms,speedup,MB_per_s,"
+               "entries,total_len,max_len,zero_len,lengths_equal,"
+               "divergent_positions,invariants_ok,positions_ok,lookups_equal,"
+               "peak_RSS_MB\n";
   }
 
+  // Columns that do not apply to a row's kind are written as NA.
   void write_row(const FileRunResult& result) {
-    const double seconds = result.timing.min_ms / 1000.0;
+    const double compared_ms = result.compared_ms();
+    const double seconds = compared_ms / 1000.0;
     const double megabytes =
         static_cast<double>(result.input_bytes) / (1024.0 * 1024.0);
+    const bool timed_whole = result.kind == RowKind::full ||
+                             result.kind == RowKind::probe;
+    const auto yes_no = [](bool value) { return value ? "YES" : "NO"; };
 
     output_ << result.filename << ',' << result.input_bytes << ','
-            << result.implementation << ',' << (result.is_baseline ? 1 : 0)
-            << ',' << std::fixed << std::setprecision(3) << result.build_ms
-            << ',' << result.timing.first_ms << ',' << result.timing.min_ms
-            << ',' << result.baseline_min_ms << ',' << std::setprecision(4)
-            << result.speedup() << ',' << std::setprecision(3)
-            << (seconds == 0.0 ? 0.0 : megabytes / seconds) << ','
-            << result.digest.entries << ',' << result.digest.total_len << ','
-            << result.digest.max_len << ',' << result.digest.zero_len_count
-            << ','
-            << (result.is_baseline ? "NA"
-                                   : (result.lengths.equal ? "YES" : "NO"))
-            << ',' << result.lengths.divergent_positions << ','
-            << (result.invariants.ok ? "YES" : "NO") << ','
-            << (result.positions.ok ? "YES" : "NO") << ','
-            << std::setprecision(2) << peak_rss_mb() << '\n';
+            << result.implementation << ',' << row_kind_name(result.kind)
+            << ',' << (result.is_baseline ? 1 : 0) << ',' << std::fixed
+            << std::setprecision(3) << result.build_ms << ','
+            << result.timing.first_ms << ',' << result.timing.min_ms << ',';
 
+    if (result.kind == RowKind::probe) {
+      output_ << result.pipeline_ms;
+    } else {
+      output_ << "NA";
+    }
+
+    output_ << ',' << result.baseline_min_ms << ',';
+
+    if (timed_whole) {
+      output_ << std::setprecision(4) << result.speedup() << ','
+              << std::setprecision(3)
+              << (seconds == 0.0 ? 0.0 : megabytes / seconds);
+    } else {
+      output_ << "NA,NA";
+    }
+
+    output_ << ',';
+
+    if (result.has_ms()) {
+      output_ << result.digest.entries << ',' << result.digest.total_len
+              << ',' << result.digest.max_len << ','
+              << result.digest.zero_len_count << ','
+              << (result.is_baseline ? "NA" : yes_no(result.lengths.equal))
+              << ',' << result.lengths.divergent_positions << ','
+              << yes_no(result.invariants.ok) << ','
+              << yes_no(result.positions.ok);
+    } else {
+      output_ << "NA,NA,NA,NA,NA,NA,NA,NA";
+    }
+
+    output_ << ',';
+
+    if (result.lookups.checked) {
+      output_ << yes_no(result.lookups.equal);
+    } else {
+      output_ << "NA";
+    }
+
+    output_ << ',' << std::setprecision(2) << peak_rss_mb() << '\n';
+
+    output_.flush();
+  }
+
+  // One extra "summary,<name>,<key>,<value>" line.
+  template <typename Value>
+  void write_summary_value(const std::string& name, const std::string& key,
+                           const Value& value) {
+    output_ << "summary," << name << ',' << key << ',' << std::fixed
+            << std::setprecision(3) << value << '\n';
     output_.flush();
   }
 

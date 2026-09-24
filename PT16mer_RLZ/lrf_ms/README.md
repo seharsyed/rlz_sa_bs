@@ -12,12 +12,20 @@ tool, and none of the parallelization advice at the end applies to it.
 | File | What it is |
 | --- | --- |
 | `ms_main.cpp` | The benchmark's entry point (build it, run it). |
-| `ms_variants.hpp` | The registry: every implementation under test, one line each. **This is the only file you edit to add a variant.** |
-| `ms_utils.hpp` | Everything generic: CLI args, loading, timing, invariant/position/brute-force checking, CSV and checksum output. |
+| `probe_pipeline.hpp` | The shared PT16 pipeline: rolling keys, the bucket and sorted probe orders, the `Prober` interface, one `Policy` per table variant, and **`build_probers`, the registry of PT16 variants**. Also `compare_lookups`, the check between variants. |
+| `ms_variants.hpp` | The registry of *full* implementations (`build_implementations`) — ones that compute complete MS on their own, currently only the baseline. Also the older self-contained PT16 variant classes, kept for the tests. |
+| `ms_tools.hpp` | `backwardChainExtend`: multi-step chain extension, lookup results to exact MS. |
+| `chain_extend.hpp` | `chainExtend`: the one-step version (not exact; kept for comparison). |
+| `ms_utils.hpp` | Everything generic: CLI args, loading, timing, invariant/position/brute-force checking, result rows and totals, CSV and checksum output. |
 | `lrf_ms.hpp` | The baseline: `LRFMS`, the classical O(n+m) suffix-array + LCP + RMQ matching-statistics algorithm. |
-| `pt16_sassy_ms.hpp` | The sassy-PT16-table-based variants (`PT16SassyMS` and its scan/bucket-scan adapters). |
+| `pt16_sassy_ms.hpp`, `pt16_fastmiss_ms.hpp`, `sorted_kmer_scan.hpp` | The older self-contained sassy / fast-miss MS classes and the sorted scan they share; no longer run by `ms_main`, used by the tests. |
 | `rmq_tree.h` | The RMQ structure `LRFMS` builds over the LCP array. |
 | `ms_test.cpp` | Standalone correctness test — builds its own SA, checks `LRFMS` against brute force, exercises the `ms_utils` comparison/digest helpers. Independent of `ms_main`. |
+| `probe_pipeline_test.cpp` | Standalone test of the pipeline: every variant, both orders, on small and repetitive references — lookups agree (`compare_lookups`), and chaining each variant's own results gives brute-force lengths. |
+| `chain_extend_test.cpp`, `fastmiss_test.cpp` | Tests of the chain extensions and of the fast-miss parser against brute force. |
+
+The table variants themselves live in `../variants/` (fast-miss, sassy,
+interleaved v2) and `../pt16_rlz_v2.hpp` (plain v2).
 
 ## Quick start
 
@@ -44,6 +52,7 @@ Run the correctness test the same way:
 
 ```bash
 g++ -std=c++20 -O2 lrf_ms/ms_test.cpp -o ms_test && ./ms_test
+g++ -std=c++20 -O2 lrf_ms/probe_pipeline_test.cpp -o probe_pipeline_test && ./probe_pipeline_test
 ```
 
 ## CLI reference
@@ -69,80 +78,107 @@ used throughout this session's scan-only experiments.
 
 ## Registered implementations
 
-Registration order is exit order; index 0 is always the baseline everything
-else is compared and speedup-ratio'd against.
+Two kinds, run differently.
 
-| Name | What it computes | Table format |
+**Full implementations** (`build_implementations` in `ms_variants.hpp`)
+each compute complete matching statistics on their own. Registration order
+is report order; index 0 is always the baseline everything else is compared
+and speedup-ratio'd against.
+
+| Name | What it computes |
+| --- | --- |
+| `lrf-ms` | Baseline. Classical algorithm: suffix range narrowing plus an LRF-array skip that resolves most consecutive positions in O(1), no table lookup at all. Builds ISA/LCP/LRF/RMQ once. |
+
+**PT16 table variants** (`build_probers` in `probe_pipeline.hpp`) share
+one pipeline, run per file as:
+
+| Stage | Runs | What it does |
 | --- | --- | --- |
-| `lrf-ms` | Baseline. Classical algorithm: suffix range narrowing plus an LRF-array skip that resolves most consecutive positions in O(1), no table lookup at all. | none (ISA/LCP/LRF/RMQ, built once) |
-| `pt16-v2-bucket-chain-multi` | One 16-mer lookup per position, run grouped by table bucket, then multi-step chain extension. | non-sassy H/L (`pt16_build_v2.hpp`) |
-| `pt16-v2-sorted-chain-multi` | Same, with the lookups fully sorted by their 32-bit key (`sortedKmerScan`). | same |
-| `pt16-v2-fastmiss-sorted-chain-multi` | As `pt16-v2-sorted-chain-multi`, with the cheaper miss path of `PT16FastMissParser`. | v2 table, own copy (`<table>.fastmiss`) |
-| `pt16-v2-fastmiss-bucket-chain-multi` | As `pt16-v2-bucket-chain-multi`, with the fast-miss lookup. | same as above |
-| `pt16-sassy-chain-multi` | Bucketed lookups over the self-contained sassy table, then multi-step chain extension. | sassy (`pt16_build_sassy.hpp`, `<table>.sassy`) |
-| `pt16-sassy-sorted-chain-multi` | Same, with fully sorted lookups. | same |
+| `keys` | once | roll every 16-mer key of the input |
+| `bucket-order` | once | positions grouped by table bucket (one counting-sort pass) |
+| `sorted-order` | once | positions fully sorted by key (two LSD counting-sort passes) |
+| probe | per variant, per order | one table lookup per key in that order, plus the tail positions |
+| `chain` | once | `backwardChainExtend` on the first variant's lookup results |
 
-Only variants that compute the full, exact matching statistics are
-registered: every row above is proven exact against brute force
-(`chain_extend_test.cpp`), so it must report `lengths=N/N equal`. The
-scan-only rows (raw 16-mer lookups capped at 16) and the one-step
-`pt16-sassy-chain` were dropped from the timed runs; their classes remain in
-`ms_variants.hpp` / `pt16_sassy_ms.hpp` / `pt16_fastmiss_ms.hpp`. What was
-found with the scan-only rows (not exhaustively, and not yet on genome-scale
-real data at the time of writing):
+Only the probe depends on the variant: the keys and orders depend only on
+the input, and every correct variant returns the same lookup results (each
+stored at its own text position, whatever order it was probed in), so the
+chain runs once. Each probe row is `<variant>-<order>`, and its *pipeline*
+time — keys + its order + its probe + the chain — is what its speedup is
+computed from.
 
-- Bucketing consistently beats input-order scanning for both table formats,
-  often enough to flip a variant from slower-than-baseline to faster.
-- The plain (non-sassy) table has so far beaten the sassy table on raw
-  lookup speed, despite needing an extra suffix-array read the sassy table
-  avoids — most likely because its L entry is half the size (4 vs. 8
-  bytes), so more entries share a cache line during a bucket search.
-- Whether `H_interleaved_` (directory + SA-start packed together) beats two
-  separate arrays depends on how often a lookup has to walk past several
-  empty buckets to find where the current one ends — that walk only needs
-  half of what interleaving fetches. This has been observed to go either
-  way depending on the dataset; it isn't settled.
+| Variant | Table |
+| --- | --- |
+| `pt16-v2` | plain v2 (`../pt16_rlz_v2.hpp`), file built by `../pt16_build_v2.hpp` |
+| `pt16-v2-fastmiss` | fast-miss (`../variants/pt16_rlz_v2_fastmiss.hpp`): same v2 file, reference position per entry, precomputed empty buckets, flagged short-suffix buckets |
+| `pt16-sassy` | sassy (`../variants/pt16_sassy.hpp`), `<table>.sassy`: self-contained, no reference or SA reads |
 
-Treat all of the above as leads, not conclusions — see the diagnostics below
-for how to check them against your own data.
+Each table file is written once per run (the v2 file is shared by `pt16-v2`
+and `pt16-v2-fastmiss`) and every variant only loads it; `[6] BUILD`
+reports the writes and loads separately.
+
+**Correctness.** The chain's output (`pt16-chain`) gets the full checks —
+invariants, positions, lengths against the baseline (`lengths N/N equal`).
+Every probe's lookups are compared against the chained ones with
+`compare_lookups` (`lookups N/N equal`), on exactly what the chain reads:
+`found`, `match_length`, `count`, and the occurrence set (a singleton's
+`match_position`, a range's `positions`), plus that every `match_position`
+is a real match. A miss's `match_position` is not compared: any occurrence
+of the longest matching prefix is correct. `probe_pipeline_test.cpp` checks
+that agreeing results really do chain to the same (brute-force) lengths.
+
+What was found with the older per-variant scans (not exhaustively, and not
+yet on genome-scale real data at the time of writing):
 
 ## Reading the diagnostics
 
-Nothing is printed per implementation per file (the per-file rows go to
-the results CSV). Each implementation's `diagnostics()` is collected after
-every `compute()` call, summed over all files, and printed once per
-implementation under `[10] DIAGNOSTICS`, after the collection totals:
+Nothing is printed per file except failures (the per-file rows, one per
+full implementation, stage, probe and chain, go to the results CSV with a
+`kind` column). `[9] COLLECTION TOTALS` has the full implementations, the
+shared stages with their share of the shared time, and one row per variant
+and order: load time, probe time, pipeline time, MB/s, speedup, lookup
+check. `[10] DIAGNOSTICS` has each variant's counters from its probes,
+summed over files:
 
 ```
-pt16-sassy-chain-multi
-        phases: prebucket 0.215 ms (5.1%)  bucket 0.422 ms (9.9%)  probe 3.620 ms (85.0%)  tail 0.003 ms (0.1%)  total 4.260 ms
+pt16-sassy-bucket
         bucket search: linear=149792 binary=0
+        misses: total=17638 empty-bucket=508 full-short-suffix-checks=1
+16-mer lookups: singleton=88.3%  range=0.0%  miss=11.7%
 ```
 
-- **`phases`** (bucketed variants; the sorted ones report `keys`,
-  `radix-low`, `radix-high`, `probe`, `tail` instead): the scan's own four stages —
-  `prebucket` (pack every 16-mer, tally per-bucket counts), `bucket`
-  (prefix-sum + counting-sort placement), `probe` (the lookups themselves,
-  now in bucket order — the phase bucketing exists to speed up), `tail`
-  (the last <16 characters, never reordered). Timed coarsely — 4
-  `clock::now()` pairs per whole file, not per lookup — so it doesn't
-  measurably inflate the numbers it reports on.
-- **`bucket search`**: how many of this call's non-empty-bucket dispatches
-  searched their bucket linearly vs. with `std::lower_bound` (the switch is
-  at 64 entries). Free counters (plain increments already on a taken
-  branch), reported by the bucketed v2 and sassy variants. Useful for checking whether a format's average bucket size sits mostly below or
-  above that threshold on your data — the answer changes which cost model
-  (bandwidth-bound linear scan vs. probe-count-bound binary search)
-  actually applies.
-- **`misses`** (fastmiss and sassy variants): `total` misses, how many
-  landed in an `empty-bucket` (answered from arrays precomputed at load
-  time), and how many ran the `full-short-suffix-checks` because their
-  bucket holds a short suffix longer than 8 characters. Every other miss
-  skips the short suffixes entirely.
+- **`bucket search`**: how many non-empty-bucket dispatches searched their
+  bucket linearly vs. with `std::lower_bound` (the switch is at 64
+  entries). Useful for checking whether a format's average bucket size sits
+  mostly below or above that threshold on your data — the answer changes
+  which cost model (bandwidth-bound linear scan vs. probe-count-bound
+  binary search) actually applies.
+- **`misses`** (fast-miss and sassy): `total` misses, how many landed in an
+  `empty-bucket` (answered from arrays precomputed at load time), and how
+  many ran the `full-short-suffix-checks` because their bucket holds a
+  short suffix longer than 8 characters. Every other miss skips the short
+  suffixes entirely.
+- **`16-mer lookups`**: how the lookups classified, from the chained
+  results (the same for every correct variant).
 
 ## Adding a new variant
 
-Edit only `ms_variants.hpp`. A class qualifies if it has:
+**A PT16 table variant**: in `probe_pipeline.hpp`, write a `Policy` for it
+(its table type and how to call its 16-mer lookup, its tail lookup and its
+counters — see `V2Policy`) and add one line to `build_probers`:
+
+```cpp
+set.probers.push_back(std::make_unique<TableProber<MyPolicy>>(
+    "my-variant", /* table constructor args */));
+```
+
+It is then probed in both orders, timed, and checked against the chained
+results automatically. The table constructor is what gets timed as its
+load; if it needs a new file format, build the file once in
+`build_probers` and add it to `table_builds`.
+
+**A full implementation** (computes complete MS on its own): edit
+`ms_variants.hpp`. A class qualifies if it has
 
 ```cpp
 Impl(const std::vector<Symbol>&, const std::vector<SAType>&, /* extra args */);
@@ -157,11 +193,8 @@ add_implementation<MyVariant<Symbol, SAType>>(implementations, "my-variant",
 ```
 
 The constructor is what gets timed into `build_ms()`. Optionally add
-`Diagnostics diagnostics() const` (lines of phase times or counters, built
-with `phase_diagnostics` / `counter_diagnostics` from `pt16_utils.hpp`) and
-`MSAdapter` will forward it automatically via `if constexpr` — no interface
-class to inherit from. `ms_main` sums it over every file and prints it once
-per variant under `[10] DIAGNOSTICS`.
+`Diagnostics diagnostics() const` and `MSAdapter` forwards it; `ms_main`
+sums it over files and prints it under `[10] DIAGNOSTICS`.
 
 ## Parallelizing over inputs
 

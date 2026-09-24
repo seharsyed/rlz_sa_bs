@@ -496,6 +496,19 @@ inline Diagnostics counter_diagnostics(
   return {{std::move(line)}};
 }
 
+// The "bucket search" line: how many non-empty-bucket dispatches searched
+// their bucket linearly vs. with std::lower_bound (a lookup's Stats with
+// linear_bucket_searches / binary_bucket_searches: PT16RLZParser,
+// PT16FastMissParser, PT16SassyLookup), between two snapshots.
+template <typename Stats>
+Diagnostics bucket_search_diagnostics(const Stats& before, const Stats& after) {
+  return counter_diagnostics(
+      "bucket search",
+      {{"linear", after.linear_bucket_searches - before.linear_bucket_searches},
+       {"binary",
+        after.binary_bucket_searches - before.binary_bucket_searches}});
+}
+
 // The "misses" line: a lookup's Stats with misses / empty_bucket_misses /
 // short_suffix_checks (PT16FastMissParser, PT16SassyLookup), as the
 // difference between two snapshots.
