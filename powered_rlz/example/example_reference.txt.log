@@ -1,0 +1,34 @@
+==== Command line:
+ /home/klara/Documents/PFP-eBWT/build/include/PFP-algos/circpfp-gca.x ../../RLZ-parser/RLZ-parser/example/example_reference.txt -w 4 -p 10
+File name: ../../RLZ-parser/RLZ-parser/example/example_reference.txt
+Windows size: 4
+Stop word modulus: 10
+Total input symbols: 17
+Found 1 distinct words
+Parsing took: 0 wall clock seconds
+Sum of lenghts of dictionary words: 21
+Total number of words: 1
+malloc_count ### exiting, total: 512,826, peak: 475,175, current: 4,096
+Writing plain dictionary and occ file
+Dictionary construction took: 0 wall clock seconds
+Generating remapped parse file
+Remapping parse file took: 0 wall clock seconds
+==== Elapsed time: 0 wall clock seconds
+==== Command line:
+ /home/klara/Documents/PFP-eBWT/build/include/eBWT-algos/parsebwtgcaNT.x ../../RLZ-parser/RLZ-parser/example/example_reference.txt -w 4
+
+Computing eBWT of the parse with the ds needed for the GCA...
+Checking parse size.
+Starting computing cSA
+malloc_count ### exiting, total: 54,151, peak: 14,509, current: 4,096
+Building the eBWT of the parse took: 0 wall clock seconds
+==== Command line:
+ /home/klara/Documents/PFP-eBWT/build/include/eBWT-algos/build-ebwt-gca.x ../../RLZ-parser/RLZ-parser/example/example_reference.txt -w 4 -c
+
+Computing BWT of the dictionary...
+Building the BWT of the dictionary took: 0 wall clock seconds
+Loading parse's data structures...
+Loading parse's data structures took: 0 wall clock seconds
+Computing the eBWT and the GCA of the text...
+malloc_count ### exiting, total: 86,928, peak: 24,138, current: 4,096
+Building the eBWT and the GCA of text took: 0 wall clock seconds
