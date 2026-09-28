@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../pt16_utils.hpp"  // KmerLookupResult, EntryComposition, constants
+#include "pt16_short_suffixes.hpp"  // collect_short_suffixes, ShortSuffixIndex
 #include "../rlz_common.hpp"
 
 /**
@@ -118,8 +119,9 @@ class PT16FastMissParser {
                      const std::string& pt16_path)
       : ref_(&ref), sa_(&sa) {
     load_hl(pt16_path);
-    build_short_suffixes();
+    short_index_ = ShortSuffixIndex(collect_short_suffixes(*ref_));
     build_empty_answers();
+    build_trimmed_ends();
 
     stats_.entries = L_.size();
     stats_.approx_bytes =
@@ -129,7 +131,10 @@ class PT16FastMissParser {
             sizeof(std::pair<const std::uint32_t, std::uint32_t>) +
         empty_ref_pos_.size() * sizeof(std::uint32_t) +
         empty_length_.size() * sizeof(std::uint8_t) +
-        sizeof(long_short_buckets_);
+        short_index_.memory_bytes() +
+        trimmed_.size() * sizeof(std::uint64_t) +
+        trimmed_end_.size() *
+            sizeof(std::pair<const std::uint32_t, std::uint32_t>);
   }
 
   PT16FastMissParser(const PT16FastMissParser&) = delete;
@@ -246,6 +251,96 @@ class PT16FastMissParser {
                                                    input_pos)));
   }
 
+  /**
+   * The longest prefix of input[input_pos..] that occurs in the reference,
+   * as (reference position, length): lookupKmerOrTail, then extended past
+   * the 16-mer on a hit, as PT16SassyLookup::find_longest_matching_factor
+   * does:
+   *
+   *   - a singleton hit extends character by character from the entry's
+   *     own ref_pos (no suffix array access);
+   *   - a range hit narrows within its SA slice (hit.positions) with
+   *     rlz::binarySearchLB/RB, then extends once one occurrence is left;
+   *   - a miss or a tail is already the longest match.
+   */
+  std::pair<std::size_t, std::size_t> findLongestMatchingFactor(
+      const input_type& input, const std::size_t input_pos) const {
+    const KmerLookupResult hit = lookupKmerOrTail(input, input_pos);
+
+    if (!hit.found) {
+      return {hit.match_position, hit.match_length};
+    }
+
+    std::size_t offset = kmer_length;
+    std::size_t j = input_pos + kmer_length;
+    std::size_t match = hit.match_position;
+
+    if (hit.count > 1) {
+      std::int64_t nlb = 0;
+      std::int64_t nrb = static_cast<std::int64_t>(hit.positions.size()) - 1;
+
+      while (nlb < nrb && j < input.size()) {
+        const auto lb = rlz::binarySearchLB(*ref_, hit.positions, nlb, nrb,
+                                            static_cast<std::int64_t>(offset),
+                                            input[j]);
+
+        if (!lb) {
+          break;
+        }
+
+        const auto rb =
+            rlz::binarySearchRB(*ref_, hit.positions, lb.value(), nrb,
+                                static_cast<std::int64_t>(offset), input[j]);
+
+        if (!rb) {
+          break;
+        }
+
+        nlb = lb.value();
+        nrb = rb.value();
+        ++j;
+        ++offset;
+      }
+
+      match = hit.positions[static_cast<std::size_t>(nlb)];
+
+      // Still several occurrences when the input ran out: any is correct.
+      if (nlb != nrb) {
+        return {match, offset};
+      }
+    }
+
+    while (j < input.size() && match + offset < ref_->size() &&
+           (*ref_)[match + offset] == input[j]) {
+      ++j;
+      ++offset;
+    }
+
+    return {match, offset};
+  }
+
+  // The same greedy parse as PT16RLZParser::lzFactorize and
+  // PT16SassyLookup::lzFactorize: a match of 0 or 1 characters becomes a
+  // literal factor.
+  Triples lzFactorize(const input_type& input) const {
+    Triples factors;
+    std::size_t i = 0;
+
+    while (i < input.size()) {
+      auto [pos, len] = findLongestMatchingFactor(input, i);
+
+      if (len <= 1) {
+        pos = static_cast<std::size_t>(input[i]);
+        len = 1;
+      }
+
+      factors.push_back({i, pos, len});
+      i += len;
+    }
+
+    return factors;
+  }
+
   const Stats& stats() const { return stats_; }
 
  private:
@@ -273,14 +368,20 @@ class PT16FastMissParser {
   std::vector<Entry> L_;
   std::unordered_map<std::uint32_t, std::uint32_t> large_offsets_;
 
-  // short_suffix_keys_[L], L = 1 .. short_suffix_count_: the reference's
-  // last L characters packed like a 16-mer key, unused low bits 0.
-  std::array<std::uint32_t, KMER_LENGTH> short_suffix_keys_{};
-  std::size_t short_suffix_count_ = 0;
+  // Every short suffix of the reference (see pt16_short_suffixes.hpp): the
+  // positions within 15 characters of its end or of a separator, arranged
+  // for the empty-bucket precomputation and for the query-time check of
+  // suffixes longer than 8 in the query's bucket.
+  ShortSuffixIndex short_index_;
 
-  // Bit b set: some short suffix of length >= 9 starts with bucket b's 8
-  // characters, so a query in bucket b may match it for more than 8.
-  std::array<std::uint64_t, NUMBER_OF_BUCKETS / 64> long_short_buckets_{};
+  // An entry's SA interval ends where the next entry's begins, except when
+  // suffixes without an entry (too short, or containing a separator) lie
+  // in between: bit `position` of trimmed_ is set for such an entry, and
+  // trimmed_end_ holds its real (inclusive) end. Worked out once at load
+  // time, so a lookup never walks back over them -- a separator run in the
+  // reference can put millions there.
+  std::vector<std::uint64_t> trimmed_;
+  std::unordered_map<std::uint32_t, std::uint32_t> trimmed_end_;
 
   // Precomputed answer per empty bucket (unused for non-empty ones).
   std::vector<std::uint32_t> empty_ref_pos_;
@@ -369,49 +470,49 @@ class PT16FastMissParser {
     }
   }
 
-  // ---------- Short suffixes ----------
+  // ---------- Interval ends ----------
 
-  void build_short_suffixes() {
-    short_suffix_count_ =
-        std::min(static_cast<std::size_t>(kmer_length - 1), ref_->size());
-
-    for (std::size_t length = 1; length <= short_suffix_count_; ++length) {
-      const std::size_t start = ref_->size() - length;
-      std::uint32_t key = 0;
-
-      for (std::size_t j = 0; j < length; ++j) {
-        key = (key << 2U) |
-              alphatab[static_cast<unsigned char>((*ref_)[start + j])];
-      }
-
-      short_suffix_keys_[length] =
-          key << (32U - 2U * static_cast<std::uint32_t>(length));
-
-      if (length > 8) {
-        const std::uint32_t bucket = short_suffix_keys_[length] >> low_bits;
-        long_short_buckets_[bucket / 64] |= std::uint64_t{1} << (bucket % 64);
-      }
+  // The last SA index before the next entry's interval: the entry's end,
+  // unless suffixes without an entry lie in between (see trimmed_).
+  std::uint32_t raw_interval_end(const std::uint32_t bucket,
+                                 const std::uint32_t position,
+                                 const std::uint32_t end) const {
+    if (position + 1 < end) {
+      return sa_start_at(bucket, position + 1) - 1;
     }
+
+    const std::uint32_t next_bucket = next_nonempty_bucket(bucket);
+
+    return static_cast<std::uint32_t>(
+        (next_bucket < number_of_buckets ? H_sa_[next_bucket] : sa_->size()) -
+        1);
   }
 
-  bool has_long_short_suffix(const std::uint32_t bucket) const {
-    return (long_short_buckets_[bucket / 64] >> (bucket % 64)) & 1U;
-  }
+  void build_trimmed_ends() {
+    trimmed_.assign((L_.size() + 63) / 64, 0);
 
-  // Same as PT16RLZParser::check_short_suffixes_empty_bucket: longest first, stopping
-  // once no remaining suffix could be longer than match_length.
-  void check_short_suffixes(const std::uint32_t key, std::size_t& ref_pos,
-                            std::size_t& match_length) const {
-    for (std::size_t length = short_suffix_count_; length > match_length;
-         --length) {
-      const std::size_t shared = std::min<std::size_t>(
-          length, static_cast<std::size_t>(
-                      std::countl_zero(key ^ short_suffix_keys_[length])) /
-                      2);
+    for (std::uint32_t bucket = 0; bucket < number_of_buckets; ++bucket) {
+      if (H_[bucket] & empty_bucket_flag) {
+        continue;
+      }
 
-      if (shared > match_length) {
-        match_length = shared;
-        ref_pos = ref_->size() - length;
+      const std::uint32_t end = H_[next_nonempty_bucket(bucket)];
+
+      for (std::uint32_t position = H_[bucket]; position < end; ++position) {
+        std::uint32_t sa_end = raw_interval_end(bucket, position, end);
+
+        if (window_is_acgt(*ref_, (*sa_)[sa_end])) {
+          continue;
+        }
+
+        // Every suffix with a 16-mer between this entry and the next
+        // belongs to this entry, so the ones without are all at the end.
+        while (!window_is_acgt(*ref_, (*sa_)[sa_end])) {
+          --sa_end;
+        }
+
+        trimmed_[position / 64] |= std::uint64_t{1} << (position % 64);
+        trimmed_end_.emplace(position, sa_end);
       }
     }
   }
@@ -422,7 +523,7 @@ class PT16FastMissParser {
   // bucket, first position of that bucket), raised by any short suffix.
   // A short suffix's match is capped at 8 here because only the bucket's
   // 8 characters are known; if a suffix could go past 8, the bucket is
-  // flagged in long_short_buckets_ and the query finishes the check.
+  // flagged (ShortSuffixIndex::has_long) and the query finishes the check.
   void build_empty_answers() {
     empty_ref_pos_.assign(number_of_buckets, 0);
     empty_length_.assign(number_of_buckets, 0);
@@ -433,25 +534,24 @@ class PT16FastMissParser {
       }
 
       const std::uint32_t matching_bucket = H_[bucket] & empty_bucket_mask;
-      const std::uint32_t difference = (bucket ^ matching_bucket) << 16U;
 
-      std::size_t match_length = std::countl_zero(difference) / 2;
-      std::size_t ref_pos = L_[H_[matching_bucket]].ref_pos;
+      // No non-empty bucket at all (a table without entries): only the
+      // short suffixes can match.
+      std::size_t match_length = 0;
+      std::size_t ref_pos = 0;
 
-      const std::uint32_t bucket_key = bucket << low_bits;
+      if (matching_bucket < number_of_buckets) {
+        const std::uint32_t difference = (bucket ^ matching_bucket) << 16U;
+        match_length = std::countl_zero(difference) / 2;
+        ref_pos = L_[H_[matching_bucket]].ref_pos;
+      }
 
-      for (std::size_t length = short_suffix_count_; length > match_length;
-           --length) {
-        const std::size_t shared = std::min<std::size_t>(
-            {length, 8,
-             static_cast<std::size_t>(
-                 std::countl_zero(bucket_key ^ short_suffix_keys_[length])) /
-                 2});
+      const auto [suffix_length, suffix_position] =
+          short_index_.best_in_bucket(bucket);
 
-        if (shared > match_length) {
-          match_length = shared;
-          ref_pos = ref_->size() - length;
-        }
+      if (suffix_length > match_length) {
+        match_length = suffix_length;
+        ref_pos = suffix_position;
       }
 
       empty_ref_pos_[bucket] = static_cast<std::uint32_t>(ref_pos);
@@ -470,9 +570,9 @@ class PT16FastMissParser {
     std::size_t ref_pos = empty_ref_pos_[bucket];
     std::size_t match_length = empty_length_[bucket];
 
-    if (has_long_short_suffix(bucket)) {
+    if (short_index_.has_long(bucket)) {
       ++stats_.short_suffix_checks;
-      check_short_suffixes(key, ref_pos, match_length);
+      short_index_.raise_long(key, match_length, ref_pos);
     }
 
     ++stats_.misses;
@@ -579,9 +679,9 @@ class PT16FastMissParser {
     std::size_t ref_pos = L_[best].ref_pos;
 
     // lcp_chars >= 8 here, so only a flagged bucket can do better.
-    if (has_long_short_suffix(bucket)) {
+    if (short_index_.has_long(bucket)) {
       ++stats_.short_suffix_checks;
-      check_short_suffixes(key, ref_pos, lcp_chars);
+      short_index_.raise_long(key, lcp_chars, ref_pos);
     }
 
     result.match_position = static_cast<std::uint32_t>(ref_pos);
@@ -624,29 +724,10 @@ class PT16FastMissParser {
   std::uint32_t interval_end(const std::uint32_t bucket,
                              const std::uint32_t position,
                              const std::uint32_t end) const {
-    std::size_t next_start;
-
-    if (position + 1 < end) {
-      next_start = sa_start_at(bucket, position + 1);
-    } else {
-      const std::uint32_t next_bucket = next_nonempty_bucket(bucket);
-
-      if (next_bucket < number_of_buckets) {
-        next_start = H_sa_[next_bucket];
-      } else {
-        next_start = sa_->size();
-      }
+    if ((trimmed_[position / 64] >> (position % 64)) & 1U) {
+      return trimmed_end_.at(position);
     }
 
-    std::size_t sa_end = next_start - 1;
-
-    // Suffixes shorter than 16 have no entry but can sit between two
-    // intervals in the SA; drop them from this interval's end.
-    while (static_cast<std::size_t>((*sa_)[sa_end]) + kmer_length >
-           ref_->size()) {
-      --sa_end;
-    }
-
-    return static_cast<std::uint32_t>(sa_end);
+    return raw_interval_end(bucket, position, end);
   }
 };

@@ -32,6 +32,9 @@ struct ScanResult {
 
   // Number of PT16 entries belonging to each bucket.
   std::array<std::uint32_t, NUMBER_OF_BUCKETS> count{};
+
+  // Singletons vs ranges, and the range sizes.
+  RangeSizeStats range_stats;
 };
 
 /*
@@ -79,20 +82,26 @@ static ScanResult build_entries(
   // One SA starting position for each H bucket.
   result.H_sa.resize(NUMBER_OF_BUCKETS, 0);
 
-  const std::size_t reserve_size = reference.size() - KMER_LENGTH + 1;
-
-  result.L.reserve(reserve_size);
+  if (reference.size() >= KMER_LENGTH) {
+    result.L.reserve(reference.size() - KMER_LENGTH + 1);
+  }
 
   bool interval_open = false;
 
   std::uint32_t current_key = 0;
   std::uint32_t current_start = 0;
 
+  // Suffixes in the current interval. Not sa_index - current_start: skipped
+  // suffixes (no full ACGT window) can sit between two intervals.
+  std::size_t current_size = 0;
+
   for (std::uint32_t sa_index = 0; sa_index < suffix_array.size(); ++sa_index) {
     const std::uint32_t position = suffix_array[sa_index];
 
-    // Suffixes shorter than 16 symbols cannot form a PT16 entry.
-    if (static_cast<std::size_t>(position) + KMER_LENGTH > reference.size()) {
+    // Only a full 16-mer of ACGT forms a PT16 entry: skip suffixes shorter
+    // than 16 and windows containing a separator. They cannot lie inside
+    // an interval (they do not start with its 16-mer), only between two.
+    if (!window_is_acgt(reference, position)) {
       continue;
     }
 
@@ -103,24 +112,29 @@ static ScanResult build_entries(
       interval_open = true;
       current_key = key;
       current_start = sa_index;
+      current_size = 1;
       continue;
     }
 
     // Same 16-mer: remain inside the current interval.
     if (key == current_key) {
+      ++current_size;
       continue;
     }
 
     // New 16-mer: store the starting position of the completed interval.
     store_entry(result, current_key, current_start);
+    result.range_stats.add(current_key, current_size);
 
     current_key = key;
     current_start = sa_index;
+    current_size = 1;
   }
 
   // Store the final interval.
   if (interval_open) {
     store_entry(result, current_key, current_start);
+    result.range_stats.add(current_key, current_size);
   }
 
   return result;
@@ -167,11 +181,16 @@ static void write_hl_table(const std::string& output_path,
 
 // ---------- Public PT16 preprocessing function ----------
 
-void build_pt16_table(const std::vector<unsigned char>& reference,
-                      const std::vector<std::uint32_t>& suffix_array,
-                      const std::string& output_path) {
+// Returns the table's construction statistics (singletons vs ranges, and
+// the distribution of range sizes); callers may ignore them.
+inline RangeSizeStats build_pt16_table(
+    const std::vector<unsigned char>& reference,
+    const std::vector<std::uint32_t>& suffix_array,
+    const std::string& output_path) {
   const ScanResult scan = build_entries(reference, suffix_array);
   const std::vector<std::uint32_t> H = build_H(scan.count);
 
   write_hl_table(output_path, scan, H);
+
+  return scan.range_stats;
 }

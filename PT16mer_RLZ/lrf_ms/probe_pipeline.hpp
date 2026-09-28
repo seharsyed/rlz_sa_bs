@@ -23,12 +23,13 @@
  *
  * Every PT16 variant computes matching statistics the same way:
  *
- *   keys    roll every 16-mer key of the input            (shared)
+ *   keys    roll every 16-mer key of the input, and list
+ *           the short queries (see ProbeInput)            (shared)
  *   order   the order the keys are probed in:
  *             bucket  counting sort by table bucket       (shared)
  *             sorted  LSD radix sort by the full key      (shared)
  *   probe   one table lookup per key, in that order,
- *           plus the tail positions                       (per variant)
+ *           plus the short queries                        (per variant)
  *   chain   multi-step chain extension (ms_tools.hpp)     (shared)
  *
  * Only the probe depends on the table variant. The keys and the two orders
@@ -39,6 +40,12 @@
  * probes -- instead of every variant redoing all of it.
  *
  * A variant is a Prober (below); build_probers is the registry.
+ *
+ * Only A, C, G and T match; any other byte is a separator that matches
+ * nothing (variants/pt16_short_suffixes.hpp). A position whose 16-mer
+ * window holds a separator has no key: like the last 15 positions of the
+ * input, it is a short query, answered from the characters before the
+ * separator.
  */
 
 namespace msbench {
@@ -52,41 +59,121 @@ inline std::size_t kmer_positions_of(const std::size_t n) {
   return n >= KMER_LENGTH ? n - KMER_LENGTH + 1 : 0;
 }
 
-// keys[i] = the 16-mer key at input position i, for every position with 16
-// characters left. Only position 0 pays a full encode; every later key is
-// `(previous key << 2) | new trailing character`.
-inline void roll_keys(const std::vector<Symbol>& input,
-                      std::vector<std::uint32_t>& keys) {
-  const std::size_t count = kmer_positions_of(input.size());
-  keys.resize(count);
+// A position with fewer than 16 ACGT characters before the next separator
+// or the input's end (see variants/pt16_short_suffixes.hpp): it has no
+// 16-mer key, so it is answered from its first `length` characters, as a
+// tail -- or it is a separator itself (length 0), which matches nothing.
+struct ShortQuery {
+  std::uint32_t position;
 
-  if (count == 0) {
-    return;
+  // Its `length` characters packed from the top bit, the rest 0 (as
+  // encode_tail); 0 if length is 0.
+  std::uint32_t key;
+
+  // 0 to 15.
+  std::uint32_t length;
+};
+
+/**
+ * What the probes of one input need, built once per file (the keys stage).
+ * Every input position is exactly one of:
+ *
+ *   a key position   its 16-mer window is all ACGT: keys[i] is its key,
+ *                    and it is probed in the bucket and sorted orders;
+ *   a short query    everything else: the positions within 15 characters
+ *                    of the input's end or of a separator, and the
+ *                    separators themselves.
+ *
+ * Without separators, the key positions are simply 0 .. keys.size() - 1
+ * (all_keys_valid) and only the last 15 positions are short queries -- the
+ * fast path; otherwise key_positions lists them. keys[i] means nothing
+ * where the window holds a separator (alphatab maps it like 'A').
+ */
+struct ProbeInput {
+  std::vector<std::uint32_t> keys;
+  bool all_keys_valid = true;
+  std::vector<std::uint32_t> key_positions;
+  std::vector<ShortQuery> short_queries;
+
+  std::size_t key_count() const {
+    return all_keys_valid ? keys.size() : key_positions.size();
   }
 
-  std::uint32_t key = encode_16mer(input, 0);
-  keys[0] = key;
+  template <typename F>
+  void for_each_key_position(F&& f) const {
+    if (all_keys_valid) {
+      for (std::uint32_t i = 0; i < keys.size(); ++i) {
+        f(i);
+      }
+    } else {
+      for (const std::uint32_t i : key_positions) {
+        f(i);
+      }
+    }
+  }
+};
 
-  for (std::size_t i = 1; i < count; ++i) {
-    key = (key << 2U) |
-          alphatab[static_cast<unsigned char>(input[i + KMER_LENGTH - 1])];
-    keys[i] = key;
+// Builds `prepared` for `input`: every 16-mer key, rolled (only position 0
+// pays a full encode; every later key is `(previous key << 2) | new
+// trailing character`), which positions are key positions, and the short
+// queries.
+inline void prepare_probe_input(const std::vector<Symbol>& input,
+                                ProbeInput& prepared) {
+  const std::size_t n = input.size();
+  const std::size_t count = kmer_positions_of(n);
+
+  std::vector<std::uint32_t>& keys = prepared.keys;
+  keys.resize(count);
+
+  if (count > 0) {
+    std::uint32_t key = encode_16mer(input, 0);
+    keys[0] = key;
+
+    for (std::size_t i = 1; i < count; ++i) {
+      key = (key << 2U) |
+            alphatab[static_cast<unsigned char>(input[i + KMER_LENGTH - 1])];
+      keys[i] = key;
+    }
+  }
+
+  prepared.key_positions.clear();
+  prepared.short_queries.clear();
+
+  const auto add_short_query = [&](const std::size_t i,
+                                   const std::uint32_t length) {
+    std::uint32_t key = 0;
+
+    for (std::uint32_t j = 0; j < length; ++j) {
+      key |= static_cast<std::uint32_t>(
+                 alphatab[static_cast<unsigned char>(input[i + j])])
+             << (30U - 2U * j);
+    }
+
+    prepared.short_queries.push_back(
+        {static_cast<std::uint32_t>(i), key, length});
+  };
+
+  prepared.all_keys_valid =
+      std::all_of(input.begin(), input.end(),
+                  [](const Symbol c) { return is_acgt(c); });
+
+  if (prepared.all_keys_valid) {
+    for (std::size_t i = count; i < n; ++i) {
+      add_short_query(i, static_cast<std::uint32_t>(n - i));
+    }
+  } else {
+    const std::vector<std::uint8_t> run = acgt_runs(input);
+
+    for (std::size_t i = 0; i < n; ++i) {
+      if (run[i] == KMER_LENGTH) {
+        prepared.key_positions.push_back(static_cast<std::uint32_t>(i));
+      } else {
+        add_short_query(i, run[i]);
+      }
+    }
   }
 
   phase_barrier(keys.data());
-}
-
-// The padded key of the first tail position (see encode_tail): the last
-// 16-mer key rolled one step past the end, or the whole input packed if it
-// is shorter than 16. Each later tail position is `key << 2` of the
-// previous one.
-inline std::uint32_t first_tail_key(const std::vector<Symbol>& input,
-                                    const std::vector<std::uint32_t>& keys) {
-  if (!keys.empty()) {
-    return keys.back() << 2U;
-  }
-
-  return input.empty() ? 0 : encode_tail(input, 0);
 }
 
 // Wall time of one counting-sort pass's three steps, in ms.
@@ -145,15 +232,16 @@ inline CountingSortTimes counting_sort_pass(
   return times;
 }
 
-// `positions` = 0, 1, ..., keys.size() - 1, timed in ms.
-inline double fill_identity(const std::vector<std::uint32_t>& keys,
+// `positions` = the key positions in text order (see ProbeInput), timed
+// in ms.
+inline double fill_identity(const ProbeInput& prepared,
                             std::vector<std::uint32_t>& positions) {
   return msbench::time_ms([&] {
-    positions.resize(keys.size());
-
-    for (std::size_t i = 0; i < keys.size(); ++i) {
-      positions[i] = static_cast<std::uint32_t>(i);
-    }
+    positions.clear();
+    positions.reserve(prepared.key_count());
+    prepared.for_each_key_position([&](std::uint32_t i) {
+      positions.push_back(i);
+    });
 
     phase_barrier(positions.data());
   });
@@ -162,14 +250,14 @@ inline double fill_identity(const std::vector<std::uint32_t>& keys,
 // Positions grouped by table bucket (the key's top LOW_BITS), in text order
 // within a bucket: one counting-sort pass. If `phases` is given, it
 // receives the time of each step.
-inline void bucket_order(const std::vector<std::uint32_t>& keys,
+inline void bucket_order(const ProbeInput& prepared,
                          std::vector<std::uint32_t>& order,
                          std::vector<std::uint32_t>& identity,
                          Diagnostics* phases = nullptr) {
-  const double identity_ms = fill_identity(keys, identity);
+  const double identity_ms = fill_identity(prepared, identity);
 
   const CountingSortTimes pass =
-      counting_sort_pass(keys, identity, order,
+      counting_sort_pass(prepared.keys, identity, order,
                          [](std::uint32_t key) { return key >> LOW_BITS; });
 
   if (phases != nullptr) {
@@ -188,11 +276,12 @@ inline void bucket_order(const std::vector<std::uint32_t>& keys,
 // Not used by the benchmark (see sorted_order_radix): its second pass reads
 // `keys` in the first pass's order, a random access per key. Kept as the
 // reference probe_pipeline_test checks the faster builds against.
-inline void sorted_order(const std::vector<std::uint32_t>& keys,
+inline void sorted_order(const ProbeInput& prepared,
                          std::vector<std::uint32_t>& order,
                          std::vector<std::uint32_t>& scratch,
                          Diagnostics* phases = nullptr) {
-  const double identity_ms = fill_identity(keys, order);
+  const std::vector<std::uint32_t>& keys = prepared.keys;
+  const double identity_ms = fill_identity(prepared, order);
 
   const CountingSortTimes low =
       counting_sort_pass(keys, order, scratch,
@@ -232,24 +321,24 @@ inline void sorted_order(const std::vector<std::uint32_t>& keys,
 // The high pass is the only one that walks the whole input, and it reads
 // `keys` sequentially -- unlike sorted_order's second pass, which reads
 // them in the first pass's order.
-inline void sorted_order_msd(const std::vector<std::uint32_t>& keys,
+inline void sorted_order_msd(const ProbeInput& prepared,
                              std::vector<std::uint32_t>& order,
                              std::vector<std::uint64_t>& packed,
                              Diagnostics* phases = nullptr) {
+  const std::vector<std::uint32_t>& keys = prepared.keys;
   using clock = std::chrono::steady_clock;
   const auto ms_between = [](clock::time_point from, clock::time_point to) {
     return std::chrono::duration<double, std::milli>(to - from).count();
   };
 
-  const std::size_t n = keys.size();
+  const std::size_t n = prepared.key_count();
   const auto start = clock::now();
 
   auto next = std::make_unique<std::array<std::uint32_t, NUMBER_OF_BUCKETS>>();
   next->fill(0);
 
-  for (const std::uint32_t key : keys) {
-    ++(*next)[key >> LOW_BITS];
-  }
+  prepared.for_each_key_position(
+      [&](std::uint32_t i) { ++(*next)[keys[i] >> LOW_BITS]; });
 
   phase_barrier(next->data());
   const auto counted = clock::now();
@@ -267,11 +356,11 @@ inline void sorted_order_msd(const std::vector<std::uint32_t>& keys,
 
   packed.resize(n);
 
-  for (std::size_t i = 0; i < n; ++i) {
+  prepared.for_each_key_position([&](std::uint32_t i) {
     const std::uint32_t key = keys[i];
     packed[(*next)[key >> LOW_BITS]++] =
-        (static_cast<std::uint64_t>(key) << 32) | static_cast<std::uint32_t>(i);
-  }
+        (static_cast<std::uint64_t>(key) << 32) | i;
+  });
 
   phase_barrier(packed.data());
   const auto scattered = clock::now();
@@ -323,11 +412,12 @@ inline void sorted_order_msd(const std::vector<std::uint32_t>& keys,
 // old two-pass sort's cost) -- and scatters to at most 2048 places, which
 // stay in cache and TLB (16-bit digits scatter to 65536). Each pass is
 // stable, so ties keep text order.
-inline void sorted_order_radix(const std::vector<std::uint32_t>& keys,
+inline void sorted_order_radix(const ProbeInput& prepared,
                                std::vector<std::uint32_t>& order,
                                std::vector<std::uint64_t>& packed,
                                std::vector<std::uint64_t>& other,
                                Diagnostics* phases = nullptr) {
+  const std::vector<std::uint32_t>& keys = prepared.keys;
   using clock = std::chrono::steady_clock;
   const auto ms_between = [](clock::time_point from, clock::time_point to) {
     return std::chrono::duration<double, std::milli>(to - from).count();
@@ -339,16 +429,17 @@ inline void sorted_order_radix(const std::vector<std::uint32_t>& keys,
                                                  (1U << 10) - 1};
   constexpr std::uint32_t radix = 1U << 11;
 
-  const std::size_t n = keys.size();
+  const std::size_t n = prepared.key_count();
   const auto start = clock::now();
 
   std::array<std::array<std::uint32_t, radix>, 3> next{};
 
-  for (const std::uint32_t key : keys) {
+  prepared.for_each_key_position([&](std::uint32_t i) {
+    const std::uint32_t key = keys[i];
     ++next[0][key & mask[0]];
     ++next[1][(key >> shift[1]) & mask[1]];
     ++next[2][key >> shift[2]];
-  }
+  });
 
   for (auto& counts : next) {
     std::uint32_t offset = 0;
@@ -366,11 +457,10 @@ inline void sorted_order_radix(const std::vector<std::uint32_t>& keys,
   packed.resize(n);
   other.resize(n);
 
-  for (std::size_t i = 0; i < n; ++i) {
+  prepared.for_each_key_position([&](std::uint32_t i) {
     const std::uint32_t key = keys[i];
-    other[next[0][key & mask[0]]++] =
-        (static_cast<std::uint64_t>(key) << 32) | static_cast<std::uint32_t>(i);
-  }
+    other[next[0][key & mask[0]]++] = (static_cast<std::uint64_t>(key) << 32) | i;
+  });
 
   phase_barrier(other.data());
   const auto passed_1 = clock::now();
@@ -437,13 +527,12 @@ class Prober {
   // once per table format (see ProberSet::table_builds).
   virtual double build_ms() const = 0;
 
-  // results[i] for every i in `order` (the 16-mer positions, from keys[i]),
-  // then every tail position kmer_positions .. n-1 (found = false),
-  // starting from `tail_key` (first_tail_key). `results` must already
-  // have n entries.
-  virtual void probe(const std::vector<std::uint32_t>& keys,
+  // results[i] for every key position i in `order` (from prepared.keys[i]),
+  // then for every short query (found = false: a tail lookup of its first
+  // `length` characters, or length 0 at a separator). `results` must
+  // already have one entry per input position.
+  virtual void probe(const ProbeInput& prepared,
                      const std::vector<std::uint32_t>& order,
-                     std::uint32_t tail_key,
                      std::vector<KmerLookupResult>& results) = 0;
 
   // Counters from the last probe() call (e.g. bucket search, misses).
@@ -495,8 +584,8 @@ class TableProber final : public Prober {
 
   double build_ms() const override { return build_ms_; }
 
-  void probe(const std::vector<std::uint32_t>& keys,
-             const std::vector<std::uint32_t>& order, std::uint32_t tail_key,
+  void probe(const ProbeInput& prepared,
+             const std::vector<std::uint32_t>& order,
              std::vector<KmerLookupResult>& results) override {
     const Table& table = *table_;
     const auto before = table.stats();
@@ -504,15 +593,18 @@ class TableProber final : public Prober {
     typename Policy::State state{};
 
     for (const std::uint32_t i : order) {
-      results[i] = Policy::lookup(table, state, keys[i]);
+      results[i] = Policy::lookup(table, state, prepared.keys[i]);
     }
 
-    const std::size_t n = results.size();
+    for (const ShortQuery& query : prepared.short_queries) {
+      KmerLookupResult& result = results[query.position];
 
-    for (std::size_t i = keys.size(); i < n; ++i, tail_key <<= 2U) {
-      results[i] =
-          Policy::tail(table, tail_key, static_cast<std::uint32_t>(n - i));
-      results[i].found = false;
+      if (query.length == 0) {
+        result = KmerLookupResult{};
+      } else {
+        result = Policy::tail(table, query.key, query.length);
+        result.found = false;
+      }
     }
 
     phase_barrier(results.data());
@@ -610,11 +702,21 @@ struct SassyPolicy {
 // and how many L entries the continuations stepped over.
 template <typename Stats>
 Diagnostics finger_diagnostics(const Stats& before, const Stats& after) {
-  return counter_diagnostics(
+  Diagnostics diagnostics = counter_diagnostics(
       "finger",
       {{"restarts", after.finger_restarts - before.finger_restarts},
        {"continues", after.finger_continues - before.finger_continues},
        {"steps", after.finger_steps - before.finger_steps}});
+
+  // Tables whose restarts walk from the bucket's start (sassy) also count
+  // the entries those walks stepped over.
+  if constexpr (requires { after.finger_restart_steps; }) {
+    diagnostics.lines.front().values.emplace_back(
+        "restart-steps", static_cast<double>(after.finger_restart_steps -
+                                             before.finger_restart_steps));
+  }
+
+  return diagnostics;
 }
 
 // The fast-miss table searched with a finger
@@ -681,6 +783,11 @@ struct ProberSet {
   // Writing each table file, once per table format.
   std::vector<TableBuild> table_builds;
 
+  // Singletons vs ranges and range sizes, recorded while building the
+  // sassy table. Every variant indexes the same 16-mers, so there is one
+  // copy.
+  RangeSizeStats range_stats;
+
   // The variants, in report order. The first one's results are the ones
   // chained, and every other one's are checked against them.
   std::vector<std::unique_ptr<Prober>> probers;
@@ -694,43 +801,43 @@ struct ProberSet {
  *
  * Table files are always rebuilt (never reused from an earlier run), so a
  * stale table from another reference or format version is never read. The
- * v2 file is shared by every v2-format variant.
+ * v2 file (when v2-format variants are enabled) is shared by all of them.
  */
 inline ProberSet build_probers(const std::vector<Symbol>& reference,
                                const std::vector<SAType>& suffix_array,
                                const std::string& table_path) {
   ProberSet set;
 
-  const std::string v2_path = table_path;
   const std::string sassy_path = table_path + ".sassy";
-
-  set.table_builds.push_back({"v2 table", msbench::time_ms([&] {
-                                std::filesystem::remove(v2_path);
-                                build_pt16_table(reference, suffix_array,
-                                                 v2_path);
-                              })});
 
   set.table_builds.push_back({"sassy table", msbench::time_ms([&] {
                                 std::filesystem::remove(sassy_path);
-                                build_pt16_sassy_table(reference, suffix_array,
-                                                       sassy_path);
+                                set.range_stats = build_pt16_sassy_table(
+                                    reference, suffix_array, sassy_path);
                               })});
 
-  // pt16-v2 (V2Policy) left out for now, to keep runs short: fast-miss
-  // answers the same lookups on the same v2 file, faster. The v2 file is
-  // still written, since fast-miss loads it. To bring it back, restore:
+  // The v2-format variants are left out for now, to keep runs short, and
+  // so is the v2 table they load. To bring them back, restore:
+  //
+  // const std::string v2_path = table_path;
+  //
+  // set.table_builds.push_back({"v2 table", msbench::time_ms([&] {
+  //                               std::filesystem::remove(v2_path);
+  //                               build_pt16_table(reference, suffix_array,
+  //                                                v2_path);
+  //                             })});
   //
   // set.probers.push_back(std::make_unique<TableProber<V2Policy>>(
   //     "pt16-v2", reference, suffix_array, v2_path));
-
-  auto fastmiss = std::make_unique<TableProber<FastMissPolicy>>(
-      "pt16-v2-fastmiss", reference, suffix_array, v2_path);
-  auto fastmiss_table = fastmiss->table();
-  set.probers.push_back(std::move(fastmiss));
-
-  // Same loaded table, searched with a finger (sorted order only).
-  set.probers.push_back(std::make_unique<TableProber<FastMissFingerPolicy>>(
-      "pt16-v2-fastmiss-finger", std::move(fastmiss_table)));
+  //
+  // auto fastmiss = std::make_unique<TableProber<FastMissPolicy>>(
+  //     "pt16-v2-fastmiss", reference, suffix_array, v2_path);
+  // auto fastmiss_table = fastmiss->table();
+  // set.probers.push_back(std::move(fastmiss));
+  //
+  // // Same loaded table, searched with a finger (sorted order only).
+  // set.probers.push_back(std::make_unique<TableProber<FastMissFingerPolicy>>(
+  //     "pt16-v2-fastmiss-finger", std::move(fastmiss_table)));
 
   auto sassy = std::make_unique<TableProber<SassyPolicy>>("pt16-sassy",
                                                            sassy_path);
@@ -843,12 +950,11 @@ inline LookupComparison compare_lookups(
 // How the 16-mer lookups classified (singleton hit / range hit / miss).
 // The same for every correct variant, so taken from the chained one.
 inline SearchComposition classify_lookups(
-    const std::vector<KmerLookupResult>& results,
-    const std::size_t kmer_positions) {
+    const std::vector<KmerLookupResult>& results, const ProbeInput& prepared) {
   SearchComposition composition;
   composition.available = true;
 
-  for (std::size_t i = 0; i < kmer_positions; ++i) {
+  prepared.for_each_key_position([&](std::uint32_t i) {
     const KmerLookupResult& result = results[i];
 
     if (!result.found) {
@@ -858,7 +964,7 @@ inline SearchComposition classify_lookups(
     } else {
       ++composition.range_hits;
     }
-  }
+  });
 
   return composition;
 }

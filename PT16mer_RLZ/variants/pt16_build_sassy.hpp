@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "pt16_sassy_format.hpp"  // PackedShortSuffix, sassy_encode_*
+#include "pt16_short_suffixes.hpp"  // collect_short_suffixes
 #include "../pt16_utils.hpp"         // PT16 constants and shared helpers
 
 // ---------- PT16 H/L representation ----------
@@ -28,6 +29,9 @@ struct SassyScanResult {
 
   // Number of PT16 entries belonging to each bucket.
   std::array<std::uint32_t, NUMBER_OF_BUCKETS> count{};
+
+  // Singletons vs ranges, and the range sizes (same as the v2 builder's).
+  RangeSizeStats range_stats;
 };
 
 /*
@@ -53,6 +57,8 @@ static void store_entry(const std::vector<std::uint32_t>& suffix_array,
   if (result.count[bucket] == 0) {
     result.H_sa[bucket] = static_cast<std::uint32_t>(result.sampled_sa.size());
   }
+
+  result.range_stats.add(key, sa_end - sa_start);
 
   if (sa_end - sa_start == 1) {
     result.L.push_back(sassy_encode_singleton(low, suffix_array[sa_start]));
@@ -96,9 +102,9 @@ static SassyScanResult build_sassy_entries(
   // One SA starting position for each H bucket.
   result.H_sa.resize(NUMBER_OF_BUCKETS, 0);
 
-  const std::size_t reserve_size = reference.size() - KMER_LENGTH + 1;
-
-  result.L.reserve(reserve_size);
+  if (reference.size() >= KMER_LENGTH) {
+    result.L.reserve(reference.size() - KMER_LENGTH + 1);
+  }
 
   bool interval_open = false;
 
@@ -114,8 +120,10 @@ static SassyScanResult build_sassy_entries(
   for (std::uint32_t sa_index = 0; sa_index < suffix_array.size(); ++sa_index) {
     const std::uint32_t position = suffix_array[sa_index];
 
-    // Suffixes shorter than 16 symbols cannot form a PT16 entry.
-    if (static_cast<std::size_t>(position) + KMER_LENGTH > reference.size()) {
+    // Only a full 16-mer of ACGT forms a PT16 entry: skip suffixes shorter
+    // than 16 and windows containing a separator. They cannot lie inside
+    // an interval (they do not start with its 16-mer), only between two.
+    if (!window_is_acgt(reference, position)) {
       continue;
     }
 
@@ -184,7 +192,7 @@ static void write_hl_table(
   // layouts ("PT16SA01" without short suffixes; "PT16SA02" with a 16-bit
   // range offset that can silently overflow on a real genome), so a reader
   // of one format rejects a table of another instead of misreading it.
-  const char magic[8] = {'P', 'T', '1', '6', 'S', 'A', '0', '3'};
+  const char magic[8] = {'P', 'T', '1', '6', 'S', 'A', '0', '4'};
 
   const std::uint64_t entry_count = scan.L.size();
   const std::uint64_t sampled_count = scan.sampled_sa.size();
@@ -221,13 +229,18 @@ static void write_hl_table(
 // (and SassyScanResult from their ScanResult), so a driver that benchmarks
 // more than one PT16 format can include this header alongside theirs in the
 // same translation unit.
-void build_pt16_sassy_table(const std::vector<unsigned char>& reference,
-                            const std::vector<std::uint32_t>& suffix_array,
-                            const std::string& output_path) {
+// Returns the table's construction statistics (singletons vs ranges, and
+// the distribution of range sizes); callers may ignore them.
+inline RangeSizeStats build_pt16_sassy_table(
+    const std::vector<unsigned char>& reference,
+    const std::vector<std::uint32_t>& suffix_array,
+    const std::string& output_path) {
   const SassyScanResult scan = build_sassy_entries(reference, suffix_array);
   const std::vector<std::uint32_t> H = build_H(scan.count);
   const std::vector<PackedShortSuffix> short_suffixes =
-      build_packed_short_suffixes(reference);
+      collect_short_suffixes(reference);
 
   write_hl_table(output_path, scan, H, short_suffixes);
+
+  return scan.range_stats;
 }

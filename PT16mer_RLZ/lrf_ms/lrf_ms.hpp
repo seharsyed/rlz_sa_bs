@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -68,10 +69,7 @@ class LRFMS {
 
   LRFMS(const reference_type& reference, const suffix_array_type& suffix_array)
       : reference_(reference),
-        suffix_array_(suffix_array),
-        isa_(reference.size()),
-        lcp_(reference.size()),
-        lrf_(reference.size()) {
+        suffix_array_(suffix_array) {
     if (reference_.empty()) {
       throw std::invalid_argument("LRFMS: reference is empty");
     }
@@ -86,12 +84,33 @@ class LRFMS {
       throw std::invalid_argument("LRFMS: reference is too large for Index");
     }
 
-    constructISA();
-    constructLCP();
-    constructLRF();
+    // Each auxiliary structure is timed on its own (see buildPhases),
+    // including allocating it.
+    const auto timed = [this](const char* name, auto&& step) {
+      const auto start = std::chrono::steady_clock::now();
+      step();
+      build_phases_.emplace_back(
+          name, std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start)
+                    .count());
+    };
 
-    rmq_ = std::make_unique<rmq_tree<Index>>(lcp_.data(),
-                                             static_cast<int>(lcp_.size()), 7);
+    timed("isa", [&] {
+      isa_.assign(reference_.size(), 0);
+      constructISA();
+    });
+    timed("lcp", [&] {
+      lcp_.assign(reference_.size(), 0);
+      constructLCP();
+    });
+    timed("lrf", [&] {
+      lrf_.assign(reference_.size(), 0);
+      constructLRF();
+    });
+    timed("rmq", [&] {
+      rmq_ = std::make_unique<rmq_tree<Index>>(
+          lcp_.data(), static_cast<int>(lcp_.size()), 7);
+    });
   }
 
   // The reference and the suffix array are held by reference; temporaries
@@ -198,6 +217,13 @@ class LRFMS {
     return matching_statistics;
   }
 
+  // Construction time of each auxiliary structure, in ms, in build order:
+  // isa, lcp (Kasai), lrf, rmq (over lcp).
+  const std::vector<std::pair<const char*, double>>& buildPhases()
+      const noexcept {
+    return build_phases_;
+  }
+
   const std::vector<Index>& isa() const noexcept { return isa_; }
 
   const std::vector<Index>& lcp() const noexcept { return lcp_; }
@@ -211,6 +237,7 @@ class LRFMS {
   std::vector<Index> isa_;
   std::vector<Index> lcp_;
   std::vector<Index> lrf_;
+  std::vector<std::pair<const char*, double>> build_phases_;
 
   std::unique_ptr<rmq_tree<Index>> rmq_;
 

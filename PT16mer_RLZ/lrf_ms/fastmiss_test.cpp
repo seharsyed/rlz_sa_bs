@@ -117,10 +117,27 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
     const KmerLookupResult actual = fast.lookupKmerByKey(
         encode_16mer(input, static_cast<std::uint32_t>(i)));
 
+    // A miss's position only has to be a real match: any occurrence of the
+    // longest matching prefix is correct, and the two parsers draw from
+    // different short-suffix sets (fast-miss keeps every position near a
+    // separator or the end, v2 only the reference's last 15), so they may
+    // break ties differently.
+    bool position_ok = expected.match_position == actual.match_position;
+
+    if (!actual.found) {
+      const std::size_t p = actual.match_position;
+      const std::size_t len = actual.match_length;
+      position_ok = p + len <= reference.size() &&
+                    std::equal(input.begin() + static_cast<std::ptrdiff_t>(i),
+                               input.begin() +
+                                   static_cast<std::ptrdiff_t>(i + len),
+                               reference.begin() +
+                                   static_cast<std::ptrdiff_t>(p));
+    }
+
     const bool same =
         expected.found == actual.found && expected.count == actual.count &&
-        expected.match_length == actual.match_length &&
-        expected.match_position == actual.match_position &&
+        expected.match_length == actual.match_length && position_ok &&
         std::equal(expected.positions.begin(), expected.positions.end(),
                    actual.positions.begin(), actual.positions.end());
 

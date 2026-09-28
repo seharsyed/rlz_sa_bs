@@ -805,6 +805,10 @@ struct ImplementationTotals {
   bool is_baseline = false;
   double build_ms = 0.0;
 
+  // build_ms split into its steps, when the implementation times them
+  // (MSImplementation::buildDiagnostics).
+  Diagnostics build_diagnostics;
+
   double total_min_ms = 0.0;
   double total_first_ms = 0.0;
   std::size_t total_entries = 0;

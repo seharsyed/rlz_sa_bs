@@ -119,6 +119,56 @@ inline std::array<std::uint8_t, 256> build_alphatab() {
 
 inline const std::array<std::uint8_t, 256> alphatab = build_alphatab();
 
+// Only A, C, G and T are sequence characters. Any other byte (N, IUPAC
+// codes, lowercase, ...) is a separator: it never matches anything, so a
+// 16-mer window containing one has no table entry and no key (see
+// variants/pt16_short_suffixes.hpp). alphatab maps a separator to 0 like
+// 'A', so it must never reach an encoded key.
+inline std::array<bool, 256> build_acgt_table() {
+  std::array<bool, 256> table{};
+  for (const char c : {'A', 'C', 'G', 'T'}) {
+    table[static_cast<unsigned char>(c)] = true;
+  }
+  return table;
+}
+
+inline const std::array<bool, 256> acgt_table = build_acgt_table();
+
+inline bool is_acgt(const unsigned char c) { return acgt_table[c]; }
+
+// The run of ACGT characters starting at every position of `text`, capped
+// at KMER_LENGTH: run[i] = KMER_LENGTH means the 16-mer window at i is all
+// ACGT, 0 means text[i] is a separator.
+inline std::vector<std::uint8_t> acgt_runs(
+    const std::vector<unsigned char>& text) {
+  std::vector<std::uint8_t> run(text.size());
+  std::uint32_t length = 0;
+
+  for (std::size_t i = text.size(); i-- > 0;) {
+    length = is_acgt(text[i]) ? std::min<std::uint32_t>(length + 1, KMER_LENGTH)
+                              : 0;
+    run[i] = static_cast<std::uint8_t>(length);
+  }
+
+  return run;
+}
+
+// Whether the 16-mer window at `position` exists and is all ACGT.
+inline bool window_is_acgt(const std::vector<unsigned char>& text,
+                           const std::size_t position) {
+  if (position + KMER_LENGTH > text.size()) {
+    return false;
+  }
+
+  for (std::size_t j = 0; j < KMER_LENGTH; ++j) {
+    if (!is_acgt(text[position + j])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 // Packs one 16-mer from the reference into a 32-bit key.
 
 inline std::uint32_t encode_16mer(const std::vector<unsigned char>& reference,
@@ -216,7 +266,11 @@ inline std::vector<std::uint32_t> build_H(
 
     std::uint32_t x;
 
-    if (next == non_empty_buckets.begin()) {
+    if (non_empty_buckets.empty()) {
+      // No 16-mer at all (e.g. a reference with no full ACGT window):
+      // NUMBER_OF_BUCKETS means "no non-empty bucket to fall back on".
+      x = NUMBER_OF_BUCKETS;
+    } else if (next == non_empty_buckets.begin()) {
       x = *next;
     } else if (next == non_empty_buckets.end()) {
       x = non_empty_buckets.back();
@@ -713,6 +767,142 @@ inline bool factor_file_equals(const std::string& path, const Triples& factors,
 
   return true;
 }
+// ---------- PT16 construction statistics ----------
+
+// The shape of a built table: how many entries are singletons (a 16-mer
+// that occurs once) and how many are ranges, and how large the ranges are.
+// Recorded by build_pt16_table while it scans the suffix array.
+struct RangeSizeStats {
+  // Range sizes by power of two: size_bins[b] counts ranges with
+  // 2^b < size <= 2^(b+1) (so bin 0 is size 2, bin 1 sizes 3-4, ...).
+  static constexpr std::size_t bin_count = 33;
+
+  // Ranges at least this large count as "very large" (thresholds below).
+  static constexpr std::array<std::size_t, 4> large_thresholds{
+      1'000, 10'000, 100'000, 1'000'000};
+
+  // How many of the largest ranges to keep, with their 16-mers.
+  static constexpr std::size_t top_count = 10;
+
+  std::size_t entries = 0;
+  std::size_t singletons = 0;
+  std::size_t ranges = 0;
+
+  // Suffixes (reference positions) covered by all entries, and by ranges.
+  std::size_t positions = 0;
+  std::size_t range_positions = 0;
+
+  std::array<std::size_t, bin_count> size_bins{};
+  std::array<std::size_t, large_thresholds.size()> large{};
+  std::array<std::size_t, large_thresholds.size()> large_positions{};
+
+  // The largest ranges as (size, key), largest first.
+  std::vector<std::pair<std::size_t, std::uint32_t>> top;
+
+  void add(const std::uint32_t key, const std::size_t size) {
+    ++entries;
+    positions += size;
+
+    if (size == 1) {
+      ++singletons;
+      return;
+    }
+
+    ++ranges;
+    range_positions += size;
+    ++size_bins[std::bit_width(size - 1) - 1];
+
+    for (std::size_t t = 0; t < large_thresholds.size(); ++t) {
+      if (size >= large_thresholds[t]) {
+        ++large[t];
+        large_positions[t] += size;
+      }
+    }
+
+    if (top.size() < top_count || size > top.back().first) {
+      const auto it = std::upper_bound(
+          top.begin(), top.end(), size,
+          [](const std::size_t value,
+             const std::pair<std::size_t, std::uint32_t>& entry) {
+            return value > entry.first;
+          });
+      top.insert(it, {size, key});
+
+      if (top.size() > top_count) {
+        top.pop_back();
+      }
+    }
+  }
+
+  std::string format() const {
+    const auto percent = [](const std::size_t part, const std::size_t whole) {
+      std::ostringstream text;
+      text << std::fixed << std::setprecision(2)
+           << (whole == 0 ? 0.0
+                          : 100.0 * static_cast<double>(part) /
+                                static_cast<double>(whole))
+           << '%';
+      return text.str();
+    };
+
+    const auto decode = [](const std::uint32_t key) {
+      std::string text(KMER_LENGTH, 'A');
+      for (std::uint32_t j = 0; j < KMER_LENGTH; ++j) {
+        text[j] = "ACGT"[(key >> (30U - 2U * j)) & 3U];
+      }
+      return text;
+    };
+
+    std::ostringstream out;
+    out << "PT16 entries: " << entries << " (covering " << positions
+        << " positions)\n";
+    out << "  singletons: " << singletons << " ("
+        << percent(singletons, entries) << " of entries)\n";
+    out << "  ranges:     " << ranges << " (" << percent(ranges, entries)
+        << " of entries, " << range_positions << " positions = "
+        << percent(range_positions, positions) << ")\n";
+
+    if (ranges != 0) {
+      out << "  range sizes:\n";
+
+      for (std::size_t b = 0; b < bin_count; ++b) {
+        if (size_bins[b] == 0) {
+          continue;
+        }
+
+        const std::size_t low = (std::size_t{1} << b) + 1;
+        const std::size_t high = std::size_t{1} << (b + 1);
+        std::ostringstream label;
+        label << low;
+        if (high != low) {
+          label << '-' << high;
+        }
+
+        out << "    " << std::setw(19) << label.str() << ": "
+            << std::setw(10) << size_bins[b] << "  ("
+            << percent(size_bins[b], ranges) << ")\n";
+      }
+
+      out << "  very large ranges:\n";
+
+      for (std::size_t t = 0; t < large_thresholds.size(); ++t) {
+        out << "    >= " << std::setw(9) << large_thresholds[t] << ": "
+            << std::setw(8) << large[t] << " ranges, " << large_positions[t]
+            << " positions (" << percent(large_positions[t], positions)
+            << ")\n";
+      }
+
+      out << "  largest ranges:\n";
+
+      for (const auto& [size, key] : top) {
+        out << "    " << decode(key) << "  " << size << '\n';
+      }
+    }
+
+    return out.str();
+  }
+};
+
 // ---------- PT16 per-file statistics ----------
 
 struct PT16Delta {

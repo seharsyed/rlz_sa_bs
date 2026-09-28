@@ -109,15 +109,21 @@ computed from.
 
 | Variant | Table |
 | --- | --- |
-| `pt16-v2` | plain v2 (`../pt16_rlz_v2.hpp`), file built by `../pt16_build_v2.hpp`. **Currently left out of `build_probers`** to keep runs short (commented out there). |
-| `pt16-v2-fastmiss` | fast-miss (`../variants/pt16_rlz_v2_fastmiss.hpp`): same v2 file, reference position per entry, precomputed empty buckets, flagged short-suffix buckets |
-| `pt16-v2-fastmiss-finger` | the same loaded fast-miss table, searched with a finger (`PT16FastMissParser::lookupKmerByKey(key, finger)`); **sorted order only**, same scheme as `pt16-sassy-finger` below. |
+| `pt16-v2` | plain v2 (`../pt16_rlz_v2.hpp`), file built by `../pt16_build_v2.hpp`. Only on an all-ACGT reference (plain v2 does not handle separators). |
+| `pt16-v2-finger` | the same loaded v2 table, searched with a finger (`PT16RLZParser::lookupKmerByKey(key, finger)`, `V2FingerPolicy`); **sorted order only**, same scheme as `pt16-sassy-finger` (a new bucket walks from the bucket's start). |
+| `pt16-v2-fastmiss` | fast-miss (`../variants/pt16_rlz_v2_fastmiss.hpp`): same v2 file, reference position per entry, precomputed empty buckets, flagged short-suffix buckets. **Currently left out of `build_probers`** (commented out there, with the v2 table build); still covered by `probe_pipeline_test`. |
+| `pt16-v2-fastmiss-finger` | the same loaded fast-miss table, searched with a finger (`PT16FastMissParser::lookupKmerByKey(key, finger)`); **sorted order only**, same scheme as `pt16-sassy-finger` below. Left out with `pt16-v2-fastmiss`. |
 | `pt16-sassy` | sassy (`../variants/pt16_sassy.hpp`), `<table>.sassy`: self-contained, no reference or SA reads |
 | `pt16-sassy-finger` | the same loaded sassy table, searched with a finger (`PT16SassyLookup::lookup(key, finger)`); **sorted order only**. Keys never decrease there, so each lookup walks on in `L` from the previous insertion point; only a new bucket restarts the search. Reports `finger: restarts / continues / steps`. |
 
-Each table file is written once per run (the v2 file is shared by `pt16-v2`
-and `pt16-v2-fastmiss`) and every variant only loads it; `[6] BUILD`
-reports the writes and loads separately.
+Each table file is written once per run and every variant only loads it;
+`[6] BUILD` reports the writes and loads separately. The v2 table is
+written only when the v2 variants run (an all-ACGT reference). `[6] BUILD` also
+prints the table's construction statistics (singletons vs ranges, range
+sizes by power of two, very large ranges, the ten largest with their
+16-mers, and the number of L entries per bucket: empty buckets,
+mean/median/max, how many are binary searched, and the distribution),
+recorded by the sassy builder; they are the same for every variant.
 
 **Correctness.** The chain's output (`pt16-chain`) gets the full checks —
 invariants, positions, lengths against the baseline (`lengths N/N equal`).
@@ -132,11 +138,45 @@ that agreeing results really do chain to the same (brute-force) lengths.
 What was found with the older per-variant scans (not exhaustively, and not
 yet on genome-scale real data at the time of writing):
 
+## Separators (non-ACGT characters)
+
+Only `A`, `C`, `G` and `T` match. Any other byte — `N`, IUPAC codes,
+lowercase, anything — is a *separator*: it never matches anything, in the
+reference or the input. So inputs and references do not need cleaning to
+ACGT (replacing `N` by `A` would create artificial poly-A runs).
+
+- **Baseline:** after loading, `ms_main` replaces every non-ACGT input byte
+  with one byte that does not occur in the reference (printed under `[5]`),
+  so `lrf-ms` and every check see the same semantics; each file's header
+  line shows how many there were.
+- **Tables** (`../pt16_build_v2.hpp`, `../variants/pt16_build_sassy.hpp`): a
+  16-mer window containing a separator gets no entry. Every reference
+  position within 15 characters of a separator (or of the reference's end)
+  is kept as a short suffix (`../variants/pt16_short_suffixes.hpp`), so a
+  lookup that misses still finds the longest match exactly. The sassy file
+  format is `PT16SA04`.
+- **Queries** (`ProbeInput` in `probe_pipeline.hpp`): a position whose
+  window contains a separator has no key; like the input's last 15
+  positions it is a *short query*, answered from the characters before the
+  separator (length 0 at the separator itself). The keys stage reports how
+  many keys and short queries each file has.
+
+The plain v2 parser (`../pt16_rlz_v2.hpp`), the interleaved v2 and the
+older `pt16_rlz.hpp` do not implement separators; they are not in the
+benchmark.
+
 ## Reading the diagnostics
 
-Nothing is printed per file except failures (the per-file rows, one per
-full implementation, stage, probe and chain, go to the results CSV with a
-`kind` column). `[9] COLLECTION TOTALS` has the full implementations, the
+Each file prints live progress under `[8] MATCHING STATISTICS`: one line
+per step (full implementation, stage, probe, chain), with its diagnostics
+below it, then how long the file took and the total elapsed time. A step
+prints its name before it runs, its time when the timed run finishes, and
+its status (`lookups EQUAL`, `lengths EQUAL`, ...) once the checks after
+it finish — so on a large input a stuck step shows as a line that stops
+at its name, or after its time if the checks are what hangs. Failures are
+printed in detail under the step. The same per-file rows, one per full
+implementation, stage, probe and chain, also go to the results CSV with a
+`kind` column. `[9] COLLECTION TOTALS` has the full implementations, the
 shared stages with their share of the shared time, and one row per variant
 and order: load time, probe time, pipeline time, MB/s, speedup, lookup
 check. `[10] DIAGNOSTICS` has each variant's counters from its probes,

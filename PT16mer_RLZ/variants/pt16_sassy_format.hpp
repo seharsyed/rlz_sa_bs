@@ -18,8 +18,8 @@
 
 // ---------- Short suffixes ----------
 
-// A suffix of the reference shorter than KMER_LENGTH has no 16-mer, so it gets
-// no table entry. The sassy table keeps each of them (down to
+// A reference position with fewer than KMER_LENGTH ACGT characters before the
+// reference's end or a separator has no 16-mer, so it gets no table entry. The sassy table keeps each of them (down to
 // SHORT_SUFFIX_MIN_LENGTH characters) as a record, to be matched when a
 // lookup misses the table. Keeping every length makes the longest match found
 // by a lookup exact: a short suffix can be the best match for a 16-mer whose
@@ -43,40 +43,9 @@ struct PackedShortSuffix {
 static_assert(sizeof(PackedShortSuffix) == 3 * sizeof(std::uint32_t),
               "PackedShortSuffix is written to the table as raw bytes");
 
-// One record for each length from SHORT_SUFFIX_MIN_LENGTH up to
-// KMER_LENGTH - 1 that the reference is long enough to have, shortest first.
-inline std::vector<PackedShortSuffix> build_packed_short_suffixes(
-    const std::vector<unsigned char>& reference) {
-  if (reference.size() > std::numeric_limits<std::uint32_t>::max()) {
-    throw std::runtime_error("reference too long for 32-bit positions");
-  }
-
-  std::vector<PackedShortSuffix> suffixes;
-
-  for (std::uint32_t length = SHORT_SUFFIX_MIN_LENGTH; length < KMER_LENGTH;
-       ++length) {
-    // A reference shorter than `length` has no suffix of that length, and
-    // neither does it have a longer one.
-    if (length > reference.size()) {
-      break;
-    }
-
-    const std::uint32_t ref_pos =
-        static_cast<std::uint32_t>(reference.size() - length);
-
-    std::uint32_t packed = 0;
-
-    for (std::uint32_t j = 0; j < length; ++j) {
-      const std::uint32_t code =
-          alphatab[static_cast<unsigned char>(reference[ref_pos + j])];
-      packed |= code << (30U - 2U * j);
-    }
-
-    suffixes.push_back({packed, ref_pos, length});
-  }
-
-  return suffixes;
-}
+// The records themselves -- every reference position within 15 characters
+// of the reference's end or of a separator -- are collected by
+// collect_short_suffixes (pt16_short_suffixes.hpp).
 
 // ---------- Sassy L entry ----------
 //

@@ -55,6 +55,10 @@ class MSImplementation {
   // Wall time of this implementation's construction, in milliseconds.
   virtual double build_ms() const = 0;
 
+  // The construction split into its steps (a "build" phases line), if the
+  // implementation times them; empty otherwise.
+  virtual Diagnostics buildDiagnostics() const { return {}; }
+
   virtual MatchingStatistics compute(const std::vector<Symbol>& input) = 0;
 
   // Diagnostics from the last compute() call (phase times, lookup
@@ -112,6 +116,19 @@ class MSAdapter : public MSImplementation {
   const std::string& name() const override { return name_; }
 
   double build_ms() const override { return build_ms_; }
+
+  // From Index::buildPhases() when the wrapped type has one (LRFMS does).
+  Diagnostics buildDiagnostics() const override {
+    if constexpr (requires(const Index& index) { index.buildPhases(); }) {
+      Diagnostics::Line line{"build", true, {}};
+      for (const auto& [name, ms] : index_->buildPhases()) {
+        line.values.emplace_back(name, ms);
+      }
+      return {{std::move(line)}};
+    } else {
+      return {};
+    }
+  }
 
   MatchingStatistics compute(const std::vector<Symbol>& input) override {
     return index_->computeMatchingStatistics(input);

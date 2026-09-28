@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "pt16_sassy_format.hpp"  // PackedShortSuffix, sassy_decode_*
+#include "pt16_short_suffixes.hpp"  // ShortSuffixIndex
 #include "../pt16_utils.hpp"         // KMER_LENGTH, buckets
 #include "../rlz_common.hpp"         // binarySearchLB, binarySearchRB
 
@@ -38,7 +39,7 @@
  *
  * File layout (all integers little-endian, as written by the builder):
  *
- *   magic          8 bytes    "PT16SA03"
+ *   magic          8 bytes    "PT16SA04"
  *   entry_count    uint64     number of L entries
  *   sampled_count  uint64     number of sampled_sa entries
  *   short_count    uint64     number of short suffix records
@@ -98,18 +99,20 @@ class PT16SassyLookup {
     // Misses in an empty bucket (answered from the precomputed
     // empty-bucket arrays), and misses that had to run the full
     // short-suffix check because their bucket holds a short suffix longer
-    // than 8 characters (see long_short_buckets_).
+    // than 8 characters (see ShortSuffixIndex::has_long).
     std::size_t empty_bucket_misses = 0;
     std::size_t short_suffix_checks = 0;
 
     // Finger lookups (lookup(key, finger)): how many started a fresh
     // bucket search (a new bucket, or a key below the previous one), how
     // many continued from the previous insertion point in the same
-    // bucket, and how many L entries those continuations stepped over in
-    // total.
+    // bucket, how many L entries those continuations stepped over in
+    // total, and how many the restarts stepped over (walking from their
+    // bucket's start).
     std::size_t finger_restarts = 0;
     std::size_t finger_continues = 0;
     std::size_t finger_steps = 0;
+    std::size_t finger_restart_steps = 0;
   };
 
   /**
@@ -209,12 +212,15 @@ class PT16SassyLookup {
    * the previous insertion point -- the key is not smaller, so its
    * insertion point is not earlier -- and ends at this key's insertion
    * point, which becomes the next start. Only a key in a new bucket
-   * restarts: its bucket's range is looked up in H and searched as by
-   * lookup(key) (linearly or by binary search, by size). An empty bucket
-   * is answered as by lookup(key).
+   * restarts: its bucket's range is looked up in H and walked forward
+   * from the bucket's start, not binary searched -- in sorted order the
+   * first key seen in a bucket is the smallest there, so its insertion
+   * point is most likely near the start. An empty bucket is answered as
+   * by lookup(key).
    *
    * A key below the previous one also restarts, so the result is correct
-   * in any order; it is only fast in sorted order.
+   * in any order; it is only fast in sorted order (in other orders a
+   * restart may walk far into a large bucket).
    */
   LookupResult lookup(const std::uint32_t key, Finger& finger) const {
     const std::uint32_t bucket = key >> LOW_BITS;
@@ -254,7 +260,15 @@ class PT16SassyLookup {
 
     finger.begin = H_[bucket];
     finger.end = bucket_end(bucket);
-    finger.at = lower_bound_low(finger.begin, finger.end, low);
+
+    std::uint32_t at = finger.begin;
+
+    while (at < finger.end && sassy_decode_low(L_[at]) < low) {
+      ++at;
+    }
+
+    stats_.finger_restart_steps += at - finger.begin;
+    finger.at = at;
 
     return bucket_result(key, bucket, finger.begin, finger.end, finger.at);
   }
@@ -478,18 +492,16 @@ class PT16SassyLookup {
 
  private:
   // Must match the magic written by write_hl_table in pt16_build_sassy.hpp.
-  static constexpr char magic_[8] = {'P', 'T', '1', '6', 'S', 'A', '0', '3'};
+  // PT16SA04: separators (non-ACGT bytes) never match -- no entry for a
+  // window containing one -- and every truncated suffix is a short-suffix
+  // record, not just the reference's last 15.
+  static constexpr char magic_[8] = {'P', 'T', '1', '6', 'S', 'A', '0', '4'};
 
   static constexpr std::uint32_t empty_bucket_mask = EMPTY_BUCKET_FLAG - 1;
 
   // Buckets with fewer entries than this are searched linearly.
   static constexpr std::uint32_t binary_search_threshold =
       BINARY_SEARCH_THRESHOLD;
-
-  // There is at most one short suffix per length in
-  // [SHORT_SUFFIX_MIN_LENGTH, KMER_LENGTH).
-  static constexpr std::uint64_t max_short_suffixes =
-      KMER_LENGTH - SHORT_SUFFIX_MIN_LENGTH;
 
   // Starting index in L of each bucket, with the empty-bucket encoding.
   std::vector<std::uint32_t> H_;
@@ -503,19 +515,15 @@ class PT16SassyLookup {
   // Text positions of every 16-mer that occurs more than once.
   std::vector<std::uint32_t> sampled_sa_;
 
-  // Suffixes of the reference of length SHORT_SUFFIX_MIN_LENGTH..KMER_LENGTH-1.
+  // Every short suffix of the reference (see pt16_short_suffixes.hpp): the
+  // positions within 15 characters of its end or of a separator.
   std::vector<PackedShortSuffix> short_suffixes_;
 
-  // Derived at load time, not stored in the file (see
-  // build_short_suffix_index / build_empty_answers):
+  // Derived at load time, not stored in the file (see build_empty_answers):
   //
-  // short_suffixes_, longest first, so match_short_suffixes can stop at
-  // the first one no longer than the match it already has.
-  std::vector<PackedShortSuffix> short_suffixes_by_length_;
-
-  // One bit per bucket: set if a short suffix longer than 8 characters
-  // starts with that bucket's 8 characters.
-  std::array<std::uint64_t, NUMBER_OF_BUCKETS / 64> long_short_buckets_{};
+  // short_suffixes_, arranged for the empty-bucket precomputation and for
+  // the query-time check of suffixes longer than 8 in the query's bucket.
+  ShortSuffixIndex short_index_;
 
   // Per empty bucket: the answer for any query in it, with short suffixes
   // counted up to the bucket's 8 characters.
@@ -586,9 +594,9 @@ class PT16SassyLookup {
     result.match_length = empty_length_[bucket];
     result.match_position = empty_position_[bucket];
 
-    if (has_long_short_suffix(bucket)) {
+    if (short_index_.has_long(bucket)) {
       ++stats_.short_suffix_checks;
-      match_short_suffixes(key, result);
+      short_index_.raise_long(key, result.match_length, result.match_position);
     }
 
     ++stats_.misses;
@@ -657,9 +665,9 @@ class PT16SassyLookup {
 
     // match_length >= 8 here (the entry shares the bucket's 8 characters),
     // so only a short suffix longer than 8 in this same bucket can beat it.
-    if (has_long_short_suffix(bucket)) {
+    if (short_index_.has_long(bucket)) {
       ++stats_.short_suffix_checks;
-      match_short_suffixes(key, result);
+      short_index_.raise_long(key, result.match_length, result.match_position);
     }
 
     ++stats_.misses;
@@ -706,58 +714,14 @@ class PT16SassyLookup {
     return static_cast<std::uint32_t>(it - L_.begin());
   }
 
-  // ---------- Short suffixes ----------
-
-  // Raises the match in `result` if a short suffix shares a longer prefix with
-  // the query than the table does. A short suffix is at most 15 characters,
-  // so this cannot turn a miss into a hit. Longest first: a suffix of
-  // length L shares at most L characters, so the loop stops at the first
-  // one no longer than the match already found.
-  void match_short_suffixes(const std::uint32_t key,
-                            LookupResult& result) const {
-    for (const PackedShortSuffix& suffix : short_suffixes_by_length_) {
-      if (suffix.length <= result.match_length) {
-        break;
-      }
-
-      // Leading characters shared with the query, capped at the suffix's own
-      // length (its unused low bits are 0 and must not count).
-      const std::uint32_t shared = std::min<std::uint32_t>(
-          suffix.length,
-          static_cast<std::uint32_t>(std::countl_zero(key ^ suffix.packed) / 2));
-
-      if (shared > result.match_length) {
-        result.match_length = shared;
-        result.match_position = suffix.ref_pos;
-      }
-    }
-  }
-
-  bool has_long_short_suffix(const std::uint32_t bucket) const {
-    return (long_short_buckets_[bucket / 64] >> (bucket % 64)) & 1U;
-  }
-
-  void build_short_suffix_index() {
-    short_suffixes_by_length_ = short_suffixes_;
-    std::sort(short_suffixes_by_length_.begin(),
-              short_suffixes_by_length_.end(),
-              [](const PackedShortSuffix& a, const PackedShortSuffix& b) {
-                return a.length > b.length;
-              });
-
-    for (const PackedShortSuffix& suffix : short_suffixes_) {
-      if (suffix.length > 8) {
-        const std::uint32_t bucket = suffix.packed >> LOW_BITS;
-        long_short_buckets_[bucket / 64] |= std::uint64_t{1} << (bucket % 64);
-      }
-    }
-  }
+  // ---------- Empty-bucket answers ----------
 
   // For every empty bucket: the old query-time answer (LCP with the
   // nearest non-empty bucket, that bucket's first position), raised by any
   // short suffix. A short suffix's match is capped at 8 here because only
   // the bucket's 8 characters are known; if one could go past 8, the
-  // bucket is flagged in long_short_buckets_ and the query finishes it.
+  // bucket is flagged (ShortSuffixIndex::has_long) and the query finishes
+  // it.
   void build_empty_answers() {
     empty_position_.assign(NUMBER_OF_BUCKETS, 0);
     empty_length_.assign(NUMBER_OF_BUCKETS, 0);
@@ -768,25 +732,23 @@ class PT16SassyLookup {
       }
 
       const std::uint32_t matching = H_[bucket] & empty_bucket_mask;
-      std::uint32_t length = lcp_bits_16(bucket, matching) / 2;
-      std::uint32_t position = first_position(matching, H_[matching]);
 
-      const std::uint32_t bucket_key = bucket << LOW_BITS;
+      // No non-empty bucket at all (a table without entries): only the
+      // short suffixes can match.
+      std::uint32_t length = 0;
+      std::uint32_t position = 0;
 
-      for (const PackedShortSuffix& suffix : short_suffixes_by_length_) {
-        if (suffix.length <= length) {
-          break;
-        }
+      if (matching < NUMBER_OF_BUCKETS) {
+        length = lcp_bits_16(bucket, matching) / 2;
+        position = first_position(matching, H_[matching]);
+      }
 
-        const std::uint32_t shared = std::min<std::uint32_t>(
-            {suffix.length, 8,
-             static_cast<std::uint32_t>(
-                 std::countl_zero(bucket_key ^ suffix.packed) / 2)});
+      const auto [suffix_length, suffix_position] =
+          short_index_.best_in_bucket(bucket);
 
-        if (shared > length) {
-          length = shared;
-          position = suffix.ref_pos;
-        }
+      if (suffix_length > length) {
+        length = suffix_length;
+        position = suffix_position;
       }
 
       empty_position_[bucket] = position;
@@ -849,7 +811,7 @@ class PT16SassyLookup {
     // cannot cause a huge allocation or an overflow below.
     if (entry_count > file_size / sizeof(std::uint64_t) ||
         sampled_count > file_size / sizeof(std::uint32_t) ||
-        short_count > max_short_suffixes) {
+        short_count > file_size / sizeof(PackedShortSuffix)) {
       throw std::runtime_error(
           "PT16 sassy table counts are out of range: " + path);
     }
@@ -880,7 +842,7 @@ class PT16SassyLookup {
 
     validate(entry_count, sampled_count);
 
-    build_short_suffix_index();
+    short_index_ = ShortSuffixIndex(short_suffixes_);
     build_empty_answers();
 
     stats_.entries = L_.size();
@@ -893,7 +855,7 @@ class PT16SassyLookup {
                           short_suffixes_.size() * sizeof(PackedShortSuffix) +
                           empty_position_.size() * sizeof(std::uint32_t) +
                           empty_length_.size() * sizeof(std::uint8_t) +
-                          sizeof(long_short_buckets_);
+                          short_index_.memory_bytes();
   }
 
   // Checks everything a lookup relies on, so that a corrupt table is rejected
@@ -905,9 +867,6 @@ class PT16SassyLookup {
                                "entry_count");
     }
 
-    if (entry_count == 0) {
-      throw std::runtime_error("PT16 sassy table has no entries");
-    }
 
     for (const std::uint32_t start : H_sa_) {
       if (start > sampled_count) {
@@ -938,6 +897,11 @@ class PT16SassyLookup {
       }
 
       const std::uint32_t matching = H_[bucket] & empty_bucket_mask;
+
+      // Without entries there is no bucket to point at (NUMBER_OF_BUCKETS).
+      if (entry_count == 0 && matching == NUMBER_OF_BUCKETS) {
+        continue;
+      }
 
       if (matching >= NUMBER_OF_BUCKETS || (H_[matching] & EMPTY_BUCKET_FLAG)) {
         throw std::runtime_error(

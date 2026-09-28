@@ -14,7 +14,9 @@
 // References are small, and some use only 1 or 2 letters, so the cases
 // the variants differ on are all exercised: empty buckets, short suffixes
 // at the end of the reference, range hits (repeated 16-mers), and inputs
-// shorter than 16.
+// shorter than 16. Some references and inputs contain separators (N runs,
+// lowercase, other bytes), which never match: brute force below only
+// matches equal ACGT characters.
 //
 //   g++ -std=c++20 -O2 lrf_ms/probe_pipeline_test.cpp -o probe_pipeline_test
 //   ./probe_pipeline_test
@@ -72,7 +74,8 @@ std::uint32_t brute_ms_length(const std::vector<Symbol>& reference,
     std::uint32_t length = 0;
 
     while (i + length < input.size() && p + length < reference.size() &&
-           reference[p + length] == input[i + length]) {
+           reference[p + length] == input[i + length] &&
+           is_acgt(input[i + length])) {
       ++length;
     }
 
@@ -92,6 +95,21 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
 
   msbench::ProberSet set = msbench::build_probers(reference, sa, table_path);
 
+  // Fastmiss is out of the benchmark (build_probers), but its code is
+  // kept, so it stays tested here on its own v2 table. (Plain pt16-v2 is
+  // not: it does not support separators or tables with no entries.)
+  build_pt16_table(reference, sa, table_path);
+  {
+    auto fastmiss =
+        std::make_unique<msbench::TableProber<msbench::FastMissPolicy>>(
+            "pt16-v2-fastmiss", reference, sa, table_path);
+    auto fastmiss_table = fastmiss->table();
+    set.probers.push_back(std::move(fastmiss));
+    set.probers.push_back(
+        std::make_unique<msbench::TableProber<msbench::FastMissFingerPolicy>>(
+            "pt16-v2-fastmiss-finger", std::move(fastmiss_table)));
+  }
+
   int mismatches = 0;
   const auto fail = [&](const std::string& what) {
     if (mismatches++ < 5) {
@@ -102,9 +120,8 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
   for (const std::vector<Symbol>& input : inputs) {
     const std::size_t n = input.size();
 
-    std::vector<std::uint32_t> keys;
-    msbench::roll_keys(input, keys);
-    const std::uint32_t tail_key = msbench::first_tail_key(input, keys);
+    msbench::ProbeInput prepared;
+    msbench::prepare_probe_input(input, prepared);
 
     std::vector<std::uint32_t> want(n);
     for (std::size_t i = 0; i < n; ++i) {
@@ -119,9 +136,9 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
       std::vector<std::uint32_t> scratch;
 
       if (probe_order == msbench::ProbeOrder::bucket) {
-        msbench::bucket_order(keys, order, scratch);
+        msbench::bucket_order(prepared, order, scratch);
       } else {
-        msbench::sorted_order(keys, order, scratch);
+        msbench::sorted_order(prepared, order, scratch);
 
         // The faster builds of the same order must give it exactly; the
         // radix one is what the benchmark probes in.
@@ -129,8 +146,8 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
         std::vector<std::uint32_t> radix_order;
         std::vector<std::uint64_t> packed;
         std::vector<std::uint64_t> other;
-        msbench::sorted_order_msd(keys, msd_order, packed);
-        msbench::sorted_order_radix(keys, radix_order, packed, other);
+        msbench::sorted_order_msd(prepared, msd_order, packed);
+        msbench::sorted_order_radix(prepared, radix_order, packed, other);
 
         if (msd_order != order) {
           fail("sorted_order_msd differs from sorted_order (n=" +
@@ -155,7 +172,7 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
                                 " n=" + std::to_string(n);
 
         std::vector<KmerLookupResult> results(n);
-        prober->probe(keys, order, tail_key, results);
+        prober->probe(prepared, order, results);
 
         if (!have_first) {
           first = results;
@@ -202,8 +219,12 @@ void check(const std::string& name, const std::vector<Symbol>& reference,
                                                       table_path);
 
     for (const std::vector<Symbol>& input : inputs) {
+      msbench::ProbeInput prepared;
+      msbench::prepare_probe_input(input, prepared);
+
       std::vector<std::uint32_t> keys;
-      msbench::roll_keys(input, keys);
+      prepared.for_each_key_position(
+          [&](std::uint32_t i) { keys.push_back(prepared.keys[i]); });
 
       std::vector<std::uint32_t> sorted_keys = keys;
       std::sort(sorted_keys.begin(), sorted_keys.end());
@@ -285,6 +306,29 @@ std::vector<std::vector<Symbol>> make_inputs(std::mt19937_64& rng,
   return inputs;
 }
 
+// `text` with separators put in at random places: runs of N (up to 40
+// long) and single lowercase letters or other bytes, `count` in all.
+std::vector<Symbol> with_separators(std::mt19937_64& rng,
+                                    std::vector<Symbol> text,
+                                    const int count) {
+  static const Symbol singles[] = {'N', 'a', 'c', 'R', 'Y', '-'};
+
+  for (int k = 0; k < count && !text.empty(); ++k) {
+    const std::size_t at = rng() % text.size();
+
+    if (rng() % 2 == 0) {
+      const std::size_t run = 1 + rng() % 40;
+      for (std::size_t j = at; j < std::min(text.size(), at + run); ++j) {
+        text[j] = 'N';
+      }
+    } else {
+      text[at] = singles[rng() % std::size(singles)];
+    }
+  }
+
+  return text;
+}
+
 }  // namespace
 
 int main() {
@@ -312,6 +356,50 @@ int main() {
     reference.insert(reference.end(), noise.begin(), noise.end());
 
     check("repeats + 20000 random", reference, make_inputs(rng, reference, 4));
+  }
+
+  // Separators. In the reference they split it into pieces (each one ends
+  // like the reference's end, with its own short suffixes, and the
+  // suffixes around them sit between table intervals); in the input they
+  // cut matches and turn the positions before them into short queries.
+  for (const std::size_t ref_size : {40, 300, 3000}) {
+    for (const int letters : {2, 4}) {
+      for (const int separators : {1, 5, 30}) {
+        const auto reference =
+            with_separators(rng, random_dna(rng, ref_size, letters), separators);
+
+        std::vector<std::vector<Symbol>> inputs =
+            make_inputs(rng, reference, letters);
+        for (auto& input : make_inputs(rng, reference, letters)) {
+          inputs.push_back(with_separators(rng, std::move(input), 3));
+        }
+
+        check("ref " + std::to_string(ref_size) + " over " +
+                  std::to_string(letters) + " letters, " +
+                  std::to_string(separators) + " separators",
+              reference, inputs);
+      }
+    }
+  }
+
+  // A long N run in the middle of the reference (thousands of suffixes
+  // between two table intervals), separators at both ends, and an input
+  // that is separators only.
+  {
+    std::vector<Symbol> reference(500, 'N');
+    const auto left = random_dna(rng, 2000, 4);
+    const auto right = random_dna(rng, 2000, 4);
+    reference.insert(reference.begin(), left.begin(), left.end());
+    reference.insert(reference.end(), right.begin(), right.end());
+    reference.insert(reference.begin(), 'N');
+    reference.push_back('n');
+
+    std::vector<std::vector<Symbol>> inputs = make_inputs(rng, reference, 4);
+    inputs.push_back(std::vector<Symbol>(50, 'N'));
+    inputs.push_back(std::vector<Symbol>(
+        reference.begin() + 1990, reference.begin() + 2600));  // across the run
+
+    check("reference with a 500-long N run", reference, inputs);
   }
 
   std::cout << "cases=" << cases << " failures=" << failures << "\n";

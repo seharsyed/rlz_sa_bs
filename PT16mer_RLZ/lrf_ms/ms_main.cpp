@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -98,6 +100,28 @@ int main(int argc, char** argv) {
     const msbench::SymbolTable<Symbol> alphabet(reference);
     std::cerr << "    Distinct symbols: " << alphabet.distinct() << std::endl;
 
+    // Only A, C, G and T match (see variants/pt16_short_suffixes.hpp): any
+    // other byte is a separator, which never matches anything. Every input
+    // byte that is not ACGT is replaced by one byte that does not occur in
+    // the reference, so the baseline and every check see the same
+    // semantics as the PT16 tables (a reference N then never matches an
+    // input N either).
+    const Symbol separator = [&] {
+      for (unsigned value = 1; value < 256; ++value) {
+        const Symbol candidate = static_cast<Symbol>(value);
+
+        if (!is_acgt(candidate) && !alphabet.contains(candidate)) {
+          return candidate;
+        }
+      }
+
+      throw std::runtime_error(
+          "the reference uses every byte value; no separator byte is left");
+    }();
+
+    std::cerr << "    Separator byte for non-ACGT input characters: "
+              << static_cast<unsigned>(separator) << std::endl;
+
     // ---------- Build ----------
 
     std::cerr << std::endl;
@@ -120,10 +144,12 @@ int main(int argc, char** argv) {
       totals[k].name = implementations[k]->name();
       totals[k].is_baseline = k == 0;
       totals[k].build_ms = implementations[k]->build_ms();
+      totals[k].build_diagnostics = implementations[k]->buildDiagnostics();
 
       std::cerr << "    " << implementations[k]->name()
                 << (k == 0 ? "  (baseline)" : "") << ": build "
                 << implementations[k]->build_ms() << " ms" << std::endl;
+      std::cerr << totals[k].build_diagnostics.format();
     }
 
     msbench::ProberSet prober_set =
@@ -142,6 +168,8 @@ int main(int argc, char** argv) {
 
     std::cerr << "Peak RSS after build: " << msbench::peak_rss_mb() << " MB"
               << std::endl;
+
+    std::cerr << prober_set.range_stats.format();
 
     // A structural property of a built index, not of any query: printed
     // once, from the first implementation that offers one.
@@ -229,14 +257,83 @@ int main(int argc, char** argv) {
     // How the 16-mer lookups classified, summed over every file.
     SearchComposition search_totals;
 
+    // ---------- Live progress on stderr ----------
+    //
+    // Every step prints its name before it runs, its time when the timed
+    // run finishes, and its status once the checks after it finish -- so
+    // on a large input a stuck step shows as a line that stops at its name
+    // (or, stuck in the checks, after its time).
+
+    const auto run_start = std::chrono::steady_clock::now();
+
+    std::size_t step_width = 0;
+    for (const auto& implementation : totals) {
+      step_width = std::max(step_width, implementation.name.size());
+    }
+    for (const auto& stage : stage_totals) {
+      step_width = std::max(step_width, stage.name.size());
+    }
+    for (const auto& probe : probe_totals) {
+      step_width = std::max(step_width, probe.name.size());
+    }
+    step_width += 2;
+
+    const auto begin_step = [&](const std::string& name) {
+      std::cerr << "    " << std::left << std::setw(static_cast<int>(step_width))
+                << name << std::right << "..." << std::flush;
+    };
+
+    const auto step_time = [&](const msbench::Timing& timing) {
+      std::cerr << std::fixed << std::setprecision(2) << std::setw(12)
+                << timing.min_ms << " ms" << std::flush;
+    };
+
+    // Ends a step's line (with `status` if any), then its diagnostics.
+    const auto end_step = [&](const std::string& status,
+                              const Diagnostics& diagnostics) {
+      if (!status.empty()) {
+        std::cerr << "  " << status;
+      }
+      std::cerr << std::endl << diagnostics.format();
+    };
+
+    const auto seconds_text = [](const double seconds) {
+      std::ostringstream out;
+      out << std::fixed << std::setprecision(1);
+      if (seconds < 60.0) {
+        out << seconds << " s";
+      } else {
+        out << static_cast<long>(seconds) / 60 << "m "
+            << static_cast<long>(seconds) % 60 << "s";
+      }
+      return out.str();
+    };
+
     for (std::size_t file_index = 0; file_index < files.size(); ++file_index) {
       const std::string& filename = files[file_index];
 
-      // Loading is deliberately outside every timed region.
-      const auto input = msbench::load_input<Symbol>(filename);
+      const auto file_start = std::chrono::steady_clock::now();
 
       std::cerr << "[" << file_index + 1 << "/" << files.size() << "] "
-                << filename << "  (" << input.size() << " bytes)" << std::endl;
+                << filename << std::flush;
+
+      // Loading is deliberately outside every timed region.
+      std::vector<Symbol> input;
+      const double load_ms = msbench::time_ms(
+          [&] { input = msbench::load_input<Symbol>(filename); });
+
+      std::size_t separators = 0;
+
+      for (Symbol& c : input) {
+        if (!is_acgt(c)) {
+          c = separator;
+          ++separators;
+        }
+      }
+
+      std::cerr << "  (" << input.size() << " bytes, " << separators
+                << " non-ACGT, loaded in " << std::fixed
+                << std::setprecision(1) << load_ms << " ms)" << std::endl;
 
       // The baseline's lengths for THIS file only, released with the
       // file. Four bytes per position rather than sixteen.
@@ -291,22 +388,42 @@ int main(int argc, char** argv) {
         checksums.write(result);
         row_totals.accumulate(result);
 
+        if (result.lengths.checked && !result.lengths.equal) {
+          file_diverged = true;
+        }
+      };
+
+      // Ends a full implementation's or the chain's progress line with its
+      // checks' outcome, then prints any failure in detail.
+      const auto end_ms_step = [&](const msbench::FileRunResult& result,
+                                   const Diagnostics& diagnostics) {
+        std::string status;
+
+        if (result.is_baseline) {
+          status = "baseline";
+        } else if (result.lengths.checked) {
+          status = result.lengths.equal ? "lengths EQUAL" : "lengths DIFFER";
+        }
+
+        if (!result.invariants.ok || !result.positions.ok) {
+          status += status.empty() ? "CHECK FAILED" : ", CHECK FAILED";
+        }
+
+        end_step(status, diagnostics);
+
         if (!result.invariants.ok) {
-          std::cerr << "    " << result.implementation
-                    << ": INVARIANT FAILURE: " << result.invariants
+          std::cerr << "        INVARIANT FAILURE: " << result.invariants
                     << std::endl;
         }
 
         if (!result.positions.ok) {
-          std::cerr << "    " << result.implementation
-                    << ": POSITION FAILURE: " << result.positions << std::endl;
+          std::cerr << "        POSITION FAILURE: " << result.positions
+                    << std::endl;
         }
 
         if (result.lengths.checked && !result.lengths.equal) {
-          std::cerr << "    " << result.implementation
-                    << ": LENGTH MISMATCH: " << result.lengths.describe()
+          std::cerr << "        LENGTH MISMATCH: " << result.lengths.describe()
                     << std::endl;
-          file_diverged = true;
         }
       };
 
@@ -332,19 +449,23 @@ int main(int argc, char** argv) {
 
         MatchingStatistics ms;
 
+        begin_step(implementation.name());
         result.timing = msbench::time_repeated(
             args.repeats, [&] { ms = implementation.compute(input); });
+        step_time(result.timing);
 
         // A variant documented as not exact by design is never compared.
         record_ms(result, ms, implementation.exactExpected(), totals[k]);
-        totals[k].diagnostics.accumulate(implementation.diagnostics());
+
+        const Diagnostics diagnostics = implementation.diagnostics();
+        totals[k].diagnostics.accumulate(diagnostics);
+        end_ms_step(result, diagnostics);
       }
 
       // ---------- PT16 pipeline ----------
 
       if (run_pipeline) {
         const std::size_t n = input.size();
-        const std::size_t kmer_positions = msbench::kmer_positions_of(n);
 
         const auto record_stage = [&](const std::size_t stage,
                                       const msbench::Timing& timing) {
@@ -356,13 +477,19 @@ int main(int argc, char** argv) {
           stage_totals[stage].accumulate(timing);
         };
 
-        // Keys, once.
-        std::vector<std::uint32_t> keys;
+        // Keys, once: every 16-mer key, and the short queries (positions
+        // within 15 characters of the end or of a separator).
+        msbench::ProbeInput prepared;
+        begin_step(stage_totals[keys_stage].name);
         const msbench::Timing keys_timing = msbench::time_repeated(
-            args.repeats, [&] { msbench::roll_keys(input, keys); });
+            args.repeats,
+            [&] { msbench::prepare_probe_input(input, prepared); });
+        step_time(keys_timing);
         record_stage(keys_stage, keys_timing);
-
-        const std::uint32_t tail_key = msbench::first_tail_key(input, keys);
+        end_step(std::to_string(prepared.key_count()) + " keys, " +
+                     std::to_string(prepared.short_queries.size()) +
+                     " short queries",
+                 {});
 
         // `chained` holds the first variant's first results: what the
         // chain runs on and every other probe is checked against (their
@@ -386,17 +513,21 @@ int main(int argc, char** argv) {
 
           // The order, once. Its steps' times come from the last repeat.
           Diagnostics order_phases;
+          begin_step(stage_totals[1 + o].name);
           const msbench::Timing order_timing =
               msbench::time_repeated(args.repeats, [&] {
                 if (probe_order == msbench::ProbeOrder::bucket) {
-                  msbench::bucket_order(keys, order, scratch, &order_phases);
+                  msbench::bucket_order(prepared, order, scratch,
+                                        &order_phases);
                 } else {
-                  msbench::sorted_order_radix(keys, order, packed, other,
+                  msbench::sorted_order_radix(prepared, order, packed, other,
                                               &order_phases);
                 }
               });
+          step_time(order_timing);
           record_stage(1 + o, order_timing);
           stage_totals[1 + o].diagnostics.accumulate(order_phases);
+          end_step("", order_phases);
 
           // Only the order is probed in; its build buffers can go.
           scratch = {};
@@ -419,9 +550,11 @@ int main(int argc, char** argv) {
                 new_result(probe_totals[row].name, msbench::RowKind::probe);
             result.build_ms = prober.build_ms();
 
+            begin_step(result.implementation);
             result.timing = msbench::time_repeated(args.repeats, [&] {
-              prober.probe(keys, order, tail_key, target);
+              prober.probe(prepared, order, target);
             });
+            step_time(result.timing);
 
             result.pipeline_ms = keys_timing.min_ms + order_timing.min_ms +
                                  result.timing.min_ms;
@@ -432,7 +565,19 @@ int main(int argc, char** argv) {
                 chained, target, input, reference);
             have_chained = true;
 
-            probe_totals[row].diagnostics.accumulate(prober.diagnostics());
+            const Diagnostics diagnostics = prober.diagnostics();
+            probe_totals[row].diagnostics.accumulate(diagnostics);
+
+            end_step(result.lookups.equal ? "lookups EQUAL"
+                                          : "lookups DIFFER",
+                     diagnostics);
+
+            if (!result.lookups.equal) {
+              std::cerr << "        LOOKUP MISMATCH: "
+                        << result.lookups.describe() << std::endl;
+              file_diverged = true;
+            }
+
             pending.emplace_back(row, std::move(result));
           }
 
@@ -443,17 +588,20 @@ int main(int argc, char** argv) {
 
         // The chain, once, on the chained variant's results.
         MatchingStatistics ms;
+        begin_step(stage_totals[chain_stage].name);
         const msbench::Timing chain_timing = msbench::time_repeated(
             args.repeats, [&] { ms = backwardChainExtend(chained); });
+        step_time(chain_timing);
         record_stage(chain_stage, chain_timing);
 
         msbench::FileRunResult chain_result =
             new_result(chain_totals.name, msbench::RowKind::chain);
         chain_result.timing = chain_timing;
         record_ms(chain_result, ms, true, chain_totals);
+        end_ms_step(chain_result, {});
 
         const SearchComposition composition =
-            msbench::classify_lookups(chained, kmer_positions);
+            msbench::classify_lookups(chained, prepared);
         search_totals.available = true;
         search_totals.singleton_hits += composition.singleton_hits;
         search_totals.range_hits += composition.range_hits;
@@ -465,18 +613,20 @@ int main(int argc, char** argv) {
 
           csv.write_row(result);
           probe_totals[row].accumulate(result);
-
-          if (!result.lookups.equal) {
-            std::cerr << "    " << result.implementation
-                      << ": LOOKUP MISMATCH: " << result.lookups.describe()
-                      << std::endl;
-            file_diverged = true;
-          }
         }
       }
 
       ++processed_files;
       total_input_bytes += input.size();
+
+      const auto now = std::chrono::steady_clock::now();
+      std::cerr << "    file done in "
+                << seconds_text(
+                       std::chrono::duration<double>(now - file_start).count())
+                << " (elapsed "
+                << seconds_text(
+                       std::chrono::duration<double>(now - run_start).count())
+                << ")" << std::endl;
 
       if (file_diverged && args.stop_on_mismatch) {
         std::cerr << "\nStopping: --stop-on-mismatch and this file diverged."
@@ -554,6 +704,7 @@ int main(int argc, char** argv) {
       }
 
       std::cerr << std::endl;
+      std::cerr << implementation.build_diagnostics.format("    ");
     }
 
     if (run_pipeline) {
@@ -689,6 +840,14 @@ int main(int argc, char** argv) {
 
       std::cout << prefix << "build_ms=" << implementation.build_ms
                 << std::endl;
+
+      // e.g. lrf-ms.build.lcp_ms=...
+      for (const auto& line : implementation.build_diagnostics.lines) {
+        for (const auto& [phase, ms] : line.values) {
+          std::cout << prefix << line.label << '.' << phase << "_ms=" << ms
+                    << std::endl;
+        }
+      }
       std::cout << prefix << "total_min_ms=" << implementation.total_min_ms
                 << std::endl;
       std::cout << prefix << "total_first_ms=" << implementation.total_first_ms
