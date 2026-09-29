@@ -719,6 +719,32 @@ Diagnostics finger_diagnostics(const Stats& before, const Stats& after) {
   return diagnostics;
 }
 
+// The plain v2 table searched with a finger
+// (PT16RLZParser::lookupKmerByKey(key, finger)): in sorted order each
+// lookup walks on from the previous one's insertion point in L; only a
+// new bucket restarts, walking from the bucket's start.
+struct V2FingerPolicy {
+  using Table = PT16RLZParser<Symbol, SAType>;
+  using State = Table::Finger;
+  static constexpr bool sorted_only = true;
+
+  static KmerLookupResult lookup(const Table& table, State& finger,
+                                 std::uint32_t key) {
+    return table.lookupKmerByKey(key, finger);
+  }
+
+  static KmerLookupResult tail(const Table& table, std::uint32_t key,
+                               std::uint32_t length) {
+    return V2Policy::tail(table, key, length);
+  }
+
+  static Diagnostics counters(const Table::Stats& before,
+                              const Table::Stats& after) {
+    return finger_diagnostics(before, after) +
+           bucket_search_diagnostics(before, after);
+  }
+};
+
 // The fast-miss table searched with a finger
 // (PT16FastMissParser::lookupKmerByKey(key, finger)): in sorted order the
 // keys never decrease, so each lookup walks on from the previous one's
@@ -816,29 +842,6 @@ inline ProberSet build_probers(const std::vector<Symbol>& reference,
                                     reference, suffix_array, sassy_path);
                               })});
 
-  // The v2-format variants are left out for now, to keep runs short, and
-  // so is the v2 table they load. To bring them back, restore:
-  //
-  // const std::string v2_path = table_path;
-  //
-  // set.table_builds.push_back({"v2 table", msbench::time_ms([&] {
-  //                               std::filesystem::remove(v2_path);
-  //                               build_pt16_table(reference, suffix_array,
-  //                                                v2_path);
-  //                             })});
-  //
-  // set.probers.push_back(std::make_unique<TableProber<V2Policy>>(
-  //     "pt16-v2", reference, suffix_array, v2_path));
-  //
-  // auto fastmiss = std::make_unique<TableProber<FastMissPolicy>>(
-  //     "pt16-v2-fastmiss", reference, suffix_array, v2_path);
-  // auto fastmiss_table = fastmiss->table();
-  // set.probers.push_back(std::move(fastmiss));
-  //
-  // // Same loaded table, searched with a finger (sorted order only).
-  // set.probers.push_back(std::make_unique<TableProber<FastMissFingerPolicy>>(
-  //     "pt16-v2-fastmiss-finger", std::move(fastmiss_table)));
-
   auto sassy = std::make_unique<TableProber<SassyPolicy>>("pt16-sassy",
                                                            sassy_path);
   auto sassy_table = sassy->table();
@@ -847,6 +850,42 @@ inline ProberSet build_probers(const std::vector<Symbol>& reference,
   // Same loaded table, searched with a finger (sorted order only).
   set.probers.push_back(std::make_unique<TableProber<SassyFingerPolicy>>(
       "pt16-sassy-finger", std::move(sassy_table)));
+
+  // Plain v2 and v2 with a finger search, on one v2 table. Plain v2 does
+  // not handle separators in the reference (sassy does), so both are left
+  // out on a reference with any non-ACGT byte.
+  const bool reference_is_acgt =
+      std::all_of(reference.begin(), reference.end(),
+                  [](const Symbol c) { return is_acgt(c); });
+
+  if (reference_is_acgt) {
+    const std::string v2_path = table_path;
+
+    set.table_builds.push_back({"v2 table", msbench::time_ms([&] {
+                                  std::filesystem::remove(v2_path);
+                                  build_pt16_table(reference, suffix_array,
+                                                   v2_path);
+                                })});
+
+    auto v2 = std::make_unique<TableProber<V2Policy>>(
+        "pt16-v2", reference, suffix_array, v2_path);
+    auto v2_table = v2->table();
+    set.probers.push_back(std::move(v2));
+
+    // Same loaded table, searched with a finger (sorted order only).
+    set.probers.push_back(std::make_unique<TableProber<V2FingerPolicy>>(
+        "pt16-v2-finger", std::move(v2_table)));
+  }
+
+  // The fast-miss variants (same v2 file) are left out for now. To bring
+  // them back, inside the block above:
+  //
+  // auto fastmiss = std::make_unique<TableProber<FastMissPolicy>>(
+  //     "pt16-v2-fastmiss", reference, suffix_array, v2_path);
+  // auto fastmiss_table = fastmiss->table();
+  // set.probers.push_back(std::move(fastmiss));
+  // set.probers.push_back(std::make_unique<TableProber<FastMissFingerPolicy>>(
+  //     "pt16-v2-fastmiss-finger", std::move(fastmiss_table)));
 
   return set;
 }

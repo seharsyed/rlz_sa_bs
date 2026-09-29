@@ -118,6 +118,13 @@ static SassyScanResult build_sassy_entries(
   std::uint32_t current_end = 0;
 
   for (std::uint32_t sa_index = 0; sa_index < suffix_array.size(); ++sa_index) {
+    // Start loading a later suffix's window now (see prefetch_window).
+    if (BUILD_PREFETCH_DISTANCE != 0 &&
+        sa_index + BUILD_PREFETCH_DISTANCE < suffix_array.size()) {
+      prefetch_window(reference,
+                      suffix_array[sa_index + BUILD_PREFETCH_DISTANCE]);
+    }
+
     const std::uint32_t position = suffix_array[sa_index];
 
     // Only a full 16-mer of ACGT forms a PT16 entry: skip suffixes shorter

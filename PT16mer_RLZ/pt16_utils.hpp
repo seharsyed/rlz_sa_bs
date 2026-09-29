@@ -153,6 +153,32 @@ inline std::vector<std::uint8_t> acgt_runs(
   return run;
 }
 
+// ---------- Prefetching the table builders' suffix-array pass ----------
+//
+// The builders walk the suffix array in order and read the 16 reference
+// characters at each SA[i]: a random position, so almost every suffix is a
+// cache miss, and without help the misses are waited for one at a time.
+// While suffix i is handled, the window of suffix i + distance is
+// prefetched, so up to `distance` misses are in flight at once. Override
+// with -DPT16_BUILD_PREFETCH_DISTANCE=N (0 turns prefetching off).
+#ifndef PT16_BUILD_PREFETCH_DISTANCE
+#define PT16_BUILD_PREFETCH_DISTANCE 32
+#endif
+
+inline constexpr std::size_t BUILD_PREFETCH_DISTANCE =
+    PT16_BUILD_PREFETCH_DISTANCE;
+
+// Prefetches the 16-mer window at text[position] (both cache lines it may
+// touch) for reading. A hint only: it never faults, whatever the position.
+inline void prefetch_window(const std::vector<unsigned char>& text,
+                            const std::size_t position) {
+  if (position < text.size()) {
+    const unsigned char* p = text.data() + position;
+    __builtin_prefetch(p, 0, 0);
+    __builtin_prefetch(p + (KMER_LENGTH - 1), 0, 0);
+  }
+}
+
 // Whether the 16-mer window at `position` exists and is all ACGT.
 inline bool window_is_acgt(const std::vector<unsigned char>& text,
                            const std::size_t position) {
@@ -799,9 +825,16 @@ struct RangeSizeStats {
   // The largest ranges as (size, key), largest first.
   std::vector<std::pair<std::size_t, std::uint32_t>> top;
 
+  // Entries in L per bucket (the key's high 16 bits): how long the bucket
+  // searches are. Filled on the first add.
+  std::vector<std::uint32_t> bucket_entries;
+
   void add(const std::uint32_t key, const std::size_t size) {
     ++entries;
     positions += size;
+
+    if (bucket_entries.empty()) bucket_entries.assign(NUMBER_OF_BUCKETS, 0);
+    ++bucket_entries[key >> LOW_BITS];
 
     if (size == 1) {
       ++singletons;
@@ -897,6 +930,57 @@ struct RangeSizeStats {
       for (const auto& [size, key] : top) {
         out << "    " << decode(key) << "  " << size << '\n';
       }
+    }
+
+    out << bucket_format(percent);
+    return out.str();
+  }
+
+  // Entries in L per bucket: empty buckets, mean over the non-empty ones,
+  // median and maximum, how many buckets are searched by binary search
+  // (BINARY_SEARCH_THRESHOLD entries or more), and the distribution by
+  // power of two.
+  template <typename Percent>
+  std::string bucket_format(const Percent& percent) const {
+    std::ostringstream out;
+    if (bucket_entries.empty()) return out.str();
+
+    std::vector<std::uint32_t> sorted(bucket_entries);
+    std::sort(sorted.begin(), sorted.end());
+
+    std::size_t empty = 0, binary = 0;
+    std::array<std::size_t, 34> bins{};  // bins[0]: 1 entry; b: 2^(b-1)+1 .. 2^b
+    for (const std::uint32_t count : bucket_entries) {
+      if (count == 0) {
+        ++empty;
+        continue;
+      }
+      if (count >= BINARY_SEARCH_THRESHOLD) ++binary;
+      ++bins[count == 1 ? 0 : std::bit_width(count - 1)];
+    }
+
+    const std::size_t buckets = bucket_entries.size();
+    const std::size_t nonempty = buckets - empty;
+
+    out << "  entries per bucket (" << buckets << " buckets): empty " << empty
+        << " (" << percent(empty, buckets) << "), mean over non-empty "
+        << std::fixed << std::setprecision(1)
+        << (nonempty == 0 ? 0.0
+                          : static_cast<double>(entries) /
+                                static_cast<double>(nonempty))
+        << ", median " << sorted[buckets / 2] << ", max " << sorted.back()
+        << ", binary-searched (>= " << BINARY_SEARCH_THRESHOLD << ") "
+        << binary << " (" << percent(binary, buckets) << ")\n";
+
+    for (std::size_t b = 0; b < bins.size(); ++b) {
+      if (bins[b] == 0) continue;
+      const std::size_t low = b == 0 ? 1 : (std::size_t{1} << (b - 1)) + 1;
+      const std::size_t high = b == 0 ? 1 : std::size_t{1} << b;
+      std::ostringstream label;
+      label << low;
+      if (high != low) label << '-' << high;
+      out << "    " << std::setw(19) << label.str() << ": " << std::setw(10)
+          << bins[b] << "  (" << percent(bins[b], buckets) << ")\n";
     }
 
     return out.str();

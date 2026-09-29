@@ -66,8 +66,9 @@ void prepare_results(const std::vector<Symbol>& input, const KeyedInput& keyed,
 
 // Writes the lookups of one table into `results`, which prepare_results
 // has made ready for this file, looking the keys up in the order of
-// `order` (packed keys: bucket_order or sorted_order). Phases: keys (the
-// 16-mer lookups), short (the tail lookups).
+// `order` (packed keys: bucket_order or sorted_order). Phases: lookups
+// (the 16-mer lookups, one per key, in `order`), tails (the tail lookups
+// of the short queries).
 template <typename Policy>
 void probe_order(const typename Policy::Table& table, const KeyedInput& keyed,
                  const std::vector<std::uint64_t>& order,
@@ -95,8 +96,8 @@ void probe_order(const typename Policy::Table& table, const KeyedInput& keyed,
   phase_barrier(results.data());
 
   if (diagnostics) {
-    *diagnostics = phase_diagnostics({{"keys", keys_ms},
-                                      {"short", short_ms}}) +
+    *diagnostics = phase_diagnostics({{"lookups", keys_ms},
+                                      {"tails", short_ms}}) +
                    Policy::counters(before, table.stats());
   }
 }

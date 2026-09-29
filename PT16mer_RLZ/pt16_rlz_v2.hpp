@@ -56,6 +56,39 @@ class PT16RLZParser {
     // all, so it touches neither counter).
     std::size_t linear_bucket_searches = 0;
     std::size_t binary_bucket_searches = 0;
+
+    // Finger lookups (lookupKmerByKey(key, finger)): how many restarted
+    // (a new bucket, or a key below the previous one), how many continued
+    // in the same bucket, how many L entries the continuations stepped
+    // over, and how many the restarts stepped over (walking from their
+    // bucket's start).
+    std::size_t finger_restarts = 0;
+    std::size_t finger_continues = 0;
+    std::size_t finger_steps = 0;
+    std::size_t finger_restart_steps = 0;
+  };
+
+  /**
+   * A finger into the table, for a run of lookups with non-decreasing keys
+   * (e.g. an input's 16-mers sorted by key): see lookupKmerByKey(key,
+   * finger). Start each run with a fresh Finger.
+   */
+  class Finger {
+   public:
+    Finger() = default;
+
+   private:
+    friend class PT16RLZParser;
+
+    // The previous lookup's bucket (number_of_buckets: none yet), whether
+    // it is empty, its entries [begin, end) in L when it is not, and the
+    // previous key's low part and insertion point there.
+    std::uint32_t bucket = NUMBER_OF_BUCKETS;
+    bool empty = false;
+    std::uint32_t begin = 0;
+    std::uint32_t end = 0;
+    std::uint32_t at = 0;
+    std::uint16_t low = 0;
   };
 
   /**
@@ -317,7 +350,83 @@ class PT16RLZParser {
 
     // ---------- Non-empty bucket: the existing PT16 lookup ----------
 
-    const LookupResult inner = lookup(key);
+    return kmer_result(lookup(key));
+  }
+
+  /**
+   * Same result as lookupKmerByKey(key), for a run of lookups whose keys
+   * never decrease (the input's 16-mers in sorted order): `finger`
+   * remembers where the previous lookup landed, so a lookup does not
+   * search its bucket from scratch.
+   *
+   * In the previous lookup's bucket, the search walks forward in L from
+   * the previous insertion point (the key is not smaller, so its insertion
+   * point is not earlier). A key in a new bucket restarts: its range is
+   * looked up in H and walked forward from the bucket's start -- in sorted
+   * order the first key seen in a bucket is the smallest there, so its
+   * insertion point is most likely near the start. An empty bucket is
+   * answered as by lookupKmerByKey(key). A key below the previous one also
+   * restarts, so the result is correct in any order; it is only fast in
+   * sorted order. (Same scheme as PT16SassyLookup::lookup(key, finger).)
+   */
+  KmerLookupResult lookupKmerByKey(const std::uint32_t key,
+                                   Finger& finger) const {
+    const std::uint32_t bucket = key >> low_bits;
+    const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
+
+    if (bucket == finger.bucket && low >= finger.low) {
+      finger.low = low;
+
+      if (finger.empty) {
+        return lookupKmerByKey(key);
+      }
+
+      ++stats_.finger_continues;
+
+      std::uint32_t at = finger.at;
+
+      while (at < finger.end && L_[at].low < low) {
+        ++at;
+      }
+
+      stats_.finger_steps += at - finger.at;
+      finger.at = at;
+
+      return kmer_result(lookup_at(key, bucket, finger.begin, finger.end, at));
+    }
+
+    // ---------- Restart: a new bucket (or a smaller key) ----------
+
+    ++stats_.finger_restarts;
+    finger.bucket = bucket;
+    finger.low = low;
+    finger.empty = (H_[bucket] & empty_bucket_flag) != 0;
+
+    if (finger.empty) {
+      return lookupKmerByKey(key);
+    }
+
+    finger.begin = H_[bucket];
+    finger.end = H_[next_nonempty_bucket(bucket)];
+
+    std::uint32_t at = finger.begin;
+
+    while (at < finger.end && L_[at].low < low) {
+      ++at;
+    }
+
+    stats_.finger_restart_steps += at - finger.begin;
+    finger.at = at;
+
+    return kmer_result(
+        lookup_at(key, bucket, finger.begin, finger.end, finger.at));
+  }
+
+ private:
+  // The KmerLookupResult of a non-empty-bucket lookup (lookup /
+  // lookup_at): a miss as is, a hit with its occurrences from the SA.
+  KmerLookupResult kmer_result(const LookupResult& inner) const {
+    KmerLookupResult result;
 
     if (!inner.found) {
       result.match_position = static_cast<std::uint32_t>(inner.ref_pos);
@@ -351,6 +460,17 @@ class PT16RLZParser {
     return result;
   }
 
+  // The first non-empty bucket after `bucket` (number_of_buckets if none;
+  // H_ has a sentinel entry there).
+  std::uint32_t next_nonempty_bucket(const std::uint32_t bucket) const {
+    std::uint32_t next = bucket + 1;
+    while (next < number_of_buckets && (H_[next] & empty_bucket_flag)) {
+      ++next;
+    }
+    return next;
+  }
+
+ public:
   /**
    * Looks up a tail of 1 .. kmer_length - 1 characters, given as `key`: the
    * tail packed from the top bit like a 16-mer key, padded with zero bits
@@ -717,6 +837,17 @@ class PT16RLZParser {
 
       insertion_position = static_cast<std::uint32_t>(it - L_.begin());
     }
+
+    return lookup_at(key, bucket, begin, end, insertion_position);
+  }
+
+  // The rest of lookup(key), once the key's insertion point in its
+  // (non-empty) bucket [begin, end) is known: a hit, or the neighbour with
+  // the longest common prefix. Shared with the finger lookup.
+  LookupResult lookup_at(const std::uint32_t key, const std::uint32_t bucket,
+                         const std::uint32_t begin, const std::uint32_t end,
+                         const std::uint32_t insertion_position) const {
+    const std::uint16_t low = static_cast<std::uint16_t>(key & low_mask);
 
     // Exact 16-mer hit.
     if (insertion_position < end && L_[insertion_position].low == low) {

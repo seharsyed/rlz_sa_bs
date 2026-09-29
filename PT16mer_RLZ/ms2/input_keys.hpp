@@ -14,7 +14,8 @@
 //                 0xFFFFFFFF), recorded as runs of consecutive positions
 //                 instead of as keys. They are not queried (yet): a
 //                 homopolymer 16-mer has a huge range in the table, and it
-//                 is the chain's worst case, so they are dealt with apart;
+//                 is the chain's worst case, so they are dealt with apart.
+//                 With keep_runs they are ordinary keys instead;
 //
 //   short queries positions without a full ACGT window: the last 15 before
 //                 a separator (any non-ACGT byte) or the input's end, with
@@ -104,9 +105,13 @@ struct KeyedInput {
  * that position is a key or part of a homopolymer run. A position whose
  * window never completes (a separator comes, or the input ends, first)
  * is a short query, answered from the characters it does have.
+ *
+ * `keep_runs`: all-A / all-T 16-mers are kept as ordinary keys (looked up
+ * like any other), and no runs are recorded.
  */
 template <typename Symbol>
-void prepare_keys(const std::vector<Symbol>& input, KeyedInput& out) {
+void prepare_keys(const std::vector<Symbol>& input, KeyedInput& out,
+                  const bool keep_runs = false) {
   if (input.size() > std::numeric_limits<std::uint32_t>::max()) {
     throw std::runtime_error("input too long for 32-bit positions");
   }
@@ -175,7 +180,7 @@ void prepare_keys(const std::vector<Symbol>& input, KeyedInput& out) {
     const std::uint32_t position =
         static_cast<std::uint32_t>(j + 1 - KMER_LENGTH);
 
-    if (key == POLY_A_KEY || key == POLY_T_KEY) {
+    if (!keep_runs && (key == POLY_A_KEY || key == POLY_T_KEY)) {
       const char base = key == POLY_A_KEY ? 'A' : 'T';
 
       if (!out.runs.empty() && out.runs.back().base == base &&

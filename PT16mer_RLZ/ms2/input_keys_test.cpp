@@ -73,6 +73,29 @@ void check(const std::string& name, const std::string& text) {
                    std::to_string(want_keys.size()) + ")");
   }
 
+  // keep_runs: the run positions are ordinary keys (key 0 for all-A,
+  // 0xFFFFFFFF for all-T), merged into the keys in text order; no runs.
+  {
+    std::vector<std::uint64_t> want_all = want_keys;
+    for (const auto& [position, base] : want_runs) {
+      const std::uint64_t key = base == 'A' ? ms2::POLY_A_KEY : ms2::POLY_T_KEY;
+      want_all.push_back(key << 32 | position);
+    }
+    std::sort(want_all.begin(), want_all.end(),
+              [](std::uint64_t a, std::uint64_t b) {
+                return ms2::position_of(a) < ms2::position_of(b);
+              });
+
+    ms2::KeyedInput kept;
+    ms2::prepare_keys(input, kept, /*keep_runs=*/true);
+    if (kept.keys != want_all) fail(name, "keep_runs: keys differ");
+    if (!kept.runs.empty()) fail(name, "keep_runs: runs recorded");
+    if (kept.short_queries.size() != want_short.size() ||
+        kept.separators != want_separators) {
+      fail(name, "keep_runs: short queries or separators differ");
+    }
+  }
+
   // Runs: expand to positions; also each run must be maximal (not
   // continued by the next run of the same base).
   std::vector<std::pair<std::uint32_t, char>> got_runs;
