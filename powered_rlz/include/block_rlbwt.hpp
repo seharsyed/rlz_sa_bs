@@ -478,7 +478,8 @@ class block_rlbwt {
 
         if (s_block_a == s_block_b) {
             res = s_blocks_[s_block_a]->extension(a % SUPER_BLOCK_ELEMS, b % SUPER_BLOCK_ELEMS, c);
-            return {res.first, gca_[(res.second + s_block_a*SUPER_BLOCK_ELEMS)]-res.first};
+            // FIX: cyclic start (the rotation may start near 0)
+            return {res.first, (gca_[(res.second + s_block_a*SUPER_BLOCK_ELEMS)] + size_ - res.first) % size_};
         }
 
 
@@ -495,7 +496,8 @@ class block_rlbwt {
         auto r = s_blocks_[s_block_b]->extension(0, b % SUPER_BLOCK_ELEMS, c);
         if (r.first > res.first) res = {r.first, r.second+s_block_b*SUPER_BLOCK_ELEMS};
 
-        return {res.first, gca_[(res.second + s_block_a*SUPER_BLOCK_ELEMS)]-res.first};
+        // FIX: res.second is already absolute here; cyclic start
+        return {res.first, (gca_[res.second] + size_ - res.first) % size_};
     }
 
     /** Function to compute the parses - tuples (length, position) - of the input sequence against this reference
@@ -601,7 +603,10 @@ class block_rlbwt {
             if (length > 0) {
                 tuple = largest_extension(a, b-1, c);
                 if (tuple.first >= i) {
-                    parses.emplace_back(length+i, tuple.second);
+                    // FIX: only i characters were left; tuple.second is the start
+                    // for tuple.first characters (the extra ones matched the
+                    // zero padding, i.e. 'A's)
+                    parses.emplace_back(length+i, (tuple.second + (tuple.first - i)) % size_);
                     return;
                 }
                 parses.emplace_back(length, gca_[a]);
@@ -727,7 +732,8 @@ class block_rlbwt {
             if (length > 0) {
                 tuple = largest_extension(a, b-1, c);
                 if (tuple.first >= i) {
-                    parses.emplace_back(length+i, tuple.second, last);
+                    // FIX: as in parse_tuples
+                    parses.emplace_back(length+i, (tuple.second + (tuple.first - i)) % size_, last);
                     return;
                 }
                 parses.emplace_back(length, gca_[a], last);
