@@ -208,7 +208,9 @@ int main(int argc, char** argv) {
       for (const Symbol c : input) non_acgt += is_acgt(c) ? 0 : 1;
 
       // Only the parse is timed.
-      phrases.clear();
+      // A fresh, empty phrase list per file, as rlz_parser has (freed here,
+      // untimed).
+      std::vector<Phrase>().swap(phrases);
       const std::string_view view(reinterpret_cast<const char*>(input.data()),
                                   input.size());
       const double parse_ms = time_ms([&] {

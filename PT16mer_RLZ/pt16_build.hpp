@@ -52,6 +52,12 @@ static ScanResult build_entries(const std::vector<unsigned char>& reference, con
     std::uint32_t current_start = 0;
 
     for (std::uint32_t sa_index = 0; sa_index < suffix_array.size(); ++sa_index) {
+        // Start loading a later suffix's window now (see prefetch_window).
+        if (BUILD_PREFETCH_DISTANCE != 0 &&
+            sa_index + BUILD_PREFETCH_DISTANCE < suffix_array.size()) {
+            prefetch_window(reference, suffix_array[sa_index + BUILD_PREFETCH_DISTANCE]);
+        }
+
         const std::uint32_t position = suffix_array[sa_index];
 
         // Suffixes shorter than 16 symbols cannot form a PT16 entry.
