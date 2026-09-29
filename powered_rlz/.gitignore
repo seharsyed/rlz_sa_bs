@@ -1,0 +1,52 @@
+# Prerequisites
+*.d
+
+# Test data
+*.bin
+*.txt
+*.tsv
+corpus/
+bwt/
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+make_bwt
+cmake_bwt
+bench_bwt
+cbench_bwt
+make_alphabet_header
+count_matches
+make_test_data
+
+#vscode
+.vscode
+
+#Jupyter notebook stuff
+.ipynb_checkpoints/
