@@ -37,10 +37,10 @@ class PT16RLZParser {
       BINARY_SEARCH_THRESHOLD;
 
   struct Stats {
-    std::size_t hits = 0;
-    std::size_t misses = 0;
-    std::size_t singleton_hits = 0;
-    std::size_t range_hits = 0;
+    pt16_counter hits = 0;
+    pt16_counter misses = 0;
+    pt16_counter singleton_hits = 0;
+    pt16_counter range_hits = 0;
     std::size_t entries = 0;
     std::size_t approx_bytes = 0;
   };

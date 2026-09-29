@@ -83,25 +83,25 @@ class PT16SassyLookup {
     // class, lookup_tail's own padded lookup counts too, since it genuinely
     // queries the table via a padded key rather than bypassing it the way
     // the older parsers' separate <16-character fallback did.
-    std::size_t hits = 0;
-    std::size_t misses = 0;
-    std::size_t singleton_hits = 0;
-    std::size_t range_hits = 0;
+    pt16_counter hits = 0;
+    pt16_counter misses = 0;
+    pt16_counter singleton_hits = 0;
+    pt16_counter range_hits = 0;
 
     // How every non-empty-bucket dispatch searched its bucket: a linear
     // scan below binary_search_threshold entries, std::lower_bound at or
     // above it. Updated by lower_bound_low, so this covers both hits and
     // non-empty-bucket misses (an empty-bucket miss never searches L_ at
     // all, so it touches neither counter).
-    std::size_t linear_bucket_searches = 0;
-    std::size_t binary_bucket_searches = 0;
+    pt16_counter linear_bucket_searches = 0;
+    pt16_counter binary_bucket_searches = 0;
 
     // Misses in an empty bucket (answered from the precomputed
     // empty-bucket arrays), and misses that had to run the full
     // short-suffix check because their bucket holds a short suffix longer
     // than 8 characters (see ShortSuffixIndex::has_long).
-    std::size_t empty_bucket_misses = 0;
-    std::size_t short_suffix_checks = 0;
+    pt16_counter empty_bucket_misses = 0;
+    pt16_counter short_suffix_checks = 0;
 
     // Finger lookups (lookup(key, finger)): how many started a fresh
     // bucket search (a new bucket, or a key below the previous one), how
@@ -109,10 +109,10 @@ class PT16SassyLookup {
     // bucket, how many L entries those continuations stepped over in
     // total, and how many the restarts stepped over (walking from their
     // bucket's start).
-    std::size_t finger_restarts = 0;
-    std::size_t finger_continues = 0;
-    std::size_t finger_steps = 0;
-    std::size_t finger_restart_steps = 0;
+    pt16_counter finger_restarts = 0;
+    pt16_counter finger_continues = 0;
+    pt16_counter finger_steps = 0;
+    pt16_counter finger_restart_steps = 0;
   };
 
   /**

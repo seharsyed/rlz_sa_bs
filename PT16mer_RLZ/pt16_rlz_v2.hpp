@@ -42,10 +42,10 @@ class PT16RLZParser {
   static constexpr std::uint16_t large_offset_flag = 65535;
 
   struct Stats {
-    std::size_t hits = 0;
-    std::size_t misses = 0;
-    std::size_t singleton_hits = 0;
-    std::size_t range_hits = 0;
+    pt16_counter hits = 0;
+    pt16_counter misses = 0;
+    pt16_counter singleton_hits = 0;
+    pt16_counter range_hits = 0;
     std::size_t entries = 0;
     std::size_t approx_bytes = 0;
 
@@ -54,18 +54,18 @@ class PT16RLZParser {
     // above it. Updated by lookup(), so this covers both hits and
     // non-empty-bucket misses (an empty-bucket miss never searches L_ at
     // all, so it touches neither counter).
-    std::size_t linear_bucket_searches = 0;
-    std::size_t binary_bucket_searches = 0;
+    pt16_counter linear_bucket_searches = 0;
+    pt16_counter binary_bucket_searches = 0;
 
     // Finger lookups (lookupKmerByKey(key, finger)): how many restarted
     // (a new bucket, or a key below the previous one), how many continued
     // in the same bucket, how many L entries the continuations stepped
     // over, and how many the restarts stepped over (walking from their
     // bucket's start).
-    std::size_t finger_restarts = 0;
-    std::size_t finger_continues = 0;
-    std::size_t finger_steps = 0;
-    std::size_t finger_restart_steps = 0;
+    pt16_counter finger_restarts = 0;
+    pt16_counter finger_continues = 0;
+    pt16_counter finger_steps = 0;
+    pt16_counter finger_restart_steps = 0;
   };
 
   /**

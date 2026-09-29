@@ -179,6 +179,27 @@ inline void prefetch_window(const std::vector<unsigned char>& text,
   }
 }
 
+// ---------- Lookup counters ----------
+//
+// The PT16 parsers count their lookups (hits, misses, searches, ...) in a
+// Stats struct they update on every lookup. Shared between threads, those
+// updates would be a data race and would make the threads fight over one
+// cache line; so a benchmark running several threads on one table builds with
+// -DPT16_NO_STATS, which makes every counter a no-op (always 0). By default a
+// counter is a plain std::size_t.
+#ifdef PT16_NO_STATS
+struct pt16_counter {
+  constexpr pt16_counter() = default;
+  constexpr pt16_counter(std::size_t) {}
+  constexpr pt16_counter& operator++() { return *this; }
+  constexpr pt16_counter operator++(int) { return *this; }
+  constexpr pt16_counter& operator+=(std::size_t) { return *this; }
+  constexpr operator std::size_t() const { return 0; }
+};
+#else
+using pt16_counter = std::size_t;
+#endif
+
 // Whether the 16-mer window at `position` exists and is all ACGT.
 inline bool window_is_acgt(const std::vector<unsigned char>& text,
                            const std::size_t position) {
