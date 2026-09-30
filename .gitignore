@@ -19,3 +19,14 @@ parser/rlz_lp
 PT16mer_RLZ/cache
 PT16mer_RLZ/pt16
 PT16mer_RLZ/pt16_v2
+PT16mer_RLZ/rlz_suite
+PT16mer_RLZ/rlz_parallel
+PT16mer_RLZ/rlz_suite.*
+PT16mer_RLZ/rlz_parallel.*
+!PT16mer_RLZ/rlz_suite.cpp
+!PT16mer_RLZ/rlz_parallel.cpp
+PT16mer_RLZ/powered_bench
+PT16mer_RLZ/pt16_powered_build
+PT16mer_RLZ/pt16_powered_check
+PT16mer_RLZ/.*.built-on
+PT16mer_RLZ/results/

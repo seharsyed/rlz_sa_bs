@@ -1,59 +1,45 @@
 #!/usr/bin/env bash
-# Runs the RLZ parsing suite (rlz_suite) on the server's data.
+# Runs the RLZ parsing suite (rlz_suite: single-threaded, with checks) on a
+# dataset.
 #
-#   ./run_rlz_suite.sh REFERENCE LIST [extra rlz_suite options]
+#   ./run_rlz_suite.sh DATASET [LIST] [rlz_suite options...]
 #
-# REFERENCE: ecoli | GCA_000179135.1 | GCA_001012175.1
-# LIST:      the input list (one input path per line)
+# DATASET  a name from rlz_datasets.sh (e.g. ecoli)
+# LIST     the input list; optional when the dataset has a default one
+# options  passed on, e.g. --quiet, --max-files 10, --results FILE
 #
-# The suffix arrays are in RLZ_DATA/cleaned-references/ (REF.sa). The E. coli
-# reference is there too; the other references are in RLZ_DATA/cleaned_inputs/
-# under the same name as their .sa file without the extension. The powered
-# index is used when it exists (built with powered_rlz's tools, see
-# powered/README.md); otherwise powered is skipped.
+# rlz_suite is rebuilt when it is missing or older than its sources (with
+# powered on x86-64, without elsewhere; see build_if_needed in rlz_datasets.sh).
 #
-# Build rlz_suite first (from PT16mer_RLZ/):
-#   g++ -std=c++2a -O3 -march=native -DNDEBUG -DWITH_POWERED \
-#       -DSMALL_BLOCK_SIZE=256 -DLARGE_BLOCK_SIZE=16384 rlz_suite.cpp -o rlz_suite
+# NUMA=N pins the run to NUMA node N (its CPU and memory; see numa_setup in
+# rlz_datasets.sh), e.g.  NUMA=0 ./run_rlz_suite.sh ecoli --quiet
 
 set -euo pipefail
 
-DATA=${DATA:-$HOME/proj/RLZ_DATA}
-SA_DIR=$DATA/cleaned-references
+cd "$(dirname "$0")"
+source ./rlz_datasets.sh
 
-if [ $# -lt 2 ]; then
-  sed -n '2,20p' "$0"
+if [ $# -lt 1 ]; then
+  sed -n '2,/^$/p' "$0"
+  echo "datasets: $(list_datasets)"
   exit 1
 fi
 
-case "$1" in
-  ecoli|GCA_000005845.2)
-    REF=$SA_DIR/GCA_000005845.2_ASM584v2.cleaned
-    SA=$REF.sa
-    POWERED=$DATA/BWT_FM_files/GCA_000005845.2_ASM584v2.cleaned_four.bwt
-    ;;
-  GCA_000179135.1)
-    REF=$DATA/cleaned_inputs/GCA_000179135.1_ASM17913v1.txt
-    SA=$SA_DIR/GCA_000179135.1_ASM17913v1.txt.sa
-    POWERED=$DATA/BWT_FM_files/GCA_000179135.1_ASM17913v1.txt_four.bwt
-    ;;
-  GCA_001012175.1)
-    REF=$DATA/cleaned_inputs/GCA_001012175.1_CFSAN026787_02.0.txt
-    SA=$SA_DIR/GCA_001012175.1_CFSAN026787_02.0.txt.sa
-    POWERED=$DATA/BWT_FM_files/GCA_001012175.1_CFSAN026787_02.0.txt_four.bwt
-    ;;
-  *)
-    echo "unknown reference: $1 (ecoli | GCA_000179135.1 | GCA_001012175.1)" >&2
-    exit 1
-    ;;
-esac
+DATASET=$1
+shift
+select_dataset "$DATASET"
 
-LIST=$2
-shift 2
+if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then
+  LIST=$1
+  shift
+fi
+[ -n "$LIST" ] || { echo "no input list for $DATASET: give one" >&2; exit 1; }
 
 for f in "$REF" "$SA" "$LIST"; do
   [ -f "$f" ] || { echo "missing: $f" >&2; exit 1; }
 done
+
+build_if_needed rlz_suite
 
 POWERED_ARGS=()
 if [ -f "$POWERED" ]; then
@@ -62,6 +48,7 @@ else
   echo "(no powered index at $POWERED: powered is skipped)" >&2
 fi
 
-cd "$(dirname "$0")"
-exec ./rlz_suite --reference "$REF" --suffix-array "$SA" --filenames "$LIST" \
-  "${POWERED_ARGS[@]}" "$@"
+numa_setup
+
+exec ${NUMA_CMD[@]+"${NUMA_CMD[@]}"} "./$BINARY" --reference "$REF" --suffix-array "$SA" --filenames "$LIST" \
+  ${POWERED_ARGS[@]+"${POWERED_ARGS[@]}"} "$@"

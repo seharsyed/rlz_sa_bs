@@ -34,6 +34,18 @@
 //
 //   ./powered_bench --index REF_four.bwt --reference REF --filenames LIST
 //                   [--code-size 4] [--results CSV] [--max-files N]
+//                   [--pt16-table REF_four.pt16 | --pt16] [--escape] [--quiet]
+//
+// Variants (powered_pt16_parse.hpp), each run on every file after powered,
+// timed the same way:
+//   powered-escape       with --escape: powered, but a phrase whose interval
+//                        is a single row is extended by character comparison;
+//   powered-pt16-escape  with --pt16-table (a table from pt16_powered_build)
+//                        or --pt16 (the table built in memory): a PT16 lookup
+//                        (sassy layout) at each phrase start, and the escape
+//                        (a singleton table entry has no row to rank from).
+// Their phrase lengths must be identical to powered's and they must decode (a
+// phrase may point at another occurrence).
 
 #include <algorithm>
 #include <cstdint>
@@ -43,6 +55,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -50,6 +63,8 @@
 
 #include "../../powered_rlz/include/types.hpp"  // bbwt::non_rle
 #include "../pt16_utils.hpp"                    // loaders, time_ms
+#include "powered_pt16_parse.hpp"
+#include "pt16_powered.hpp"
 
 using Symbol = unsigned char;
 using Phrase = std::tuple<std::uint64_t, std::uint64_t>;  // (length, position)
@@ -62,9 +77,14 @@ struct PoweredArgs {
   std::string filenames;   // our input list
   std::string results;     // optional CSV
   std::size_t max_files = 0;
+  bool quiet = false;  // per-file lines only for files that fail
   // Characters per (meta)symbol: 4 for the powered index, 1 for an index
   // over the original alphabet (rlz_parser's --original).
   unsigned code_size = 4;
+  // powered-pt16: a table file, or build the table in memory.
+  std::string pt16_table;
+  bool pt16 = false;
+  bool escape = false;  // the escape-on-singleton variants
 };
 
 std::string require_value(int& i, int argc, char** argv) {
@@ -86,17 +106,32 @@ PoweredArgs parse_powered_args(int argc, char** argv) {
       args.filenames = require_value(i, argc, argv);
     } else if (option == "--results") {
       args.results = require_value(i, argc, argv);
+    } else if (option == "--quiet") {
+      args.quiet = true;
     } else if (option == "--max-files") {
       args.max_files = std::stoull(require_value(i, argc, argv));
     } else if (option == "--code-size") {
       args.code_size = static_cast<unsigned>(
           std::stoul(require_value(i, argc, argv)));
+    } else if (option == "--pt16-table") {
+      args.pt16_table = require_value(i, argc, argv);
+      args.pt16 = true;
+    } else if (option == "--pt16") {
+      args.pt16 = true;
+    } else if (option == "--escape") {
+      args.escape = true;
     } else if (option == "--help" || option == "-h") {
       std::cout << "Usage: " << argv[0]
                 << " --index REF_four.bwt --reference REF --filenames LIST\n"
                    "  [--code-size 4]  4: powered index, 1: original alphabet\n"
                    "  [--results CSV]  per-file CSV\n"
-                   "  [--max-files N]  only the first N input files\n";
+                   "  [--max-files N]  only the first N input files\n"
+                   "  [--quiet]        per-file lines only for failing files\n"
+                   "  [--pt16-table P] also run powered-pt16-escape with this "
+                   "table\n"
+                   "  [--pt16]         also run powered-pt16-escape, table built "
+                   "in memory\n"
+                   "  [--escape]       also run powered-escape\n";
       std::exit(EXIT_SUCCESS);
     } else {
       throw std::runtime_error("unknown argument: " + option);
@@ -107,6 +142,9 @@ PoweredArgs parse_powered_args(int argc, char** argv) {
   }
   if (args.code_size != 1 && args.code_size != 4) {
     throw std::runtime_error("--code-size must be 1 or 4");
+  }
+  if ((args.pt16 || args.escape) && args.code_size != 4) {
+    throw std::runtime_error("the powered variants need --code-size 4");
   }
   return args;
 }
@@ -187,18 +225,61 @@ int main(int argc, char** argv) {
     std::cerr << "    loaded in " << index_ms << " ms (" << index->size()
               << " BWT symbols)\n";
 
+    // The variants: the table (loaded or built) and their parsers.
+    using Index = bbwt::non_rle<>;
+    using Parser = PoweredPT16Parser<Index>;
+    std::unique_ptr<PT16PoweredTable> table;
+    double table_ms = 0.0;
+    if (args.pt16) {
+      table = std::make_unique<PT16PoweredTable>();
+      if (!args.pt16_table.empty()) {
+        table_ms = time_ms(
+            [&] { *table = PT16PoweredTable::load(args.pt16_table); });
+        std::cerr << "    PT16 table loaded in " << table_ms << " ms: ";
+      } else {
+        table_ms = time_ms([&] {
+          *table = PT16PoweredTable::build(reference, index->gca_, nullptr);
+        });
+        std::cerr << "    PT16 table built in " << table_ms << " ms: ";
+      }
+      std::cerr << table->entries() << " entries, "
+                << table->bytes() / (1024.0 * 1024.0) << " MB\n";
+    }
+
+    struct Variant {
+      std::string name;
+      std::unique_ptr<Parser> parser;
+      double total_ms = 0.0;
+      std::size_t files_ok = 0;
+      Parser::Stats total;
+    };
+    std::vector<Variant> variants;
+    const auto add_variant = [&](std::string name, const PT16PoweredTable* t,
+                                 const std::vector<Symbol>* r) {
+      variants.push_back({std::move(name),
+                          std::make_unique<Parser>(*index, t, r), 0.0, 0, {}});
+    };
+    if (args.escape) add_variant("powered-escape", nullptr, &reference);
+    if (args.pt16) add_variant("powered-pt16-escape", table.get(), &reference);
+
     std::ofstream csv;
     if (!args.results.empty()) {
       csv.open(args.results);
       if (!csv) throw std::runtime_error("cannot create " + args.results);
-      csv << "file,input_bytes,non_acgt,parse_ms,phrases,decoded_ok\n";
+      csv << "file,input_bytes,non_acgt,parse_ms,phrases,decoded_ok";
+      for (const Variant& v : variants) {
+        csv << ',' << v.name << "_ms," << v.name << "_ok";
+      }
+      csv << '\n';
     }
 
-    std::cerr << "[4] files\n";
+    if (!args.quiet) std::cerr << "[4] files\n";
 
     std::size_t total_bytes = 0, total_phrases = 0, files_ok = 0;
     double total_parse_ms = 0.0;
     std::vector<Phrase> phrases;
+
+    std::vector<Phrase> variant_phrases;
 
     for (std::size_t f = 0; f < files.size(); ++f) {
       // Loading is not timed (as in our other benchmarks).
@@ -206,6 +287,9 @@ int main(int argc, char** argv) {
 
       std::size_t non_acgt = 0;
       for (const Symbol c : input) non_acgt += is_acgt(c) ? 0 : 1;
+
+      // This file's lines; with --quiet printed only if the file fails.
+      std::ostringstream file_log;
 
       // Only the parse is timed.
       // A fresh, empty phrase list per file, as rlz_parser has (freed here,
@@ -223,10 +307,10 @@ int main(int argc, char** argv) {
           decode_check(phrases, reference, input, decoded_length);
       const bool ok = difference == input.size();
 
-      std::cerr << "[" << f + 1 << "/" << files.size() << "] " << files[f]
+      file_log << "[" << f + 1 << "/" << files.size() << "] " << files[f]
                 << "  (" << input.size() << " bytes";
-      if (non_acgt != 0) std::cerr << ", " << non_acgt << " non-ACGT";
-      std::cerr << ")\n    parse " << std::fixed << std::setprecision(2)
+      if (non_acgt != 0) file_log << ", " << non_acgt << " non-ACGT";
+      file_log << ")\n    parse " << std::fixed << std::setprecision(2)
                 << parse_ms << " ms, " << phrases.size() << " phrases, "
                 << "average length "
                 << (phrases.empty() ? 0.0
@@ -234,10 +318,10 @@ int main(int argc, char** argv) {
                                           static_cast<double>(phrases.size()))
                 << ", decode " << (ok ? "OK" : "DIFFERS");
       if (!ok) {
-        std::cerr << " (first at " << difference << ", decoded "
+        file_log << " (first at " << difference << ", decoded "
                   << decoded_length << " of " << input.size() << " bytes)";
       }
-      std::cerr << '\n';
+      file_log << '\n';
 
       // On a mismatch: the first phrases in text order, and the input next
       // to what the first phrase decodes to, to see what kind of mismatch
@@ -253,15 +337,15 @@ int main(int argc, char** argv) {
           }
           return s;
         };
-        std::cerr << "    first phrases in text order (length, position):";
+        file_log << "    first phrases in text order (length, position):";
         std::size_t shown = 0;
         for (auto it = phrases.rbegin(); it != phrases.rend() && shown < 5;
              ++it, ++shown) {
-          std::cerr << " (" << std::get<0>(*it) << ", " << std::get<1>(*it)
+          file_log << " (" << std::get<0>(*it) << ", " << std::get<1>(*it)
                     << ")";
         }
         const std::uint64_t first_position = std::get<1>(phrases.back());
-        std::cerr << "\n    input[0..40)                : "
+        file_log << "\n    input[0..40)                : "
                   << show(input, 0, 40, false)
                   << "\n    reference[first position ..]: "
                   << show(reference, first_position, 40, true)
@@ -273,24 +357,114 @@ int main(int argc, char** argv) {
                   << '\n';
       }
 
+      // The variants on the same input, timed the same way.
+      bool variants_ok = true;
+      std::vector<std::pair<double, bool>> variant_results;
+      for (Variant& v : variants) {
+        Parser::Stats stats;
+        std::vector<Phrase>().swap(variant_phrases);
+        const double ms =
+            time_ms([&] { v.parser->parse(view, variant_phrases, stats); });
+        // The lengths must be powered's (zero-length phrases aside, which
+        // powered emits when a phrase ends at the input start); a phrase may
+        // point at another occurrence, so the phrases are decoded.
+        std::size_t k = 0, m = 0;
+        bool lengths_equal = true;
+        while (lengths_equal) {
+          while (k < phrases.size() && std::get<0>(phrases[k]) == 0) ++k;
+          while (m < variant_phrases.size() &&
+                 std::get<0>(variant_phrases[m]) == 0) {
+            ++m;
+          }
+          if (k == phrases.size() || m == variant_phrases.size()) {
+            lengths_equal =
+                k == phrases.size() && m == variant_phrases.size();
+            break;
+          }
+          lengths_equal =
+              std::get<0>(phrases[k]) == std::get<0>(variant_phrases[m]);
+          if (lengths_equal) {
+            ++k;
+            ++m;
+          }
+        }
+        std::size_t variant_decoded = 0;
+        const bool decodes =
+            decode_check(variant_phrases, reference, input, variant_decoded) ==
+            input.size();
+        const bool variant_ok = lengths_equal && decodes;
+
+        file_log << "    " << v.name << ' ' << ms << " ms (x"
+                  << (ms == 0.0 ? 0.0 : parse_ms / ms) << " vs powered), lengths "
+                  << (lengths_equal ? "identical" : "DIFFER") << ", decode "
+                  << (decodes ? "OK" : "DIFFERS");
+        if (stats.lookups != 0) {
+          file_log << ", 16-mer hits " << stats.hits << ", misses "
+                    << stats.misses;
+        }
+        if (stats.escapes != 0) file_log << ", escapes " << stats.escapes;
+        file_log << '\n';
+        if (!lengths_equal) {
+          file_log << "    first length difference at phrase " << k
+                    << " (from the right) of " << phrases.size() << " / "
+                    << variant_phrases.size() << '\n';
+        }
+
+        v.total_ms += ms;
+        v.files_ok += variant_ok ? 1 : 0;
+        v.total.lookups += stats.lookups;
+        v.total.hits += stats.hits;
+        v.total.misses += stats.misses;
+        v.total.escapes += stats.escapes;
+        variants_ok = variants_ok && variant_ok;
+        variant_results.emplace_back(ms, variant_ok);
+      }
+
       if (csv.is_open()) {
         csv << files[f] << ',' << input.size() << ',' << non_acgt << ','
             << std::setprecision(3) << parse_ms << ',' << phrases.size() << ','
-            << (ok ? "YES" : "NO") << '\n';
+            << (ok ? "YES" : "NO");
+        for (const auto& [ms, variant_ok] : variant_results) {
+          csv << ',' << ms << ',' << (variant_ok ? "YES" : "NO");
+        }
+        csv << '\n';
       }
 
       total_bytes += input.size();
       total_phrases += phrases.size();
       total_parse_ms += parse_ms;
       files_ok += ok ? 1 : 0;
+
+      if (!args.quiet || !ok || !variants_ok) {
+        std::cerr << file_log.str();
+      }
     }
 
-    std::cerr << "[5] totals over " << files.size() << " files ("
+    std::cerr << std::fixed << std::setprecision(2) << "[5] totals over " << files.size() << " files ("
               << total_bytes << " bytes)\n"
               << "    index load " << index_ms << " ms\n"
               << "    parse      " << total_parse_ms << " ms, " << total_phrases
               << " phrases, decode OK " << files_ok << "/" << files.size()
               << " files\n";
+    bool all_variants_ok = true;
+    for (const Variant& v : variants) {
+      std::cerr << "    " << v.name << ' ' << v.total_ms << " ms (x"
+                << (v.total_ms == 0.0 ? 0.0 : total_parse_ms / v.total_ms)
+                << " vs powered), lengths identical and decode OK "
+                << v.files_ok << "/" << files.size() << " files";
+      if (v.total.lookups != 0) {
+        std::cerr << ", 16-mer hits " << v.total.hits << ", misses "
+                  << v.total.misses << " of " << v.total.lookups << " lookups";
+      }
+      if (v.total.escapes != 0) std::cerr << ", escapes " << v.total.escapes;
+      std::cerr << '\n';
+      all_variants_ok = all_variants_ok && v.files_ok == files.size();
+    }
+    if (table) {
+      std::cerr << "    PT16 table " << (args.pt16_table.empty() ? "build " : "load ")
+                << table_ms << " ms, " << table->bytes() / (1024.0 * 1024.0)
+                << " MB\n";
+    }
 
     std::cout << "files=" << files.size() << '\n'
               << "input_bytes=" << total_bytes << '\n'
@@ -299,8 +473,27 @@ int main(int argc, char** argv) {
               << "powered_phrases=" << total_phrases << '\n'
               << "decode_ok=" << (files_ok == files.size() ? "YES" : "NO")
               << '\n';
+    if (table) {
+      std::cout << "pt16_table_ms=" << table_ms << '\n'
+                << "pt16_table_bytes=" << table->bytes() << '\n';
+    }
+    for (const Variant& v : variants) {
+      std::string key = v.name;
+      std::replace(key.begin(), key.end(), '-', '_');
+      std::cout << key << "_parse_ms=" << v.total_ms << '\n'
+                << key << "_ok=" << (v.files_ok == files.size() ? "YES" : "NO")
+                << '\n';
+      if (v.total.lookups != 0) {
+        std::cout << key << "_lookups=" << v.total.lookups << '\n'
+                  << key << "_hits=" << v.total.hits << '\n'
+                  << key << "_misses=" << v.total.misses << '\n';
+      }
+      if (v.total.escapes != 0) {
+        std::cout << key << "_escapes=" << v.total.escapes << '\n';
+      }
+    }
 
-    return files_ok == files.size() ? EXIT_SUCCESS : 4;
+    return files_ok == files.size() && all_variants_ok ? EXIT_SUCCESS : 4;
   } catch (const std::exception& error) {
     std::cerr << "\nERROR: " << error.what() << std::endl;
     return EXIT_FAILURE;

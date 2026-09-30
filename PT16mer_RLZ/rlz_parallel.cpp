@@ -3,7 +3,8 @@
 // table or index.
 //
 // Parsers (as in rlz_suite.cpp): sa-binary-search, lrf-ms, pt16, pt16-v2,
-// sassy, and powered (built with -DWITH_POWERED, given --powered-index).
+// sassy, and powered-escape and powered-pt16-escape (built with -DWITH_POWERED,
+// given --powered-index; see rlz_suite.cpp).
 //
 // Per parser: build or load its structure once (timed apart), then parse all
 // files with T threads, then free the structure before the next parser, so
@@ -30,6 +31,10 @@
 //   ./rlz_parallel --reference REF --suffix-array REF.sa --filenames LIST
 //                  [--threads T] [--parsers a,b,...] [--powered-index REF_four.bwt]
 //                  [--table PATH] [--max-files N] [--no-preload] [--results CSV]
+//                  [--quiet]
+//
+// There is no per-file output; --quiet is accepted (and changes nothing) so
+// that every benchmark takes the same flag.
 
 // The PT16 parsers' lookup counters would be written by every thread: turn
 // them off (see pt16_counter in pt16_utils.hpp).
@@ -78,6 +83,8 @@ namespace pt16_v1 {
 
 #ifdef WITH_POWERED
 #include "../powered_rlz/include/types.hpp"
+#include "powered/powered_pt16_parse.hpp"  // PoweredPT16Parser
+#include "powered/pt16_powered.hpp"        // PT16PoweredTable
 #endif
 
 using Symbol = unsigned char;
@@ -90,7 +97,8 @@ namespace {
 // ---------- Arguments ----------
 
 const std::vector<std::string> kAllParsers = {
-    "sa-binary-search", "lrf-ms", "pt16", "pt16-v2", "sassy", "powered"};
+    "sa-binary-search", "lrf-ms", "pt16", "pt16-v2", "sassy", "powered-escape",
+    "powered-pt16-escape"};
 
 struct ParallelArgs {
   std::string reference, suffix_array, filenames, table, powered_index, results;
@@ -112,14 +120,16 @@ void print_usage(const char* program) {
             << " --reference PATH --suffix-array PATH --filenames PATH\n"
                "  [--threads T]           threads (default: all hardware threads)\n"
                "  [--parsers a,b,...]     subset of: sa-binary-search, lrf-ms, "
-               "pt16, pt16-v2, sassy, powered\n"
+               "pt16, pt16-v2, sassy, powered-escape, powered-pt16-escape\n"
                "  [--powered-index PATH]  powered_rlz index (REF_four.bwt)\n"
                "  [--table PATH]          PT16 table files (default: "
                "<reference>.parallel_pt16, .v2, .sassy)\n"
                "  [--max-files N]         only the first N input files\n"
                "  [--no-preload]          threads load their own files (the "
                "loading then counts in the wall time)\n"
-               "  [--results PATH]        CSV, one row per parser\n";
+               "  [--results PATH]        CSV, one row per parser\n"
+               "  [--quiet]               accepted for uniformity (no per-file "
+               "output anyway)\n";
 }
 
 ParallelArgs parse_parallel_args(int argc, char** argv) {
@@ -144,6 +154,8 @@ ParallelArgs parse_parallel_args(int argc, char** argv) {
       args.threads = static_cast<unsigned>(std::stoul(require_value(i, argc, argv)));
     } else if (option == "--no-preload") {
       args.preload = false;
+    } else if (option == "--quiet") {
+      // no per-file output to suppress
     } else if (option == "--parsers") {
       std::stringstream list(require_value(i, argc, argv));
       std::string name;
@@ -306,7 +318,7 @@ int main(int argc, char** argv) {
 
     std::vector<Result> results;
     const auto report = [&](const Result& r) {
-      std::cerr << "    " << std::left << std::setw(17) << r.name << std::right
+      std::cerr << "    " << std::left << std::setw(20) << r.name << std::right
                 << std::fixed << std::setprecision(1) << " build "
                 << std::setw(8) << r.build_ms << " ms, load " << std::setw(7)
                 << r.load_ms << " ms | wall " << std::setw(9) << r.wall_ms
@@ -427,11 +439,14 @@ int main(int argc, char** argv) {
     // The suffix array is not needed by powered; free it before loading it.
     std::vector<SAType>().swap(suffix_array);
 
-    // ---------- powered ----------
+    // ---------- powered-escape, powered-pt16-escape ----------
+    // One index for both; each parse has its own (unused) counters, so the
+    // parsers are safe to share between threads.
+    const bool any_powered =
+        wanted("powered-escape") || wanted("powered-pt16-escape");
 #ifdef WITH_POWERED
-    if (wanted("powered") && !args.powered_index.empty()) {
-      Result r;
-      r.name = "powered";
+    if (any_powered && !args.powered_index.empty()) {
+      using Parse = PoweredPT16Parser<bbwt::non_rle<>>;
       const std::string path = args.powered_index;
       const std::size_t dot = path.find_last_of('.');
       const std::string data_file =
@@ -443,29 +458,54 @@ int main(int argc, char** argv) {
         }
       }
       std::unique_ptr<bbwt::non_rle<>> index;
-      r.load_ms = time_ms([&] { index = std::make_unique<bbwt::non_rle<>>(path); });
+      const double index_ms =
+          time_ms([&] { index = std::make_unique<bbwt::non_rle<>>(path); });
       std::uint64_t data_bytes = 0;
       {
         std::ifstream header(path, std::ios::binary);
         header.read(reinterpret_cast<char*>(&data_bytes), sizeof(data_bytes));
       }
-      r.own_bytes = sizeof(bbwt::non_rle<>) + data_bytes +
-                    257 * sizeof(std::uint64_t) +
-                    index->gca_.size() * sizeof(std::uint64_t) +
-                    fs::file_size(data_file);
-      r.needed_bytes = r.own_bytes;
-      run_parallel(inputs, args.threads, [&](const std::vector<Symbol>& input) {
-        std::vector<std::tuple<std::uint64_t, std::uint64_t>> phrases;
-        const std::string_view view(reinterpret_cast<const char*>(input.data()),
-                                    input.size());
-        index->parse_tuples(view, phrases, 4);
-        return phrases;
-      }, r);
-      report(r);
+      const std::size_t index_bytes =
+          sizeof(bbwt::non_rle<>) + data_bytes + 257 * sizeof(std::uint64_t) +
+          index->gca_.size() * sizeof(std::uint64_t) + fs::file_size(data_file);
+
+      const auto run_powered = [&](const std::string& name,
+                                   const PT16PoweredTable* table, Result& r) {
+        r.name = name;
+        const Parse parser(*index, table, &reference);
+        r.needed_bytes = r.own_bytes + n;  // + the reference (the escape)
+        run_parallel(inputs, args.threads, [&](const std::vector<Symbol>& input) {
+          std::vector<std::tuple<std::uint64_t, std::uint64_t>> phrases;
+          const std::string_view view(reinterpret_cast<const char*>(input.data()),
+                                      input.size());
+          Parse::Stats stats;
+          parser.parse(view, phrases, stats);
+          return phrases;
+        }, r);
+        report(r);
+      };
+
+      if (wanted("powered-escape")) {
+        Result r;
+        r.load_ms = index_ms;
+        r.own_bytes = index_bytes;
+        run_powered("powered-escape", nullptr, r);
+      }
+      if (wanted("powered-pt16-escape")) {
+        Result r;
+        std::unique_ptr<PT16PoweredTable> table;
+        r.build_ms = time_ms([&] {
+          table = std::make_unique<PT16PoweredTable>(
+              PT16PoweredTable::build(reference, index->gca_, nullptr));
+        });
+        r.own_bytes = index_bytes + table->bytes();
+        run_powered("powered-pt16-escape", table.get(), r);
+      }
     }
 #endif
-    if (wanted("powered") && args.powered_index.empty()) {
-      std::cerr << "    (powered: not run; give --powered-index"
+    if (any_powered && args.powered_index.empty()) {
+      std::cerr << "    (powered-escape, powered-pt16-escape: not run; give "
+                   "--powered-index"
 #ifndef WITH_POWERED
                    " and build with -DWITH_POWERED"
 #endif
@@ -479,10 +519,10 @@ int main(int argc, char** argv) {
               << " available threads, "
               << inputs.files.size() << " files, " << mb(inputs.total_bytes)
               << " MB)\n"
-              << "    parser              wall ms   vs first      MB/s   parallel"
+              << "    parser                 wall ms   vs first      MB/s   parallel"
                  "      phrases    own MB  needs MB\n";
     for (const Result& r : results) {
-      std::cerr << "    " << std::left << std::setw(17) << r.name << std::right
+      std::cerr << "    " << std::left << std::setw(20) << r.name << std::right
                 << std::fixed << std::setprecision(1) << std::setw(10)
                 << r.wall_ms << std::setprecision(2) << std::setw(10)
                 << (r.wall_ms == 0.0 ? 0.0 : base_wall / r.wall_ms)

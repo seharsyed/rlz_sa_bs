@@ -10,9 +10,15 @@
 //   pt16      the original PT16 table (pt16_build.hpp, pt16_rlz.hpp)
 //   pt16-v2   the v2 table (pt16_build_v2.hpp, pt16_rlz_v2.hpp)
 //   sassy     the self-contained sassy table (variants/pt16_*sassy*.hpp)
-//   powered   powered backward search in an FM-index (../powered_rlz), only
-//             when built with -DWITH_POWERED (x86-64, GCC) and given
-//             --powered-index
+//   powered-escape       powered backward search in an FM-index
+//             (../powered_rlz), with escape on singleton: once the interval is
+//             a single row, the phrase is extended by comparing characters
+//             with the reference (powered/powered_pt16_parse.hpp)
+//   powered-pt16-escape  the same with the powered PT16 table (sassy layout,
+//             powered/pt16_powered.hpp, built from the index) at every phrase
+//             start
+//             Both only when built with -DWITH_POWERED (x86-64, GCC) and given
+//             --powered-index.
 //
 // What is timed, for every parser alike: parsing one input that is already in
 // memory into an in-memory list of phrases. Not timed: loading inputs, building
@@ -23,6 +29,8 @@
 // must also give the baseline's phrase count (they compute the same greedy
 // left-to-right parse). powered parses right to left (longest suffix of the
 // remaining prefix), so its phrases may differ; its count is reported.
+// (powered's own phrase count equals the greedy left-to-right count; the
+// powered variants give powered's phrase lengths.)
 //
 // Inputs and reference should be plain ACGT (powered maps any other byte to
 // one of A/C/G/T); non-ACGT bytes are reported.
@@ -82,6 +90,8 @@ namespace pt16_v1 {
 
 #ifdef WITH_POWERED
 #include "../powered_rlz/include/types.hpp"  // bbwt::non_rle
+#include "powered/powered_pt16_parse.hpp"   // PoweredPT16Parser
+#include "powered/pt16_powered.hpp"         // PT16PoweredTable
 #endif
 
 using Symbol = unsigned char;
@@ -401,15 +411,14 @@ struct SassyParser : Parser {
 };
 
 #ifdef WITH_POWERED
-// powered_rlz's parser (right to left, phrases (length, position) into the
-// cyclic reference, kept last-to-first). Its index is built beforehand with
-// powered_rlz's tools; here it is only loaded.
-struct PoweredParser : Parser {
+// The powered index, loaded once and shared by the powered parsers.
+struct PoweredIndex {
   std::unique_ptr<bbwt::non_rle<>> index;
-  std::vector<std::tuple<std::uint64_t, std::uint64_t>> result;
-  static constexpr std::uint8_t code_size = 4;  // the powered index
+  double load_ms = 0.0;
+  std::size_t own_bytes = 0;
+  std::size_t reserved_bytes = 0;
 
-  explicit PoweredParser(const std::string& path) {
+  explicit PoweredIndex(const std::string& path) {
     // powered_rlz's loader only prints " -> Failed" and exits on a missing
     // file, so check both files first and name them.
     const std::size_t dot = path.find_last_of('.');
@@ -444,12 +453,45 @@ struct PoweredParser : Parser {
         index->bytes() + index->gca_.size() * sizeof(std::uint64_t);
     reserved_bytes = allocated > own_bytes ? allocated - own_bytes : 0;
   }
-  std::string name() const override { return "powered"; }
+};
+
+// powered's parse with escape on singleton, optionally with the powered PT16
+// table (powered/powered_pt16_parse.hpp): right to left, phrases (length,
+// position) into the cyclic reference, kept last-to-first. The index is built
+// beforehand with powered_rlz's tools; the table is built here from it.
+struct PoweredParser : Parser {
+  using Parse = PoweredPT16Parser<bbwt::non_rle<>>;
+  std::unique_ptr<PT16PoweredTable> table;
+  std::unique_ptr<Parse> parser;
+  std::vector<std::tuple<std::uint64_t, std::uint64_t>> result;
+  bool with_table;
+
+  PoweredParser(const PoweredIndex& powered, const std::vector<Symbol>& ref,
+                const bool use_table)
+      : with_table(use_table) {
+    own_bytes = powered.own_bytes;
+    reserved_bytes = powered.reserved_bytes;
+    needs_reference = true;  // the escape compares characters
+    if (with_table) {
+      build_ms = time_ms([&] {
+        table = std::make_unique<PT16PoweredTable>(
+            PT16PoweredTable::build(ref, powered.index->gca_, nullptr));
+      });
+      own_bytes += table->bytes();
+    } else {
+      load_ms = powered.load_ms;
+    }
+    parser = std::make_unique<Parse>(*powered.index, table.get(), &ref);
+  }
+  std::string name() const override {
+    return with_table ? "powered-pt16-escape" : "powered-escape";
+  }
   bool left_to_right() const override { return false; }
   void parse(const std::vector<Symbol>& input) override {
     const std::string_view view(reinterpret_cast<const char*>(input.data()),
                                 input.size());
-    index->parse_tuples(view, result, code_size);
+    Parse::Stats stats;
+    parser->parse(view, result, stats);
   }
   void release() override {
     std::remove_reference_t<decltype(result)>().swap(result);
@@ -542,13 +584,18 @@ int main(int argc, char** argv) {
     parsers.push_back(std::make_unique<SassyParser>(reference, suffix_array,
                                                     args.table + ".sassy"));
 #ifdef WITH_POWERED
+    std::unique_ptr<PoweredIndex> powered;
     if (!args.powered_index.empty()) {
-      parsers.push_back(std::make_unique<PoweredParser>(args.powered_index));
+      powered = std::make_unique<PoweredIndex>(args.powered_index);
+      parsers.push_back(
+          std::make_unique<PoweredParser>(*powered, reference, false));
+      parsers.push_back(
+          std::make_unique<PoweredParser>(*powered, reference, true));
     }
 #endif
 
     for (const auto& parser : parsers) {
-      std::cerr << "    " << std::left << std::setw(17) << parser->name()
+      std::cerr << "    " << std::left << std::setw(20) << parser->name()
                 << std::right << " build " << std::fixed << std::setprecision(1)
                 << std::setw(9) << parser->build_ms << " ms, load "
                 << std::setw(8) << parser->load_ms << " ms, own "
@@ -569,7 +616,8 @@ int main(int argc, char** argv) {
                 << '\n';
     }
     if (args.powered_index.empty()) {
-      std::cerr << "    (powered: not run; give --powered-index"
+      std::cerr << "    (powered-escape, powered-pt16-escape: not run; give "
+                   "--powered-index"
 #ifndef WITH_POWERED
                    " and build with -DWITH_POWERED"
 #endif
@@ -635,7 +683,7 @@ int main(int argc, char** argv) {
         }
         const bool count_ok = !parser.left_to_right() || phrases == baseline_phrases;
 
-        out << "    " << std::left << std::setw(17) << parser.name()
+        out << "    " << std::left << std::setw(20) << parser.name()
             << std::right << std::fixed << std::setprecision(2) << std::setw(10)
             << ms << " ms";
         if (k > 0) {
@@ -673,7 +721,7 @@ int main(int argc, char** argv) {
 
     std::cerr << std::fixed << std::setprecision(2) << "[6] totals over "
               << files.size() << " files (" << total_bytes << " bytes)\n"
-              << "    parser              build ms    load ms    parse ms  speedup"
+              << "    parser                 build ms    load ms    parse ms  speedup"
                  "      phrases  decoded  count        own MB  needs MB\n";
     bool all_ok = true;
     for (std::size_t k = 0; k < parsers.size(); ++k) {
@@ -681,7 +729,7 @@ int main(int argc, char** argv) {
       const Totals& t = totals[k];
       const bool ok = t.files_ok == files.size() && t.count_mismatches == 0;
       all_ok = all_ok && ok;
-      std::cerr << "    " << std::left << std::setw(17) << parser.name()
+      std::cerr << "    " << std::left << std::setw(20) << parser.name()
                 << std::right << std::setw(11) << parser.build_ms
                 << std::setw(11) << parser.load_ms << std::setw(12)
                 << t.parse_ms << std::setw(9)
