@@ -102,7 +102,8 @@ namespace {
 // ---------- Arguments ----------
 
 const std::vector<std::string> kAllParsers = {
-    "sa-binary-search", "lrf-ms", "pt16", "pt16-v2", "sassy", "varki",
+    "sa-binary-search", "lrf-ms", "pt16", "pt16-v2", "sassy", "pt16-mlr",
+    "pt16-v2-mlr", "sassy-mlr", "varki",
     "powered-escape", "powered-pt16-escape", "powered-fwd-escape",
     "powered-pt16-fwd-escape"};
 
@@ -135,7 +136,8 @@ void print_usage(const char* program) {
                "  [--per-file PATH]       CSV: every file's parse time, per parser and\n"
                "                          thread count\n"
                "  [--parsers a,b,...]     subset of: sa-binary-search, lrf-ms, "
-               "pt16, pt16-v2, sassy, varki, powered-escape, powered-pt16-escape,\n"
+               "pt16, pt16-v2, sassy, pt16-mlr, pt16-v2-mlr, sassy-mlr, varki,\n"
+               "                          powered-escape, powered-pt16-escape,\n"
                "                          powered-fwd-escape, powered-pt16-fwd-escape\n"
                "  [--powered-index PATH]  RLZ_powered index (REF_four.bwt)\n"
                "  [--powered-fwd-index PATH]  the same, of the reversed reference "
@@ -425,9 +427,9 @@ int main(int argc, char** argv) {
     }
 
     // ---------- pt16 (original) ----------
-    if (wanted("pt16")) {
+    if (wanted("pt16") || wanted("pt16-mlr")) {
+      const char* base = "pt16";  // and pt16-mlr: the same table, mlr ranges
       Result r;
-      r.name = "pt16";
       const std::string path = args.table;
       std::unique_ptr<pt16_v1::PT16RLZParser<Symbol, SAType>> parser;
       r.build_ms = time_ms([&] {
@@ -440,15 +442,20 @@ int main(int argc, char** argv) {
       });
       r.own_bytes = parser->stats().approx_bytes;
       r.needed_bytes = r.own_bytes + n * sizeof(SAType) + n;
-      run_threads(r, [&](const std::vector<Symbol>& input) {
-        return parser->lzFactorize(input);
-      });
+      for (const bool mlr : {false, true}) {
+        r.name = std::string(base) + (mlr ? "-mlr" : "");
+        if (!wanted(r.name)) continue;
+        parser->set_mlr(mlr);
+        run_threads(r, [&](const std::vector<Symbol>& input) {
+          return parser->lzFactorize(input);
+        });
+      }
     }
 
     // ---------- pt16-v2 ----------
-    if (wanted("pt16-v2")) {
+    if (wanted("pt16-v2") || wanted("pt16-v2-mlr")) {
+      const char* base = "pt16-v2";  // and pt16-v2-mlr
       Result r;
-      r.name = "pt16-v2";
       const std::string path = args.table + ".v2";
       std::unique_ptr<PT16RLZParser<Symbol, SAType>> parser;
       r.build_ms = time_ms([&] {
@@ -461,15 +468,20 @@ int main(int argc, char** argv) {
       });
       r.own_bytes = parser->stats().approx_bytes;
       r.needed_bytes = r.own_bytes + n * sizeof(SAType) + n;
-      run_threads(r, [&](const std::vector<Symbol>& input) {
-        return parser->lzFactorize(input);
-      });
+      for (const bool mlr : {false, true}) {
+        r.name = std::string(base) + (mlr ? "-mlr" : "");
+        if (!wanted(r.name)) continue;
+        parser->set_mlr(mlr);
+        run_threads(r, [&](const std::vector<Symbol>& input) {
+          return parser->lzFactorize(input);
+        });
+      }
     }
 
     // ---------- sassy ----------
-    if (wanted("sassy")) {
+    if (wanted("sassy") || wanted("sassy-mlr")) {
+      const char* base = "sassy";  // and sassy-mlr
       Result r;
-      r.name = "sassy";
       const std::string path = args.table + ".sassy";
       std::unique_ptr<PT16SassyLookup> lookup;
       r.build_ms = time_ms([&] {
@@ -479,9 +491,14 @@ int main(int argc, char** argv) {
       r.load_ms = time_ms([&] { lookup = std::make_unique<PT16SassyLookup>(path); });
       r.own_bytes = lookup->stats().approx_bytes;
       r.needed_bytes = r.own_bytes + n;  // no suffix array
-      run_threads(r, [&](const std::vector<Symbol>& input) {
-        return lookup->lzFactorize(input, reference);
-      });
+      for (const bool mlr : {false, true}) {
+        r.name = std::string(base) + (mlr ? "-mlr" : "");
+        if (!wanted(r.name)) continue;
+        lookup->set_mlr(mlr);
+        run_threads(r, [&](const std::vector<Symbol>& input) {
+          return lookup->lzFactorize(input, reference);
+        });
+      }
     }
 
     // The suffix array is not needed by powered; free it before loading it.

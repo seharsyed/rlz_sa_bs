@@ -126,6 +126,57 @@ inline std::optional<std::int64_t> binarySearchRB(const std::vector<T1>& ref, co
     return {}; // key not found.
 }
 
+// The longest match of text[j, ...) among the suffixes sa[lb..rb] (an
+// inclusive range whose suffixes all share their first `offset` characters
+// with text[j - offset, j)): binary search with the "mlr" acceleration
+// (Manber and Myers). The full LCP with the text beyond `offset` is kept for
+// both boundaries, l and r; every suffix between them shares at least
+// min(l, r) of those characters, so the LCP at the midpoint is computed from
+// there on. The first mismatching character decides the half; when two
+// neighbouring boundaries are left, the longer of their LCPs is the match
+// (the longest match of a text is always with one of its two neighbours in
+// suffix order). Returns (reference position, match length including
+// `offset`). The lengths are those of the one-character-at-a-time narrowing
+// (binarySearchLB/RB); the position may be another occurrence.
+template<typename T1, typename SA>
+inline std::pair<std::size_t, std::size_t> mlrLongestMatch(
+        const std::vector<T1>& ref, const SA& sa, std::size_t lb, std::size_t rb,
+        const std::vector<T1>& text, const std::size_t j, const std::size_t offset) {
+    // The LCP of text[j, ...) and the suffix at sa[idx] beyond `offset`,
+    // knowing that the first `k` of those characters are equal.
+    const auto lcp_from = [&](const std::size_t idx, std::size_t k) {
+        const std::size_t p = static_cast<std::size_t>(sa[idx]) + offset;
+        while (j + k < text.size() && p + k < ref.size() && ref[p + k] == text[j + k]) {
+            ++k;
+        }
+        return k;
+    };
+
+    std::size_t l = lcp_from(lb, 0);
+    std::size_t r = lb == rb ? l : lcp_from(rb, 0);
+
+    while (rb - lb > 1) {
+        const std::size_t m = lb + (rb - lb) / 2;
+        const std::size_t k = lcp_from(m, std::min(l, r));
+        if (j + k == text.size()) {
+            // The whole rest of the text matches: nothing can be longer.
+            return {static_cast<std::size_t>(sa[m]), offset + k};
+        }
+        const std::size_t p = static_cast<std::size_t>(sa[m]) + offset + k;
+        // A suffix that ends here sorts before the text: go right.
+        if (p >= ref.size() || ref[p] < text[j + k]) {
+            lb = m;
+            l = k;
+        } else {
+            rb = m;
+            r = k;
+        }
+    }
+
+    return l >= r ? std::pair<std::size_t, std::size_t>{static_cast<std::size_t>(sa[lb]), offset + l}
+                  : std::pair<std::size_t, std::size_t>{static_cast<std::size_t>(sa[rb]), offset + r};
+}
+
 template<typename T1, typename T2>
 std::tuple<std::size_t, std::size_t> computeLZFactorAt(const std::vector<T1>& input,
                                                        const std::vector<T1>& ref,

@@ -30,8 +30,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 import pandas as pd  # noqa: E402
 
 # The variants in the order of config.sh (fallback: as they appear).
-VARIANT_ORDER = ["sa-binary-search", "lrf-ms", "pt16", "pt16-v2", "sassy", "varki",
-                 "powered-fwd-escape", "powered-pt16-fwd-escape"]
+VARIANT_ORDER = ["sa-binary-search", "lrf-ms", "pt16", "pt16-mlr", "pt16-v2",
+                 "pt16-v2-mlr", "sassy", "sassy-mlr", "varki", "powered-fwd-escape",
+                 "powered-pt16-fwd-escape"]
 
 
 def default_results():

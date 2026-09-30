@@ -182,6 +182,10 @@ class PT16SassyLookup {
 
   const Stats& stats() const { return stats_; }
 
+  // Narrow a range hit with the mlr binary search (rlz::mlrLongestMatch)
+  // instead of one character at a time; the phrase lengths are the same.
+  void set_mlr(const bool on) { mlr_ = on; }
+
   /**
    * Looks up a 16-mer packed as by encode_16mer: 2 bits per character, the
    * first character in the top bits. See the caveat above: this is only for
@@ -392,6 +396,15 @@ class PT16SassyLookup {
       return {match, static_cast<std::uint32_t>(offset)};
     }
 
+    // Range, with the mlr binary search (set_mlr) over the 16-mer's own
+    // occurrences (in suffix order), instead of narrowing them one character
+    // at a time.
+    if (mlr_) {
+      const auto [match, length] = rlz::mlrLongestMatch(
+          reference, hit.positions, 0, hit.positions.size() - 1, text, j, offset);
+      return {static_cast<std::uint32_t>(match), static_cast<std::uint32_t>(length)};
+    }
+
     // Range: narrow among the 16-mer's own occurrences, exactly as the plain
     // RLZ parser narrows [nlb, nrb] within the suffix array, but with
     // hit.positions standing in for it.
@@ -533,6 +546,7 @@ class PT16SassyLookup {
   // hits/misses/singleton_hits/range_hits are updated inside lookup(), which
   // is logically read-only (querying the table does not change it).
   mutable Stats stats_;
+  bool mlr_ = false;  // see set_mlr
 
   // ---------- Decoding an L entry ----------
   //

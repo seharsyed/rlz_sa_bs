@@ -140,6 +140,7 @@ class PT16RLZParser {
   std::unordered_map<std::uint32_t, std::uint32_t> large_offsets_;
 
   mutable Stats stats_;
+  bool mlr_ = false;  // see set_mlr
 
  public:
   PT16RLZParser(const reference_type& ref, const suffix_array_type& sa,
@@ -208,6 +209,15 @@ class PT16RLZParser {
     std::size_t j = input_pos + kmer_length;
     std::size_t nlb = result.sa_start;
     std::size_t nrb = result.sa_end;
+
+    // Range, with the mlr binary search (set_mlr): one search over the
+    // range with the boundaries' LCPs, instead of narrowing it one
+    // character at a time.
+    if (mlr_ && nlb < nrb) {
+      const auto [match, length] =
+          rlz::mlrLongestMatch(*ref_, *sa_, nlb, nrb, input, j, offset);
+      return {match, length};
+    }
 
     // Range case: narrow the SA interval from character 17 onward.
     while (nlb < nrb && j < input.size()) {
@@ -511,6 +521,10 @@ class PT16RLZParser {
   }
 
   const Stats& stats() const { return stats_; }
+
+  // Narrow a range hit with the mlr binary search (rlz::mlrLongestMatch)
+  // instead of one character at a time; the phrase lengths are the same.
+  void set_mlr(const bool on) { mlr_ = on; }
 
   /**
    * Classifies every entry in the table by whether its SA interval has

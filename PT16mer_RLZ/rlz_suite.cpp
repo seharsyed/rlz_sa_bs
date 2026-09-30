@@ -10,6 +10,8 @@
 //   pt16      the original PT16 table (pt16_build.hpp, pt16_rlz.hpp)
 //   pt16-v2   the v2 table (pt16_build_v2.hpp, pt16_rlz_v2.hpp)
 //   sassy     the self-contained sassy table (variants/pt16_*sassy*.hpp)
+//   pt16-mlr, pt16-v2-mlr, sassy-mlr  the same three, with range hits
+//             narrowed by the mlr binary search (rlz::mlrLongestMatch)
 //   powered-escape       powered backward search in an FM-index
 //             (../RLZ_powered), with escape on singleton: once the interval is
 //             a single row, the phrase is extended by comparing characters
@@ -362,9 +364,11 @@ struct LrfMsParser : Parser {
 struct Pt16Parser : Parser {
   std::unique_ptr<pt16_v1::PT16RLZParser<Symbol, SAType>> parser;
   Triples result;
+  bool mlr;  // ranges narrowed by the mlr binary search (pt16-mlr)
 
   Pt16Parser(const std::vector<Symbol>& ref, const std::vector<SAType>& sa,
-             const std::string& path) {
+             const std::string& path, const bool use_mlr = false)
+      : mlr(use_mlr) {
     build_ms = time_ms([&] {
       fs::remove(path);
       pt16_v1::build_pt16_table(ref, sa, path);
@@ -373,11 +377,12 @@ struct Pt16Parser : Parser {
       parser = std::make_unique<pt16_v1::PT16RLZParser<Symbol, SAType>>(ref, sa,
                                                                         path);
     });
+    parser->set_mlr(mlr);
     own_bytes = parser->stats().approx_bytes;
     needs_suffix_array = true;
     needs_reference = true;
   }
-  std::string name() const override { return "pt16"; }
+  std::string name() const override { return mlr ? "pt16-mlr" : "pt16"; }
   void parse(const std::vector<Symbol>& input) override {
     result = parser->lzFactorize(input);
   }
@@ -398,8 +403,11 @@ struct V2Parser : Parser {
   std::unique_ptr<PT16RLZParser<Symbol, SAType>> parser;
   Triples result;
 
+  bool mlr;  // ranges narrowed by the mlr binary search (pt16-v2-mlr)
+
   V2Parser(const std::vector<Symbol>& ref, const std::vector<SAType>& sa,
-           const std::string& path) {
+           const std::string& path, const bool use_mlr = false)
+      : mlr(use_mlr) {
     build_ms = time_ms([&] {
       fs::remove(path);
       build_pt16_table(ref, sa, path);
@@ -407,11 +415,12 @@ struct V2Parser : Parser {
     load_ms = time_ms([&] {
       parser = std::make_unique<PT16RLZParser<Symbol, SAType>>(ref, sa, path);
     });
+    parser->set_mlr(mlr);
     own_bytes = parser->stats().approx_bytes;
     needs_suffix_array = true;
     needs_reference = true;
   }
-  std::string name() const override { return "pt16-v2"; }
+  std::string name() const override { return mlr ? "pt16-v2-mlr" : "pt16-v2"; }
   void parse(const std::vector<Symbol>& input) override {
     result = parser->lzFactorize(input);
   }
@@ -433,18 +442,21 @@ struct SassyParser : Parser {
   std::unique_ptr<PT16SassyLookup> lookup;
   Triples result;
 
+  bool mlr;  // ranges narrowed by the mlr binary search (sassy-mlr)
+
   SassyParser(const std::vector<Symbol>& ref, const std::vector<SAType>& sa,
-              const std::string& path)
-      : reference(ref) {
+              const std::string& path, const bool use_mlr = false)
+      : reference(ref), mlr(use_mlr) {
     build_ms = time_ms([&] {
       fs::remove(path);
       build_pt16_sassy_table(ref, sa, path);
     });
     load_ms = time_ms([&] { lookup = std::make_unique<PT16SassyLookup>(path); });
+    lookup->set_mlr(mlr);
     own_bytes = lookup->stats().approx_bytes;
     needs_reference = true;  // to extend matches; no suffix array
   }
-  std::string name() const override { return "sassy"; }
+  std::string name() const override { return mlr ? "sassy-mlr" : "sassy"; }
   void parse(const std::vector<Symbol>& input) override {
     result = lookup->lzFactorize(input, reference);
   }
@@ -694,6 +706,13 @@ int main(int argc, char** argv) {
         std::make_unique<V2Parser>(reference, suffix_array, args.table + ".v2"));
     parsers.push_back(std::make_unique<SassyParser>(reference, suffix_array,
                                                     args.table + ".sassy"));
+    // The same three with the mlr binary search for range hits.
+    parsers.push_back(std::make_unique<Pt16Parser>(reference, suffix_array,
+                                                   args.table + ".mlr", true));
+    parsers.push_back(std::make_unique<V2Parser>(reference, suffix_array,
+                                                 args.table + ".v2.mlr", true));
+    parsers.push_back(std::make_unique<SassyParser>(reference, suffix_array,
+                                                    args.table + ".sassy.mlr", true));
 #ifdef WITH_VARKI
     parsers.push_back(std::make_unique<VarkiParser>(reference));
 #endif
