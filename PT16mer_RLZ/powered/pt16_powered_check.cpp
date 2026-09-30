@@ -39,7 +39,7 @@
 #include <string_view>
 #include <tuple>
 
-#include "../../powered_rlz/include/types.hpp"  // bbwt::non_rle
+#include "../../RLZ_powered/include/types.hpp"  // bbwt::non_rle
 #include "pt16_powered.hpp"
 
 namespace {
@@ -136,7 +136,7 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<bbwt::non_rle<>> index =
         std::make_unique<bbwt::non_rle<>>(args.index);
-    const auto& gca = index->gca_;
+    const auto& gca = index->sa_;
     std::cerr << "[2] powered index: " << index->size() << " rows\n";
 
     PT16PoweredTable table;

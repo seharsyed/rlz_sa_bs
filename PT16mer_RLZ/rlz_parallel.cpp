@@ -82,7 +82,7 @@ namespace pt16_v1 {
 #include "variants/pt16_sassy.hpp"
 
 #ifdef WITH_POWERED
-#include "../powered_rlz/include/types.hpp"
+#include "../RLZ_powered/include/types.hpp"
 #include "powered/powered_pt16_parse.hpp"  // PoweredPT16Parser
 #include "powered/pt16_powered.hpp"        // PT16PoweredTable
 #endif
@@ -121,7 +121,7 @@ void print_usage(const char* program) {
                "  [--threads T]           threads (default: all hardware threads)\n"
                "  [--parsers a,b,...]     subset of: sa-binary-search, lrf-ms, "
                "pt16, pt16-v2, sassy, powered-escape, powered-pt16-escape\n"
-               "  [--powered-index PATH]  powered_rlz index (REF_four.bwt)\n"
+               "  [--powered-index PATH]  RLZ_powered index (REF_four.bwt)\n"
                "  [--table PATH]          PT16 table files (default: "
                "<reference>.parallel_pt16, .v2, .sassy)\n"
                "  [--max-files N]         only the first N input files\n"
@@ -467,7 +467,7 @@ int main(int argc, char** argv) {
       }
       const std::size_t index_bytes =
           sizeof(bbwt::non_rle<>) + data_bytes + 257 * sizeof(std::uint64_t) +
-          index->gca_.size() * sizeof(std::uint64_t) + fs::file_size(data_file);
+          index->sa_.size() * sizeof(std::uint64_t) + fs::file_size(data_file);
 
       const auto run_powered = [&](const std::string& name,
                                    const PT16PoweredTable* table, Result& r) {
@@ -496,7 +496,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<PT16PoweredTable> table;
         r.build_ms = time_ms([&] {
           table = std::make_unique<PT16PoweredTable>(
-              PT16PoweredTable::build(reference, index->gca_, nullptr));
+              PT16PoweredTable::build(reference, index->sa_, nullptr));
         });
         r.own_bytes = index_bytes + table->bytes();
         run_powered("powered-pt16-escape", table.get(), r);

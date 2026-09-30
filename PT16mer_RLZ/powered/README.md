@@ -1,6 +1,6 @@
 # Powered RLZ in our benchmark
 
-`powered_bench.cpp` runs the parser of `../../powered_rlz` (RLZ by powered
+`powered_bench.cpp` runs the parser of `../../RLZ_powered` (RLZ by powered
 backward search in an FM-index) under our benchmark conventions:
 
 - the powered index is given as an argument and loaded once (timed apart);
@@ -10,9 +10,9 @@ backward search in an FM-index) under our benchmark conventions:
   exactly (powered RLZ parses right to left, so its phrases differ from a
   left-to-right greedy parse; the decode check is what proves it correct).
 
-x86-64 only (the powered_rlz headers use x86 intrinsics), built with GCC.
+x86-64 only (the RLZ_powered headers use x86 intrinsics), built with GCC.
 
-## 1. Build powered_rlz's tools and the index (once per reference)
+## 1. Build RLZ_powered's tools and the index (once per reference)
 
 The index needs the reference's extended BWT and its GCA (the cyclic
 rotation order), made with [PFP-eBWT](https://github.com/davidecenzato/PFP-eBWT):
@@ -20,18 +20,21 @@ rotation order), made with [PFP-eBWT](https://github.com/davidecenzato/PFP-eBWT)
 ```
 pfpebwt --GCA REF                      # writes REF.ebwt and REF.gca (and more)
 
-cd powered_rlz
+cd RLZ_powered
 make
-./make_bwt --rle -i REF.ebwt -sa REF.gca -o REF.bwt        # run again if it reports 0 dense blocks
-./transform -b -i REF.bwt -sa REF.gca -o REF_four.txt      # writes REF_four.bwt: the powered index
+./make_bwt -i REF.ebwt -sa REF.gca -o REF_four.bwt   # the powered index (+ REF_four_data.bwt)
+./make_bwt -i REF.ebwt -sa REF.gca -o REF_four.bwt   # again: the first run rebuilt the tools
 ```
+
+Run it a third time if it reports 0 dense blocks. `prepare_reference.sh REF
+[OUTDIR]` does all of this (and checks the eBWT length).
 
 The reference and the inputs must be plain ACGT: no `N`, no newline
 (powered RLZ maps any other byte to one of A/C/G/T).
 
 ## 2. Build and run the benchmark
 
-From `PT16mer_RLZ/`. The block sizes must match the ones powered_rlz was
+From `PT16mer_RLZ/`. The block sizes must match the ones RLZ_powered was
 built with (its Makefile's defaults):
 
 ```
@@ -73,11 +76,11 @@ A lookup of the 16-mer ending at a phrase start:
   entry, or precomputed for an empty bucket): no backward search at all.
 
 A singleton hit, and a miss next to a singleton, read one L entry and nothing
-else (no row array, no `gca_`).
+else (no row array, no `sa_`).
 
 It is built from the reference and the powered index (`REF_four.bwt`), not
 from a suffix array: the index's rows are the sorted rotations of the cyclic
-reference and `gca_[row]` is each rotation's start. Every row has a full
+reference and `sa_[row]` is each rotation's start. Every row has a full
 (cyclic) 16-mer, so every occurrence of any string ends some table 16-mer
 (no short-suffix records are needed).
 
@@ -115,7 +118,7 @@ optional table and an optional reference:
 
 The phrase lengths are identical to powered's; a phrase may point at another
 occurrence, so each variant is also checked by decoding. powered's C array is
-private, so it is rebuilt from `count()` at load; `powered_rlz` is unchanged.
+private, so it is rebuilt from `count()` at load; `RLZ_powered` is unchanged.
 
 ```
 ./powered_bench --index REF_four.bwt --reference REF --filenames LIST \

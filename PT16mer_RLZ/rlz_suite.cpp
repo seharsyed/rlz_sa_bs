@@ -11,7 +11,7 @@
 //   pt16-v2   the v2 table (pt16_build_v2.hpp, pt16_rlz_v2.hpp)
 //   sassy     the self-contained sassy table (variants/pt16_*sassy*.hpp)
 //   powered-escape       powered backward search in an FM-index
-//             (../powered_rlz), with escape on singleton: once the interval is
+//             (../RLZ_powered), with escape on singleton: once the interval is
 //             a single row, the phrase is extended by comparing characters
 //             with the reference (powered/powered_pt16_parse.hpp)
 //   powered-pt16-escape  the same with the powered PT16 table (sassy layout,
@@ -38,7 +38,7 @@
 // Build (from PT16mer_RLZ/):
 //   without powered (any platform):
 //     g++ -std=c++20 -O3 rlz_suite.cpp -o rlz_suite
-//   with powered (x86-64, GCC; block sizes as powered_rlz was built with):
+//   with powered (x86-64, GCC; block sizes as RLZ_powered was built with):
 //     g++ -std=c++2a -O3 -march=native -DNDEBUG -DWITH_POWERED \
 //         -DSMALL_BLOCK_SIZE=256 -DLARGE_BLOCK_SIZE=16384 rlz_suite.cpp -o rlz_suite
 //
@@ -89,7 +89,7 @@ namespace pt16_v1 {
 #include "variants/pt16_sassy.hpp"
 
 #ifdef WITH_POWERED
-#include "../powered_rlz/include/types.hpp"  // bbwt::non_rle
+#include "../RLZ_powered/include/types.hpp"  // bbwt::non_rle
 #include "powered/powered_pt16_parse.hpp"   // PoweredPT16Parser
 #include "powered/pt16_powered.hpp"         // PT16PoweredTable
 #endif
@@ -107,7 +107,7 @@ struct SuiteArgs {
   std::string suffix_array;
   std::string filenames;
   std::string table;          // PT16 table files; default beside the reference
-  std::string powered_index;  // powered_rlz index (.bwt from transform -b)
+  std::string powered_index;  // RLZ_powered index (.bwt from make_bwt)
   std::string results;        // optional CSV
   std::size_t max_files = 0;
   bool quiet = false;
@@ -123,7 +123,7 @@ std::string require_value(int& i, int argc, char** argv) {
 void print_usage(const char* program) {
   std::cout << "Usage: " << program
             << " --reference PATH --suffix-array PATH --filenames PATH\n"
-               "  [--powered-index PATH]  powered_rlz index (REF_four.bwt)"
+               "  [--powered-index PATH]  RLZ_powered index (REF_four.bwt)"
 #ifndef WITH_POWERED
                " -- this build has no powered support"
 #endif
@@ -228,7 +228,7 @@ struct Parser {
   // Parses `input` (the only timed part, see parse_timed), keeping the result.
   virtual void parse(const std::vector<Symbol>& input) = 0;
   // Frees the previous result, so that every parser starts from an empty
-  // phrase list (as powered_rlz's own rlz_parser does per file) and no
+  // phrase list (as RLZ_powered's own rlz_parser does per file) and no
   // parser's timing includes freeing the previous file's result.
   virtual void release() = 0;
   virtual std::size_t phrase_count() const = 0;
@@ -419,7 +419,7 @@ struct PoweredIndex {
   std::size_t reserved_bytes = 0;
 
   explicit PoweredIndex(const std::string& path) {
-    // powered_rlz's loader only prints " -> Failed" and exits on a missing
+    // RLZ_powered's loader only prints " -> Failed" and exits on a missing
     // file, so check both files first and name them.
     const std::size_t dot = path.find_last_of('.');
     const std::string data_file =
@@ -447,10 +447,10 @@ struct PoweredIndex {
     }
     own_bytes = sizeof(bbwt::non_rle<>) + data_bytes +
                 257 * sizeof(std::uint64_t) +
-                index->gca_.size() * sizeof(std::uint64_t) +
+                index->sa_.size() * sizeof(std::uint64_t) +
                 fs::file_size(data_file);
     const std::size_t allocated =
-        index->bytes() + index->gca_.size() * sizeof(std::uint64_t);
+        index->bytes() + index->sa_.size() * sizeof(std::uint64_t);
     reserved_bytes = allocated > own_bytes ? allocated - own_bytes : 0;
   }
 };
@@ -458,7 +458,7 @@ struct PoweredIndex {
 // powered's parse with escape on singleton, optionally with the powered PT16
 // table (powered/powered_pt16_parse.hpp): right to left, phrases (length,
 // position) into the cyclic reference, kept last-to-first. The index is built
-// beforehand with powered_rlz's tools; the table is built here from it.
+// beforehand with RLZ_powered's tools; the table is built here from it.
 struct PoweredParser : Parser {
   using Parse = PoweredPT16Parser<bbwt::non_rle<>>;
   std::unique_ptr<PT16PoweredTable> table;
@@ -475,7 +475,7 @@ struct PoweredParser : Parser {
     if (with_table) {
       build_ms = time_ms([&] {
         table = std::make_unique<PT16PoweredTable>(
-            PT16PoweredTable::build(ref, powered.index->gca_, nullptr));
+            PT16PoweredTable::build(ref, powered.index->sa_, nullptr));
       });
       own_bytes += table->bytes();
     } else {

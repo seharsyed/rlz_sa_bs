@@ -56,7 +56,7 @@ select_dataset() {
 # home directory shared between machines, one binary would be rebuilt by each
 # machine in turn (and -march=native code may not run on another CPU). It is
 # (re)built when missing or older than PROGRAM.cpp or any header here or in
-# ../powered_rlz/include -- with powered on x86-64, without elsewhere. A failed
+# ../RLZ_powered/include -- with powered on x86-64, without elsewhere. A failed
 # build stops the calling script. Two runs started at once on one machine can
 # still race on a rebuild: start the second after the first has built.
 build_if_needed() {
@@ -66,7 +66,7 @@ build_if_needed() {
   if [ ! -x "$BINARY" ]; then
     newer="(no binary for this machine)"
   else
-    newer=$(find . ../powered_rlz/include \( -name '*.hpp' -o -name "$program.cpp" \) \
+    newer=$(find . ../RLZ_powered/include \( -name '*.hpp' -o -name "$program.cpp" \) \
               -newer "$BINARY" 2>/dev/null | head -1)
     [ -n "$newer" ] && echo "($newer changed since $BINARY was built)" >&2
   fi

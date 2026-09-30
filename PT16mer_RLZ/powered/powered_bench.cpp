@@ -1,10 +1,10 @@
-// Powered RLZ (../../powered_rlz) inside our benchmark conventions: a first,
+// Powered RLZ (../../RLZ_powered) inside our benchmark conventions: a first,
 // single-threaded experiment.
 //
-// Differences from powered_rlz's own rlz_parser, which reads its file list
+// Differences from RLZ_powered's own rlz_parser, which reads its file list
 // and every input itself and times that too:
 //
-//   - the powered index (the .bwt written by powered_rlz's `transform -b`)
+//   - the powered index (the .bwt written by RLZ_powered's `make_bwt`)
 //     is given as an argument and loaded once (timed on its own);
 //   - the input list is our usual one, and each input is loaded with our
 //     loader, untimed -- only the parse itself is timed, as in our other
@@ -22,8 +22,8 @@
 // powered RLZ maps any other byte to one of A/C/G/T. Inputs with other
 // bytes are reported.
 //
-// Build (x86-64 only: the powered_rlz headers use x86 intrinsics). The
-// block sizes must be the ones powered_rlz's make_bwt / transform were
+// Build (x86-64 only: the RLZ_powered headers use x86 intrinsics). The
+// block sizes must be the ones RLZ_powered's make_bwt was
 // built with (its Makefile's defaults are below):
 //
 //   g++ -std=c++2a -O3 -march=native -DNDEBUG \
@@ -61,7 +61,7 @@
 #include <tuple>
 #include <vector>
 
-#include "../../powered_rlz/include/types.hpp"  // bbwt::non_rle
+#include "../../RLZ_powered/include/types.hpp"  // bbwt::non_rle
 #include "../pt16_utils.hpp"                    // loaders, time_ms
 #include "powered_pt16_parse.hpp"
 #include "pt16_powered.hpp"
@@ -72,7 +72,7 @@ using Phrase = std::tuple<std::uint64_t, std::uint64_t>;  // (length, position)
 namespace {
 
 struct PoweredArgs {
-  std::string index;       // powered_rlz index (.bwt from `transform -b`)
+  std::string index;       // RLZ_powered index (.bwt from make_bwt)
   std::string reference;   // the plain reference, for the decode check
   std::string filenames;   // our input list
   std::string results;     // optional CSV
@@ -150,7 +150,7 @@ PoweredArgs parse_powered_args(int argc, char** argv) {
 }
 
 // Rebuilds the input from the phrases (kept right to left, as the parser
-// produces them) against the cyclic reference, as powered_rlz's
+// produces them) against the cyclic reference, as RLZ_powered's
 // decompress does, and compares it with `input`. Returns the first
 // differing position, or input.size() if they are equal.
 std::size_t decode_check(const std::vector<Phrase>& phrases,
@@ -238,7 +238,7 @@ int main(int argc, char** argv) {
         std::cerr << "    PT16 table loaded in " << table_ms << " ms: ";
       } else {
         table_ms = time_ms([&] {
-          *table = PT16PoweredTable::build(reference, index->gca_, nullptr);
+          *table = PT16PoweredTable::build(reference, index->sa_, nullptr);
         });
         std::cerr << "    PT16 table built in " << table_ms << " ms: ";
       }

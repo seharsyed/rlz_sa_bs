@@ -1,6 +1,6 @@
 #pragma once
 
-// powered_rlz's parse_tuples (code size 4), with a PT16 lookup
+// RLZ_powered's parse_tuples (code size 4), with a PT16 lookup
 // (pt16_powered.hpp) at every phrase start.
 //
 // powered parses right to left: a phrase starts at its right end i, with the
@@ -33,7 +33,7 @@
 // exactly at the start of the input; this parse does not.
 //
 // Otherwise it follows parse_tuples. It uses only public members of the
-// index (rank, largest_extension, gca_, count); powered's C array
+// index (rank, largest_extension, sa_, count); powered's C array
 // (char_counts_, private) is rebuilt once from count().
 
 #include <array>
@@ -90,7 +90,7 @@ class PoweredPT16Parser {
       return static_cast<std::uint8_t>((ch > 'A') + (ch > 'C') + (ch > 'G'));
     };
     const auto* text = reinterpret_cast<const unsigned char*>(seq.data());
-    const auto& gca = index_.gca_;
+    const auto& gca = index_.sa_;
     const std::uint64_t size = index_.size();
 
     std::uint8_t c = 0;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prepares the powered index of one cleaned reference for the RLZ suite
 # (rlz_suite): REF_four.bwt (+ REF_four_data.bwt), via
-# PFP-eBWT -> make_bwt --rle -> transform -b.
+# PFP-eBWT -> make_bwt (RLZ_powered's; it builds the powered index directly).
 #
 # The suffix array the other parsers need (REF.sa) is not made here: use the
 # one you already have. The PT16 tables and lrf-ms's structures are built by
@@ -29,7 +29,7 @@ fi
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=${REPO:-$(cd "$HERE/../.." && pwd)}
 PFP=${PFP:-$HOME/proj/ebwt/PFP-eBWT/build}
-POWERED=$REPO/powered_rlz
+POWERED=$REPO/RLZ_powered
 
 SRC=$(realpath "$1")
 OUTDIR=$(realpath "${2:-$(dirname "$SRC")}")
@@ -58,7 +58,7 @@ if [ -s "$REF.fa" ]; then
   echo "    exists"
 else
   # header, the sequence, a newline ending it, then an empty second record
-  # (the format of powered_rlz's example)
+  # (the format of RLZ_powered's example)
   { echo ">reference"; cat "$SRC"; echo; echo ">empty"; } > "$REF.fa"
   echo "    written"
 fi
@@ -77,9 +77,10 @@ echo "    eBWT length $LEN (reference $N)"
 [ "$LEN" -eq "$N" ] || { echo "ERROR: eBWT length differs from the reference" >&2; exit 1; }
 
 # ---------- 3. powered index ----------
-# make_bwt --rle regenerates powered_rlz's alphabet header for this eBWT and
+# make_bwt regenerates RLZ_powered's alphabet header for this eBWT and
 # rebuilds the tools, but builds the index with the binary that was already
-# running; so it is run twice (the second run uses the rebuilt tools).
+# running; so it is run twice (the second run uses the rebuilt tools), and a
+# third time if it still reports 0 dense blocks (RLZ_powered's README).
 
 step "3. powered index ${REF}_four.bwt"
 if [ -s "${REF}_four.bwt" ] && [ -s "${REF}_four_data.bwt" ]; then
@@ -87,14 +88,13 @@ if [ -s "${REF}_four.bwt" ] && [ -s "${REF}_four_data.bwt" ]; then
 else
   cd "$POWERED"
   make
-  ./make_bwt --rle -i "$REF.fa.ebwt" -sa "$REF.fa.gca" -o "$REF.bwt" > /dev/null
-  OUT=$(./make_bwt --rle -i "$REF.fa.ebwt" -sa "$REF.fa.gca" -o "$REF.bwt" 2>&1)
-  echo "$OUT" | grep "dense blocks" | sed 's/^/    /'
+  ./make_bwt -i "$REF.fa.ebwt" -sa "$REF.fa.gca" -o "${REF}_four.bwt" > /dev/null 2>&1
+  OUT=$(./make_bwt -i "$REF.fa.ebwt" -sa "$REF.fa.gca" -o "${REF}_four.bwt" 2>&1)
+  echo "$OUT" | grep "dense blocks\|took" | sed 's/^/    /'
   if echo "$OUT" | grep -q " 0 dense blocks"; then
-    ./make_bwt --rle -i "$REF.fa.ebwt" -sa "$REF.fa.gca" -o "$REF.bwt" 2>&1 \
+    ./make_bwt -i "$REF.fa.ebwt" -sa "$REF.fa.gca" -o "${REF}_four.bwt" 2>&1 \
       | grep "dense blocks" | sed 's/^/    third run: /'
   fi
-  ./transform -b -i "$REF.bwt" -sa "$REF.fa.gca" -o "${REF}_four.txt" | tail -1
 fi
 
 # ---------- Done ----------

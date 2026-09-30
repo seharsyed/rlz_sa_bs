@@ -1,6 +1,6 @@
 #pragma once
 
-// A PT16 table for powered_rlz's backward search, in the sassy layout
+// A PT16 table for RLZ_powered's backward search, in the sassy layout
 // (variants/pt16_sassy.hpp, variants/pt16_build_sassy.hpp), mirrored for a
 // parse that runs right to left.
 //
@@ -24,11 +24,11 @@
 //         reference position of it (from that entry, or precomputed for an
 //         empty bucket). No backward search at all.
 // A singleton hit and a miss on a singleton neighbour read one L entry and
-// nothing else: no row array, no gca_.
+// nothing else: no row array, no sa_.
 //
 // Built from the reference and the powered index itself (REF_four.bwt), not
 // from a suffix array: the index's rows are the rotations of the cyclic
-// reference in sorted order and gca_[row] is the start of the rotation at
+// reference in sorted order and sa_[row] is the start of the rotation at
 // that row. Every row has a full cyclic 16-mer, so every occurrence of any
 // string ends a table 16-mer -- there are no short suffixes (sassy's short
 // suffix records have no counterpart here).

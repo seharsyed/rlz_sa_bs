@@ -1,10 +1,10 @@
 // Builds the powered PT16 table (pt16_powered.hpp: keyed by the 16-mer read
 // from its right end, for powered's backward search) from a reference and its
-// powered_rlz index -- the same REF_four.bwt (+ REF_four_data.bwt) the
+// RLZ_powered index -- the same REF_four.bwt (+ REF_four_data.bwt) the
 // parsing programs take. No suffix array: the rows and their rotation
 // starts come from the index itself.
 //
-// Build (x86-64, GCC; block sizes as for powered_rlz's tools), from
+// Build (x86-64, GCC; block sizes as for RLZ_powered's tools), from
 // PT16mer_RLZ/:
 //
 //   g++ -std=c++2a -O3 -march=native -DNDEBUG \
@@ -25,7 +25,7 @@
 #include <memory>
 #include <string>
 
-#include "../../powered_rlz/include/types.hpp"  // bbwt::non_rle
+#include "../../RLZ_powered/include/types.hpp"  // bbwt::non_rle
 #include "pt16_powered.hpp"
 
 namespace {
@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
     PT16PoweredTable table;
     PoweredTableStats stats;
     const double build_ms = time_ms([&] {
-      table = PT16PoweredTable::build(reference, index->gca_, &stats);
+      table = PT16PoweredTable::build(reference, index->sa_, &stats);
     });
 
     const double write_ms = time_ms([&] { table.write(args.output); });
