@@ -49,7 +49,10 @@ PFP=${PFP:-$TOOLS/PFP-eBWT/build}
 DATASETS=${DATASETS:-"ecoli chr19 yeast"}
 
 # The parsers that are compared (all give the same greedy left-to-right parse).
-VARIANTS=${VARIANTS:-"sa-binary-search lrf-ms pt16 pt16-v2 sassy varki powered-fwd-escape powered-pt16-fwd-escape"}
+# The three PT16 tables on the suffix-array side narrow their range hits with
+# the mlr binary search (pt16-mlr, pt16-v2-mlr, sassy-mlr); the versions that
+# narrow one character at a time (pt16, pt16-v2, sassy) are still available.
+VARIANTS=${VARIANTS:-"sa-binary-search lrf-ms pt16-mlr pt16-v2-mlr sassy-mlr varki powered-fwd-escape powered-pt16-fwd-escape"}
 
 # verify.sh: check only the first N input files of each dataset (empty: all).
 VERIFY_FILES=${VERIFY_FILES:-}

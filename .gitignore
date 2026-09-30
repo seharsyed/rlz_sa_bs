@@ -30,5 +30,6 @@ PT16mer_RLZ/pt16_powered_build
 PT16mer_RLZ/pt16_powered_check
 PT16mer_RLZ/.*.built-on
 PT16mer_RLZ/varki_rlz.*.o
+PT16mer_RLZ/*.sources
 PT16mer_RLZ/pipeline/local.sh
 PT16mer_RLZ/results/

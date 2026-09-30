@@ -59,7 +59,7 @@ select_dataset() {
 # Each machine gets its own binary, PROGRAM.<hostname> (set in BINARY): with a
 # home directory shared between machines, one binary would be rebuilt by each
 # machine in turn (and -march=native code may not run on another CPU). It is
-# (re)built when missing or older than PROGRAM.cpp or any header here or in
+# (re)built when missing or when the contents of PROGRAM.cpp or any header here or in
 # ../RLZ_powered/include or ../RLZ-Varki -- with powered on x86-64, without
 # elsewhere, and with varki when sdsl-lite is built for it
 # (varki/build_sdsl.sh: ../RLZ-Varki/build/sdsl/lib/libsdsl.a). A failed
@@ -68,16 +68,21 @@ select_dataset() {
 build_if_needed() {
   local program=$1
   BINARY="$program.$(hostname -s)"
-  local newer=""
-  if [ ! -x "$BINARY" ]; then
-    newer="(no binary for this machine)"
-  else
-    newer=$(find . ../RLZ_powered/include ../RLZ-Varki/include ../RLZ-Varki/src \
-              ../RLZ-Varki/build/sdsl/lib \
+  # The sources the program is built from; their contents' checksum is kept
+  # next to the binary (BINARY.sources), so a copy that keeps old file times
+  # (rsync -a, scp -p) still triggers a rebuild.
+  local sources sum newer=""
+  sources=$(find . ../RLZ_powered/include ../RLZ-Varki/include ../RLZ-Varki/src \
+              ../RLZ-Varki/build/sdsl/lib -type f \
               \( -name '*.hpp' -o -name '*.h' -o -name "$program.cpp" \
                  -o -name fm_wrapper.cpp -o -name varki_rlz.cpp -o -name '*.a' \) \
-              -newer "$BINARY" 2>/dev/null | head -1 || true)  # (missing folders: find fails)
-    [ -n "$newer" ] && echo "($newer changed since $BINARY was built)" >&2
+              2>/dev/null | sort || true)  # (missing folders: find fails)
+  sum=$(printf '%s\n' "$sources" | xargs cat 2>/dev/null | cksum)
+  if [ ! -x "$BINARY" ]; then
+    newer="(no binary for this machine)"
+  elif [ "$(cat "$BINARY.sources" 2>/dev/null)" != "$sum" ]; then
+    newer="(sources changed since $BINARY was built)"
+    echo "$newer" >&2
   fi
   [ -z "$newer" ] && return 0
 
@@ -107,6 +112,7 @@ build_if_needed() {
     g++ -std=c++20 -O3 -pthread ${varki_flags[@]+"${varki_flags[@]}"} \
         "$program.cpp" -o "$BINARY" ${varki_libs[@]+"${varki_libs[@]}"}
   fi
+  echo "$sum" > "$BINARY.sources"
 }
 
 # numa_setup   (reads NUMA from the environment)
