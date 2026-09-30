@@ -47,6 +47,11 @@ if [ -f "$POWERED" ]; then
 else
   echo "(no powered index at $POWERED: powered is skipped)" >&2
 fi
+if [ -f "$POWERED_FWD" ]; then
+  POWERED_ARGS+=(--powered-fwd-index "$POWERED_FWD")
+else
+  echo "(no reversed powered index at $POWERED_FWD: the fwd variants are skipped)" >&2
+fi
 
 numa_setup
 

@@ -7,7 +7,13 @@
 # one you already have. The PT16 tables and lrf-ms's structures are built by
 # the suite itself.
 #
-#   ./prepare_reference.sh REF [OUTDIR]
+#   ./prepare_reference.sh [--reversed] REF [OUTDIR]
+#
+# --reversed: index the REVERSED reference instead, for the forward powered
+# variants (powered-fwd-escape, powered-pt16-fwd-escape: the greedy
+# left-to-right parse): writes REF.rev (REF reversed) to OUTDIR and builds
+# REF.rev_four.bwt (+ REF.rev_four_data.bwt) from it. The parsers still take
+# the original REF as --reference (and reverse it in memory themselves).
 #
 # REF must be a cleaned reference: plain A/C/G/T, no header, no newline (our
 # clean_reference / clean_inputs output). Everything is written to OUTDIR
@@ -22,7 +28,7 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-  sed -n '2,22p' "$0"
+  sed -n '2,/^$/p' "$0"
   exit 1
 fi
 
@@ -31,12 +37,22 @@ REPO=${REPO:-$(cd "$HERE/../.." && pwd)}
 PFP=${PFP:-$HOME/proj/ebwt/PFP-eBWT/build}
 POWERED=$REPO/RLZ_powered
 
+REVERSED=0
+if [ "$1" = "--reversed" ]; then
+  REVERSED=1
+  shift
+fi
+
 SRC=$(realpath "$1")
 OUTDIR=$(realpath "${2:-$(dirname "$SRC")}")
 mkdir -p "$OUTDIR"
 NAME=$(basename "$SRC")
-REF=$OUTDIR/$NAME
-[ "$SRC" = "$REF" ] || ln -sf "$SRC" "$REF"   # keep all outputs together
+if [ "$REVERSED" -eq 1 ]; then
+  REF=$OUTDIR/$NAME.rev   # written in step 0b
+else
+  REF=$OUTDIR/$NAME
+  [ "$SRC" = "$REF" ] || ln -sf "$SRC" "$REF"   # keep all outputs together
+fi
 
 step() { echo; echo "=== $*"; }
 
@@ -51,6 +67,19 @@ if [ "$OTHER" -ne 0 ]; then
 fi
 echo "    $N bytes, plain ACGT"
 
+# ---------- 0b. The reversed reference (--reversed) ----------
+
+if [ "$REVERSED" -eq 1 ]; then
+  step "0b. reversed reference $REF"
+  if [ -s "$REF" ] && [ "$REF" -nt "$SRC" ]; then
+    echo "    exists"
+  else
+    perl -0777 -pe '$_ = reverse $_' "$SRC" > "$REF"
+  fi
+  [ "$(stat -c %s "$REF")" -eq "$N" ] ||
+    { echo "ERROR: $REF has another length than $SRC" >&2; exit 1; }
+fi
+
 # ---------- 1. FASTA framing for PFP-eBWT ----------
 
 step "1. FASTA $REF.fa"
@@ -59,7 +88,7 @@ if [ -s "$REF.fa" ]; then
 else
   # header, the sequence, a newline ending it, then an empty second record
   # (the format of RLZ_powered's example)
-  { echo ">reference"; cat "$SRC"; echo; echo ">empty"; } > "$REF.fa"
+  { echo ">reference"; cat "$REF"; echo; echo ">empty"; } > "$REF.fa"
   echo "    written"
 fi
 
@@ -102,7 +131,7 @@ fi
 step "done: run the suite with"
 cat <<EOF
     ./rlz_suite --reference $SRC --suffix-array <its .sa file> \\
-                --powered-index ${REF}_four.bwt --filenames LIST ...
+                $([ "$REVERSED" -eq 1 ] && echo --powered-fwd-index || echo --powered-index) ${REF}_four.bwt --filenames LIST ...
 
 (LIST should not contain this reference itself.)
 EOF

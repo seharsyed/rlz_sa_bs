@@ -44,8 +44,10 @@
 //                        or --pt16 (the table built in memory): a PT16 lookup
 //                        (sassy layout) at each phrase start, and the escape
 //                        (a singleton table entry has no row to rank from).
-// Their phrase lengths must be identical to powered's and they must decode (a
-// phrase may point at another occurrence).
+// They must decode. Their phrase lengths are compared with powered's for
+// information: the variants take only matches inside the reference (and a
+// greedy tail), where powered's cyclic parse may run over the reference's end;
+// rlz_suite checks the left-to-right variants against sa-binary-search.
 
 #include <algorithm>
 #include <cstdint>
@@ -251,6 +253,7 @@ int main(int argc, char** argv) {
       std::unique_ptr<Parser> parser;
       double total_ms = 0.0;
       std::size_t files_ok = 0;
+      std::size_t lengths_differ = 0;  // files where they differ from powered's
       Parser::Stats total;
     };
     std::vector<Variant> variants;
@@ -280,6 +283,7 @@ int main(int argc, char** argv) {
     std::vector<Phrase> phrases;
 
     std::vector<Phrase> variant_phrases;
+    std::size_t total_powered_wrapping = 0;
 
     for (std::size_t f = 0; f < files.size(); ++f) {
       // Loading is not timed (as in our other benchmarks).
@@ -357,6 +361,15 @@ int main(int argc, char** argv) {
                   << '\n';
       }
 
+      // powered's phrases that run over the reference's end (its index is
+      // cyclic), for the length comparison below.
+      std::size_t powered_wrapping = 0;
+      for (const Phrase& phrase : phrases) {
+        const std::uint64_t length = std::get<0>(phrase) & ~(std::uint64_t{1} << 63);
+        powered_wrapping += std::get<1>(phrase) + length > reference.size() ? 1 : 0;
+      }
+      total_powered_wrapping += powered_wrapping;
+
       // The variants on the same input, timed the same way.
       bool variants_ok = true;
       std::vector<std::pair<double, bool>> variant_results;
@@ -365,9 +378,13 @@ int main(int argc, char** argv) {
         std::vector<Phrase>().swap(variant_phrases);
         const double ms =
             time_ms([&] { v.parser->parse(view, variant_phrases, stats); });
-        // The lengths must be powered's (zero-length phrases aside, which
-        // powered emits when a phrase ends at the input start); a phrase may
-        // point at another occurrence, so the phrases are decoded.
+        // The check is the decode. The lengths are compared with powered's
+        // (zero-length phrases aside, which powered emits when a phrase ends
+        // at the input start) for information only: the variants take only
+        // matches inside the reference and a greedy tail, powered's cyclic
+        // parse may run over the reference's end and drops a partial
+        // extension before its last short phrase. (rlz_suite checks the
+        // left-to-right variants against sa-binary-search exactly.)
         std::size_t k = 0, m = 0;
         bool lengths_equal = true;
         while (lengths_equal) {
@@ -392,11 +409,13 @@ int main(int argc, char** argv) {
         const bool decodes =
             decode_check(variant_phrases, reference, input, variant_decoded) ==
             input.size();
-        const bool variant_ok = lengths_equal && decodes;
+        const bool variant_ok = decodes;
 
         file_log << "    " << v.name << ' ' << ms << " ms (x"
                   << (ms == 0.0 ? 0.0 : parse_ms / ms) << " vs powered), lengths "
-                  << (lengths_equal ? "identical" : "DIFFER") << ", decode "
+                  << (lengths_equal ? "identical to powered's"
+                                    : "differ from powered's")
+                  << ", decode "
                   << (decodes ? "OK" : "DIFFERS");
         if (stats.lookups != 0) {
           file_log << ", 16-mer hits " << stats.hits << ", misses "
@@ -407,11 +426,13 @@ int main(int argc, char** argv) {
         if (!lengths_equal) {
           file_log << "    first length difference at phrase " << k
                     << " (from the right) of " << phrases.size() << " / "
-                    << variant_phrases.size() << '\n';
+                    << variant_phrases.size() << "; powered runs over the "
+                    << "reference's end in " << powered_wrapping << " phrases\n";
         }
 
         v.total_ms += ms;
         v.files_ok += variant_ok ? 1 : 0;
+        v.lengths_differ += lengths_equal ? 0 : 1;
         v.total.lookups += stats.lookups;
         v.total.hits += stats.hits;
         v.total.misses += stats.misses;
@@ -450,8 +471,10 @@ int main(int argc, char** argv) {
     for (const Variant& v : variants) {
       std::cerr << "    " << v.name << ' ' << v.total_ms << " ms (x"
                 << (v.total_ms == 0.0 ? 0.0 : total_parse_ms / v.total_ms)
-                << " vs powered), lengths identical and decode OK "
-                << v.files_ok << "/" << files.size() << " files";
+                << " vs powered), decode OK " << v.files_ok << "/"
+                << files.size() << " files, lengths differ from powered's in "
+                << v.lengths_differ << " (powered runs over the reference's end "
+                << "in " << total_powered_wrapping << " phrases)";
       if (v.total.lookups != 0) {
         std::cerr << ", 16-mer hits " << v.total.hits << ", misses "
                   << v.total.misses << " of " << v.total.lookups << " lookups";

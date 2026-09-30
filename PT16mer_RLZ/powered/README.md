@@ -124,3 +124,26 @@ private, so it is rebuilt from `count()` at load; `RLZ_powered` is unchanged.
 ./powered_bench --index REF_four.bwt --reference REF --filenames LIST \
                 --pt16-table REF_four.pt16 --escape --quiet
 ```
+
+### Forward variants (the left-to-right parse)
+
+`powered-fwd-escape` and `powered-pt16-fwd-escape` (in `rlz_suite` and
+`rlz_parallel`) use the powered index of the **reversed** reference and read
+the input reversed (virtually, no copy): powered's right-to-left parse then
+is the greedy left-to-right parse, the same phrases as sa-binary-search and
+Varki. Positions are converted back to the original reference and the phrases
+come out in input order; the suite checks them like the left-to-right parsers
+(count and every length, and decoding).
+
+```
+./prepare_reference.sh --reversed REF OUTDIR   # REF.rev and REF.rev_four.bwt in OUTDIR
+```
+
+The parsers still take the original REF (`--reference`) and reverse it in
+memory; the reversed index is `--powered-fwd-index` (the runners pass
+`BWT_FM_files/<ref>.rev_four.bwt` when it exists).
+
+The one expected difference from the baseline: powered's index is cyclic, so
+a match can run over the end of the reference into its start, which the
+linear parsers cannot match. The suite counts those phrases ("run over the
+reference's end") next to a DIFFERS.

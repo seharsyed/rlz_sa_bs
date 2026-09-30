@@ -2,11 +2,14 @@
 # run_rlz_suite.sh and run_rlz_parallel.sh:
 #
 #   source rlz_datasets.sh
-#   select_dataset NAME     # sets REF, SA, POWERED, LIST (LIST may be empty)
+#   select_dataset NAME     # sets REF, SA, POWERED, POWERED_FWD, LIST (LIST may be empty)
 #
 # REF      the cleaned reference (plain ACGT)
 # SA       its suffix array (4-byte entries, no sentinel)
 # POWERED  its powered index (REF_four.bwt; skipped if the file is missing)
+# POWERED_FWD  the powered index of the reversed reference, for the fwd
+#          variants (REF.rev_four.bwt, from powered/prepare_reference.sh
+#          --reversed; skipped if missing). Derived from POWERED.
 # LIST     the default input list (one input path per line), or empty
 #
 # DATA is the data root; override it from the environment.
@@ -18,7 +21,7 @@ list_datasets() {
 }
 
 select_dataset() {
-  REF="" SA="" POWERED="" LIST=""
+  REF="" SA="" POWERED="" POWERED_FWD="" LIST=""
   case "$1" in
     ecoli|GCA_000005845.2)
       REF=$DATA/cleaned-references/GCA_000005845.2_ASM584v2.cleaned
@@ -48,6 +51,7 @@ select_dataset() {
       return 1
       ;;
   esac
+  POWERED_FWD=${POWERED%_four.bwt}.rev_four.bwt
 }
 
 # build_if_needed PROGRAM   (rlz_suite or rlz_parallel; run from PT16mer_RLZ/)
@@ -56,7 +60,9 @@ select_dataset() {
 # home directory shared between machines, one binary would be rebuilt by each
 # machine in turn (and -march=native code may not run on another CPU). It is
 # (re)built when missing or older than PROGRAM.cpp or any header here or in
-# ../RLZ_powered/include -- with powered on x86-64, without elsewhere. A failed
+# ../RLZ_powered/include or ../RLZ-Varki -- with powered on x86-64, without
+# elsewhere, and with varki when sdsl-lite is built for it
+# (varki/build_sdsl.sh: ../RLZ-Varki/build/sdsl/lib/libsdsl.a). A failed
 # build stops the calling script. Two runs started at once on one machine can
 # still race on a rebuild: start the second after the first has built.
 build_if_needed() {
@@ -66,19 +72,40 @@ build_if_needed() {
   if [ ! -x "$BINARY" ]; then
     newer="(no binary for this machine)"
   else
-    newer=$(find . ../RLZ_powered/include \( -name '*.hpp' -o -name "$program.cpp" \) \
-              -newer "$BINARY" 2>/dev/null | head -1)
+    newer=$(find . ../RLZ_powered/include ../RLZ-Varki/include ../RLZ-Varki/src \
+              ../RLZ-Varki/build/sdsl/lib \
+              \( -name '*.hpp' -o -name '*.h' -o -name "$program.cpp" \
+                 -o -name fm_wrapper.cpp -o -name varki_rlz.cpp -o -name '*.a' \) \
+              -newer "$BINARY" 2>/dev/null | head -1 || true)  # (missing folders: find fails)
     [ -n "$newer" ] && echo "($newer changed since $BINARY was built)" >&2
   fi
   [ -z "$newer" ] && return 0
 
-  if [ "$(uname -m)" = "x86_64" ]; then
-    echo "(building $BINARY with powered)" >&2
-    g++ -std=c++2a -O3 -march=native -pthread -DNDEBUG -DWITH_POWERED \
-        -DSMALL_BLOCK_SIZE=256 -DLARGE_BLOCK_SIZE=16384 "$program.cpp" -o "$BINARY"
+  local sdsl=../RLZ-Varki/build/sdsl
+  local varki_flags=() varki_libs=() with="" without=""
+  if [ -f "$sdsl/lib/libsdsl.a" ]; then
+    # varki's implementation, with sdsl-lite, is C++17 (sdsl does not
+    # compile as C++20): built apart and linked in.
+    local object="varki_rlz.$(hostname -s).o"
+    local march=(); [ "$(uname -m)" = "x86_64" ] && march=(-march=native)
+    g++ -std=c++17 -O3 ${march[@]+"${march[@]}"} -DNDEBUG -Wno-deprecated-declarations \
+        -I"$sdsl/include" \
+        -I../RLZ-Varki/include -c varki/varki_rlz.cpp -o "$object"
+    varki_flags=(-DWITH_VARKI)
+    varki_libs=("$object" -L"$sdsl/lib" -lsdsl -ldivsufsort -ldivsufsort64)
+    with=" varki"
   else
-    echo "(building $BINARY without powered: not x86-64)" >&2
-    g++ -std=c++20 -O3 -pthread "$program.cpp" -o "$BINARY"
+    without=" varki (run varki/build_sdsl.sh)"
+  fi
+  if [ "$(uname -m)" = "x86_64" ]; then
+    echo "(building $BINARY with powered$with${without:+; without$without})" >&2
+    g++ -std=c++2a -O3 -march=native -pthread -DNDEBUG -DWITH_POWERED \
+        -DSMALL_BLOCK_SIZE=256 -DLARGE_BLOCK_SIZE=16384 ${varki_flags[@]+"${varki_flags[@]}"} \
+        "$program.cpp" -o "$BINARY" ${varki_libs[@]+"${varki_libs[@]}"}
+  else
+    echo "(building $BINARY${with:+ with$with}; without powered: not x86-64${without:+; without$without})" >&2
+    g++ -std=c++20 -O3 -pthread ${varki_flags[@]+"${varki_flags[@]}"} \
+        "$program.cpp" -o "$BINARY" ${varki_libs[@]+"${varki_libs[@]}"}
   fi
 }
 

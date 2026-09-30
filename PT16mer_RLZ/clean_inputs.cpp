@@ -76,8 +76,11 @@ static std::vector<char> clean_sequence(
 
         at_line_start = false;
 
-        if (raw == 'A' || raw == 'C' || raw == 'G' || raw == 'T') {
-            cleaned.push_back(raw);
+        // Lower-case (soft-masked) bases are the same bases: upper-case them.
+        // Everything else (N, IUPAC codes, ...) becomes 'A'.
+        const char base = static_cast<char>(std::toupper(symbol));
+        if (base == 'A' || base == 'C' || base == 'G' || base == 'T') {
+            cleaned.push_back(base);
         } else {
             cleaned.push_back('A');
             ++stats.replacement_count;

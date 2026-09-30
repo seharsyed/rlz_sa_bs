@@ -19,15 +19,24 @@
 //             start
 //             Both only when built with -DWITH_POWERED (x86-64, GCC) and given
 //             --powered-index.
+//   powered-fwd-escape, powered-pt16-fwd-escape  the same over the index of
+//             the REVERSED reference (--powered-fwd-index, from
+//             powered/prepare_reference.sh --reversed), reading the input
+//             reversed: the greedy left-to-right parse, checked like the
+//             left-to-right parsers (see powered/powered_pt16_parse.hpp)
+//   varki     Varki's RLZ (../RLZ-Varki: FM-index of the reversed reference,
+//             sdsl-lite; varki/varki_rlz.hpp), one chunk per input; only when
+//             built with -DWITH_VARKI (see varki/build_sdsl.sh)
 //
 // What is timed, for every parser alike: parsing one input that is already in
 // memory into an in-memory list of phrases. Not timed: loading inputs, building
 // or loading tables and indexes (reported separately), and the checks.
 //
 // Checks (untimed), for every parser alike: its phrases are decoded against the
-// reference and must reproduce the input exactly. lrf-ms and the PT16 parsers
-// must also give the baseline's phrase count (they compute the same greedy
-// left-to-right parse). powered parses right to left (longest suffix of the
+// reference and must reproduce the input exactly. lrf-ms, the PT16 parsers and
+// varki must also give the baseline's phrases: the same count and the same
+// length for every phrase (they compute the same greedy left-to-right parse;
+// the positions may be other occurrences). powered parses right to left (longest suffix of the
 // remaining prefix), so its phrases may differ; its count is reported.
 // (powered's own phrase count equals the greedy left-to-right count; the
 // powered variants give powered's phrase lengths.)
@@ -41,6 +50,8 @@
 //   with powered (x86-64, GCC; block sizes as RLZ_powered was built with):
 //     g++ -std=c++2a -O3 -march=native -DNDEBUG -DWITH_POWERED \
 //         -DSMALL_BLOCK_SIZE=256 -DLARGE_BLOCK_SIZE=16384 rlz_suite.cpp -o rlz_suite
+//   with varki: add -DWITH_VARKI and link varki/varki_rlz.cpp (see
+//   varki/varki_rlz.hpp); run_rlz_suite.sh builds all of this itself
 //
 // Run:
 //   ./rlz_suite --reference REF --suffix-array REF.sa --filenames LIST
@@ -88,6 +99,9 @@ namespace pt16_v1 {
 #include "variants/pt16_build_sassy.hpp"
 #include "variants/pt16_sassy.hpp"
 
+#ifdef WITH_VARKI
+#include "varki/varki_rlz.hpp"  // VarkiRLZ (sdsl-lite)
+#endif
 #ifdef WITH_POWERED
 #include "../RLZ_powered/include/types.hpp"  // bbwt::non_rle
 #include "powered/powered_pt16_parse.hpp"   // PoweredPT16Parser
@@ -108,6 +122,7 @@ struct SuiteArgs {
   std::string filenames;
   std::string table;          // PT16 table files; default beside the reference
   std::string powered_index;  // RLZ_powered index (.bwt from make_bwt)
+  std::string powered_fwd_index;  // the same, of the reversed reference
   std::string results;        // optional CSV
   std::size_t max_files = 0;
   bool quiet = false;
@@ -128,6 +143,8 @@ void print_usage(const char* program) {
                " -- this build has no powered support"
 #endif
                "\n"
+               "  [--powered-fwd-index PATH]  the same, of the reversed "
+               "reference (REF.rev_four.bwt)\n"
                "  [--table PATH]          PT16 table files (default: "
                "<reference>.suite_pt16, .v2, .sassy)\n"
                "  [--results PATH]        per-file CSV\n"
@@ -149,6 +166,8 @@ SuiteArgs parse_suite_args(int argc, char** argv) {
       args.table = require_value(i, argc, argv);
     } else if (option == "--powered-index") {
       args.powered_index = require_value(i, argc, argv);
+    } else if (option == "--powered-fwd-index") {
+      args.powered_fwd_index = require_value(i, argc, argv);
     } else if (option == "--results") {
       args.results = require_value(i, argc, argv);
     } else if (option == "--max-files") {
@@ -168,7 +187,7 @@ SuiteArgs parse_suite_args(int argc, char** argv) {
         "reference, suffix-array and filenames are required");
   }
 #ifndef WITH_POWERED
-  if (!args.powered_index.empty()) {
+  if (!args.powered_index.empty() || !args.powered_fwd_index.empty()) {
     throw std::runtime_error(
         "--powered-index given, but this build has no powered support "
         "(rebuild with -DWITH_POWERED on x86-64)");
@@ -206,6 +225,14 @@ std::size_t decode_triples(const Triples& phrases,
 
 // ---------- Parsers ----------
 
+// The lengths of (input position, reference position, length) phrases.
+std::vector<std::uint64_t> triple_lengths(const Triples& phrases) {
+  std::vector<std::uint64_t> lengths;
+  lengths.reserve(phrases.size());
+  for (const auto& phrase : phrases) lengths.push_back(std::get<2>(phrase));
+  return lengths;
+}
+
 // One parser: builds or loads what it needs once, then parses inputs.
 struct Parser {
   virtual ~Parser() = default;
@@ -236,8 +263,17 @@ struct Parser {
   virtual std::size_t decode(const std::vector<Symbol>& reference,
                              const std::vector<Symbol>& input) const = 0;
   // True for parsers computing the same greedy left-to-right parse as the
-  // baseline (their phrase count must match).
+  // baseline (their phrase count and phrase lengths must match).
   virtual bool left_to_right() const { return true; }
+  // The phrase lengths in input order (for the comparison with the baseline).
+  virtual std::vector<std::uint64_t> phrase_lengths() const = 0;
+  // Phrases that run over the end of the reference into its start (only a
+  // parser over a cyclic index has any: the powered fwd variants). Such a
+  // phrase is longer than any match in the linear reference, which is the
+  // expected way for their phrases to differ from the baseline's.
+  virtual std::size_t wrapping_phrases(std::size_t /*reference_size*/) const {
+    return 0;
+  }
 
   double parse_timed(const std::vector<Symbol>& input) {
     release();  // untimed
@@ -264,6 +300,9 @@ struct BaselineParser : Parser {
     std::remove_reference_t<decltype(result)>().swap(result);
   }
   std::size_t phrase_count() const override { return result.size(); }
+  std::vector<std::uint64_t> phrase_lengths() const override {
+    return triple_lengths(result);
+  }
   std::size_t decode(const std::vector<Symbol>& ref,
                      const std::vector<Symbol>& input) const override {
     return decode_triples(result, ref, input);
@@ -311,6 +350,9 @@ struct LrfMsParser : Parser {
     }
   }
   std::size_t phrase_count() const override { return result.size(); }
+  std::vector<std::uint64_t> phrase_lengths() const override {
+    return triple_lengths(result);
+  }
   std::size_t decode(const std::vector<Symbol>& ref,
                      const std::vector<Symbol>& input) const override {
     return decode_triples(result, ref, input);
@@ -343,6 +385,9 @@ struct Pt16Parser : Parser {
     std::remove_reference_t<decltype(result)>().swap(result);
   }
   std::size_t phrase_count() const override { return result.size(); }
+  std::vector<std::uint64_t> phrase_lengths() const override {
+    return triple_lengths(result);
+  }
   std::size_t decode(const std::vector<Symbol>& ref,
                      const std::vector<Symbol>& input) const override {
     return decode_triples(result, ref, input);
@@ -374,6 +419,9 @@ struct V2Parser : Parser {
     std::remove_reference_t<decltype(result)>().swap(result);
   }
   std::size_t phrase_count() const override { return result.size(); }
+  std::vector<std::uint64_t> phrase_lengths() const override {
+    return triple_lengths(result);
+  }
   std::size_t decode(const std::vector<Symbol>& ref,
                      const std::vector<Symbol>& input) const override {
     return decode_triples(result, ref, input);
@@ -404,11 +452,55 @@ struct SassyParser : Parser {
     std::remove_reference_t<decltype(result)>().swap(result);
   }
   std::size_t phrase_count() const override { return result.size(); }
+  std::vector<std::uint64_t> phrase_lengths() const override {
+    return triple_lengths(result);
+  }
   std::size_t decode(const std::vector<Symbol>& ref,
                      const std::vector<Symbol>& input) const override {
     return decode_triples(result, ref, input);
   }
 };
+
+#ifdef WITH_VARKI
+// Varki's RLZ (varki/varki_rlz.hpp): its FM-index of the reversed reference
+// is built here from the reference; one chunk per input.
+struct VarkiParser : Parser {
+  std::unique_ptr<VarkiRLZ> varki;
+  std::vector<VarkiRLZ::Phrase> result;
+
+  explicit VarkiParser(const std::vector<Symbol>& ref) {
+    build_ms = time_ms([&] { varki = std::make_unique<VarkiRLZ>(ref); });
+    own_bytes = varki->bytes();  // parsing reads the index only
+  }
+  std::string name() const override { return "varki"; }
+  void parse(const std::vector<Symbol>& input) override {
+    varki->parse(input.data(), input.size(), result);
+  }
+  void release() override {
+    std::remove_reference_t<decltype(result)>().swap(result);
+  }
+  std::size_t phrase_count() const override { return result.size(); }
+  std::vector<std::uint64_t> phrase_lengths() const override {
+    std::vector<std::uint64_t> lengths;
+    lengths.reserve(result.size());
+    for (const auto& phrase : result) lengths.push_back(phrase.second);
+    return lengths;
+  }
+  std::size_t decode(const std::vector<Symbol>& ref,
+                     const std::vector<Symbol>& input) const override {
+    std::size_t at = 0;
+    for (const auto& [position, length] : result) {
+      for (std::uint64_t j = 0; j < length; ++j, ++at) {
+        if (at >= input.size() || position + j >= ref.size() ||
+            input[at] != ref[position + j]) {
+          return std::min(at, input.size());
+        }
+      }
+    }
+    return at == input.size() ? input.size() : std::min(at, input.size());
+  }
+};
+#endif
 
 #ifdef WITH_POWERED
 // The powered index, loaded once and shared by the powered parsers.
@@ -465,10 +557,11 @@ struct PoweredParser : Parser {
   std::unique_ptr<Parse> parser;
   std::vector<std::tuple<std::uint64_t, std::uint64_t>> result;
   bool with_table;
+  bool forward;  // index of the reversed reference; `ref` is then reversed
 
   PoweredParser(const PoweredIndex& powered, const std::vector<Symbol>& ref,
-                const bool use_table)
-      : with_table(use_table) {
+                const bool use_table, const bool fwd = false)
+      : with_table(use_table), forward(fwd) {
     own_bytes = powered.own_bytes;
     reserved_bytes = powered.reserved_bytes;
     needs_reference = true;  // the escape compares characters
@@ -481,12 +574,13 @@ struct PoweredParser : Parser {
     } else {
       load_ms = powered.load_ms;
     }
-    parser = std::make_unique<Parse>(*powered.index, table.get(), &ref);
+    parser = std::make_unique<Parse>(*powered.index, table.get(), &ref, forward);
   }
   std::string name() const override {
-    return with_table ? "powered-pt16-escape" : "powered-escape";
+    return std::string(with_table ? "powered-pt16-" : "powered-") +
+           (forward ? "fwd-escape" : "escape");
   }
-  bool left_to_right() const override { return false; }
+  bool left_to_right() const override { return forward; }
   void parse(const std::vector<Symbol>& input) override {
     const std::string_view view(reinterpret_cast<const char*>(input.data()),
                                 input.size());
@@ -497,14 +591,30 @@ struct PoweredParser : Parser {
     std::remove_reference_t<decltype(result)>().swap(result);
   }
   std::size_t phrase_count() const override { return result.size(); }
+  std::size_t wrapping_phrases(const std::size_t n) const override {
+    std::size_t count = 0;
+    for (const auto& phrase : result) {
+      count += std::get<1>(phrase) + std::get<0>(phrase) > n ? 1 : 0;
+    }
+    return count;
+  }
+  std::vector<std::uint64_t> phrase_lengths() const override {
+    if (!forward) return {};  // not a left-to-right parse
+    std::vector<std::uint64_t> lengths;
+    lengths.reserve(result.size());
+    for (const auto& phrase : result) lengths.push_back(std::get<0>(phrase));
+    return lengths;
+  }
   std::size_t decode(const std::vector<Symbol>& ref,
                      const std::vector<Symbol>& input) const override {
     const std::uint64_t literal = std::uint64_t{1} << 63;
     const std::size_t m = ref.size();
     std::size_t at = 0;
-    for (auto it = result.rbegin(); it != result.rend(); ++it) {
-      std::uint64_t length = std::get<0>(*it);
-      const std::uint64_t position = std::get<1>(*it);
+    // Phrases last to first; in input order in forward mode.
+    for (std::size_t k = 0; k < result.size(); ++k) {
+      const auto& phrase = result[forward ? k : result.size() - 1 - k];
+      std::uint64_t length = std::get<0>(phrase);
+      const std::uint64_t position = std::get<1>(phrase);
       const bool is_literal = (length & literal) != 0;
       if (is_literal) length -= literal;
       for (std::uint64_t j = 0; j < length; ++j, ++at) {
@@ -530,7 +640,8 @@ struct Totals {
   double parse_ms = 0.0;
   std::size_t phrases = 0;
   std::size_t files_ok = 0;         // decoded exactly
-  std::size_t count_mismatches = 0;  // phrase count differs from baseline
+  std::size_t count_mismatches = 0;  // phrase count or lengths differ from baseline
+  std::size_t wrapping = 0;          // phrases over the reference's end
 };
 
 }  // namespace
@@ -583,6 +694,9 @@ int main(int argc, char** argv) {
         std::make_unique<V2Parser>(reference, suffix_array, args.table + ".v2"));
     parsers.push_back(std::make_unique<SassyParser>(reference, suffix_array,
                                                     args.table + ".sassy"));
+#ifdef WITH_VARKI
+    parsers.push_back(std::make_unique<VarkiParser>(reference));
+#endif
 #ifdef WITH_POWERED
     std::unique_ptr<PoweredIndex> powered;
     if (!args.powered_index.empty()) {
@@ -592,10 +706,23 @@ int main(int argc, char** argv) {
       parsers.push_back(
           std::make_unique<PoweredParser>(*powered, reference, true));
     }
+    // The forward variants: the index of the reversed reference, and the
+    // reference reversed in memory (for the table and the escape; their
+    // phrases are converted back to the original).
+    std::unique_ptr<PoweredIndex> powered_fwd;
+    const std::vector<Symbol> reversed_reference(reference.rbegin(),
+                                                 reference.rend());
+    if (!args.powered_fwd_index.empty()) {
+      powered_fwd = std::make_unique<PoweredIndex>(args.powered_fwd_index);
+      parsers.push_back(std::make_unique<PoweredParser>(
+          *powered_fwd, reversed_reference, false, true));
+      parsers.push_back(std::make_unique<PoweredParser>(
+          *powered_fwd, reversed_reference, true, true));
+    }
 #endif
 
     for (const auto& parser : parsers) {
-      std::cerr << "    " << std::left << std::setw(20) << parser->name()
+      std::cerr << "    " << std::left << std::setw(24) << parser->name()
                 << std::right << " build " << std::fixed << std::setprecision(1)
                 << std::setw(9) << parser->build_ms << " ms, load "
                 << std::setw(8) << parser->load_ms << " ms, own "
@@ -614,6 +741,14 @@ int main(int argc, char** argv) {
                               ")"
                         : std::string(" (own only)"))
                 << '\n';
+    }
+    if (args.powered_fwd_index.empty()) {
+      std::cerr << "    (powered-fwd-escape, powered-pt16-fwd-escape: not run; "
+                   "give --powered-fwd-index"
+#ifndef WITH_POWERED
+                   " and build with -DWITH_POWERED"
+#endif
+                   ")\n";
     }
     if (args.powered_index.empty()) {
       std::cerr << "    (powered-escape, powered-pt16-escape: not run; give "
@@ -665,6 +800,7 @@ int main(int argc, char** argv) {
       }
 
       std::size_t baseline_phrases = 0;
+      std::vector<std::uint64_t> baseline_lengths;
       double baseline_ms = 0.0;
 
       for (std::size_t k = 0; k < parsers.size(); ++k) {
@@ -679,11 +815,16 @@ int main(int argc, char** argv) {
         const std::size_t phrases = parser.phrase_count();
         if (k == 0) {
           baseline_phrases = phrases;
+          baseline_lengths = parser.phrase_lengths();
           baseline_ms = ms;
         }
-        const bool count_ok = !parser.left_to_right() || phrases == baseline_phrases;
+        // The same phrases as the baseline: count and every length.
+        const bool count_ok =
+            !parser.left_to_right() ||
+            (phrases == baseline_phrases &&
+             (k == 0 || parser.phrase_lengths() == baseline_lengths));
 
-        out << "    " << std::left << std::setw(20) << parser.name()
+        out << "    " << std::left << std::setw(24) << parser.name()
             << std::right << std::fixed << std::setprecision(2) << std::setw(10)
             << ms << " ms";
         if (k > 0) {
@@ -695,7 +836,13 @@ int main(int argc, char** argv) {
         out << "  " << std::setw(9) << phrases << " phrases  "
             << (decoded ? "decode OK" : "DECODE DIFFERS");
         if (!decoded) out << " (first at " << difference << ")";
-        if (!count_ok) out << "  PHRASE COUNT DIFFERS from baseline";
+        const std::size_t wrapping = parser.wrapping_phrases(reference.size());
+        if (!count_ok) {
+          out << "  PHRASES DIFFER from baseline (count or lengths)";
+          if (wrapping != 0) {
+            out << "; " << wrapping << " run over the reference's end";
+          }
+        }
         out << '\n';
 
         Totals& t = totals[k];
@@ -703,9 +850,10 @@ int main(int argc, char** argv) {
         t.phrases += phrases;
         t.files_ok += decoded ? 1 : 0;
         t.count_mismatches += count_ok ? 0 : 1;
+        t.wrapping += wrapping;
 
         if (csv.is_open()) {
-          csv << ',' << std::setprecision(3) << ms << ',' << phrases << ','
+          csv << ',' << std::fixed << std::setprecision(3) << ms << ',' << phrases << ','
               << (decoded && count_ok ? "YES" : "NO");
         }
       }
@@ -721,7 +869,7 @@ int main(int argc, char** argv) {
 
     std::cerr << std::fixed << std::setprecision(2) << "[6] totals over "
               << files.size() << " files (" << total_bytes << " bytes)\n"
-              << "    parser                 build ms    load ms    parse ms  speedup"
+              << "    parser                     build ms    load ms    parse ms  speedup"
                  "      phrases  decoded  count        own MB  needs MB\n";
     bool all_ok = true;
     for (std::size_t k = 0; k < parsers.size(); ++k) {
@@ -729,7 +877,7 @@ int main(int argc, char** argv) {
       const Totals& t = totals[k];
       const bool ok = t.files_ok == files.size() && t.count_mismatches == 0;
       all_ok = all_ok && ok;
-      std::cerr << "    " << std::left << std::setw(20) << parser.name()
+      std::cerr << "    " << std::left << std::setw(24) << parser.name()
                 << std::right << std::setw(11) << parser.build_ms
                 << std::setw(11) << parser.load_ms << std::setw(12)
                 << t.parse_ms << std::setw(9)
@@ -744,13 +892,21 @@ int main(int argc, char** argv) {
                 << std::setw(10) << mb(parser.total_bytes(reference.size()))
                 << '\n';
     }
+    for (std::size_t k = 0; k < parsers.size(); ++k) {
+      if (totals[k].wrapping != 0) {
+        std::cerr << "    " << parsers[k]->name() << ": " << totals[k].wrapping
+                  << " phrases run over the reference's end (cyclic index; "
+                     "the linear parsers cannot match there)\n";
+      }
+    }
     std::cerr << "    peak RSS " << peak_rss_mb() << " MB\n";
 
     std::cout << "files=" << files.size() << '\n'
               << "input_bytes=" << total_bytes << '\n';
     for (std::size_t k = 0; k < parsers.size(); ++k) {
       const std::string n = parsers[k]->name();
-      std::cout << n << "_own_bytes=" << parsers[k]->own_bytes << '\n'
+      std::cout << n << "_wrapping_phrases=" << totals[k].wrapping << '\n'
+                << n << "_own_bytes=" << parsers[k]->own_bytes << '\n'
                 << n << "_reserved_bytes=" << parsers[k]->reserved_bytes << '\n'
                 << n << "_needed_bytes="
                 << parsers[k]->total_bytes(reference.size()) << '\n'
