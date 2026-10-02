@@ -2,7 +2,7 @@
 # Runs the RLZ parsing suite (rlz_suite: single-threaded, with checks) on a
 # dataset.
 #
-#   ./run_rlz_suite.sh DATASET [LIST] [rlz_suite options...]
+#   scripts/run_rlz_suite.sh DATASET [LIST] [rlz_suite options...]
 #
 # DATASET  a name from rlz_datasets.sh (e.g. ecoli)
 # LIST     the input list; optional when the dataset has a default one
@@ -12,12 +12,12 @@
 # powered on x86-64, without elsewhere; see build_if_needed in rlz_datasets.sh).
 #
 # NUMA=N pins the run to NUMA node N (its CPU and memory; see numa_setup in
-# rlz_datasets.sh), e.g.  NUMA=0 ./run_rlz_suite.sh ecoli --quiet
+# rlz_datasets.sh), e.g.  NUMA=0 scripts/run_rlz_suite.sh ecoli --quiet
 
 set -euo pipefail
 
-cd "$(dirname "$0")"
-source ./rlz_datasets.sh
+cd "$(dirname "$0")/.."
+source scripts/rlz_datasets.sh
 
 if [ $# -lt 1 ]; then
   sed -n '2,/^$/p' "$0"

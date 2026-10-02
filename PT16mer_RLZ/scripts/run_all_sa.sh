@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
 DATE=$(date +%Y%m%d)
 OUT=/home/sehar/PhD/RLZResults

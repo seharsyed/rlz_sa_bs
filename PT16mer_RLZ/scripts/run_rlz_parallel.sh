@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs rlz_parallel (RLZ parsing, parallel over input files) on a dataset.
 #
-#   ./run_rlz_parallel.sh DATASET [LIST] [rlz_parallel options...]
+#   scripts/run_rlz_parallel.sh DATASET [LIST] [rlz_parallel options...]
 #
 # DATASET  a name from rlz_datasets.sh (e.g. ecoli)
 # LIST     the input list; optional when the dataset has a default one
@@ -14,12 +14,12 @@
 # results/parallel_<dataset>_t<threads>_<numa>_<date>.csv.
 #
 # NUMA=N pins the run to NUMA node N (threads and memory; see numa_setup in
-# rlz_datasets.sh), e.g.  NUMA=0 ./run_rlz_parallel.sh ecoli --threads 16
+# rlz_datasets.sh), e.g.  NUMA=0 scripts/run_rlz_parallel.sh ecoli --threads 16
 
 set -euo pipefail
 
-cd "$(dirname "$0")"
-source ./rlz_datasets.sh
+cd "$(dirname "$0")/.."
+source scripts/rlz_datasets.sh
 
 if [ $# -lt 1 ]; then
   sed -n '2,/^$/p' "$0"

@@ -1,7 +1,7 @@
 # The datasets of the RLZ benchmarks, in one place. Sourced by
 # run_rlz_suite.sh and run_rlz_parallel.sh:
 #
-#   source rlz_datasets.sh
+#   source scripts/rlz_datasets.sh   (from PT16mer_RLZ/)
 #   select_dataset NAME     # sets REF, SA, POWERED, POWERED_FWD, LIST (LIST may be empty)
 #
 # REF      the cleaned reference (plain ACGT)

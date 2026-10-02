@@ -16,7 +16,7 @@ set -euo pipefail
 #
 # General form:
 #
-#   ./run_rlz_experiments.sh \
+#   scripts/run_rlz_experiments.sh \
 #       <number_of_datasets> \
 #       <name1> <reference1> <suffix_array1> <input_list1> \
 #       <name2> <reference2> <suffix_array2> <input_list2> \
@@ -25,7 +25,7 @@ set -euo pipefail
 #
 # Example with one dataset:
 #
-#   ./run_rlz_experiments.sh \
+#   scripts/run_rlz_experiments.sh \
 #       1 \
 #       ecoli \
 #       /data/ecoli/reference.plain \
@@ -35,7 +35,7 @@ set -euo pipefail
 #
 # Example with two datasets:
 #
-#   ./run_rlz_experiments.sh \
+#   scripts/run_rlz_experiments.sh \
 #       2 \
 #       ecoli \
 #       /data/ecoli/reference.plain \
@@ -54,7 +54,7 @@ set -euo pipefail
 # Locate this script
 # ============================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"  # PT16mer_RLZ/
 
 
 # ============================================================

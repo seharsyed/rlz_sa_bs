@@ -12,8 +12,8 @@
 # .gitignore ignores build/, so it was never committed. So this script
 # configures sdsl-lite in RLZ-Varki/build/sdsl-build instead.
 #
-# After this, run_rlz_suite.sh / run_rlz_parallel.sh build their programs
-# with varki (build_if_needed in rlz_datasets.sh adds -DWITH_VARKI and the
+# After this, scripts/run_rlz_suite.sh / run_rlz_parallel.sh build their programs
+# with varki (build_if_needed in scripts/rlz_datasets.sh adds -DWITH_VARKI and the
 # sdsl flags when RLZ-Varki/build/sdsl/lib/libsdsl.a exists).
 
 set -euo pipefail

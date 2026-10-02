@@ -19,14 +19,14 @@ if [ -n "${CPUS:-}" ]; then
 fi
 
 # build_programs PROGRAM: builds (if needed) PT16mer_RLZ/PROGRAM.<host> with
-# powered and varki (rlz_datasets.sh's build_if_needed), copies it to
+# powered and varki (scripts/rlz_datasets.sh's build_if_needed), copies it to
 # ROOT/bin (so that syncing the repository during a long run cannot remove the
 # program being run) and sets PROGRAM_PATH to that copy.
 build_programs() {
   local program=$1
   pushd "$PT16" > /dev/null
   # shellcheck disable=SC1091
-  source ./rlz_datasets.sh
+  source scripts/rlz_datasets.sh
   build_if_needed "$program"
   popd > /dev/null
   mkdir -p "$ROOT/bin"

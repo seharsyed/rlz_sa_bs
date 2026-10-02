@@ -76,7 +76,7 @@ fi
 step "5. rlz_suite and rlz_parallel"
 (
   cd "$PT16"
-  source ./rlz_datasets.sh
+  source scripts/rlz_datasets.sh
   build_if_needed rlz_suite
   build_if_needed rlz_parallel
   ls -la rlz_suite."$(hostname -s)" rlz_parallel."$(hostname -s)"
