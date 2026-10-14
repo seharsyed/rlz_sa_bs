@@ -28,6 +28,20 @@ void help() {
     exit(0);
 }
 
+static inline bool is_acgt(char c) noexcept
+{
+    switch (c) {
+        case 'A':
+        case 'C':
+        case 'G':
+        case 'T':
+            return true;
+        default:
+            return false;
+    }
+}
+
+
 template <class bwt_type, typename T>
 std::pair<double, size_t> parse(const std::string& in_file_path, std::ifstream& sequences,
                         const std::string& output_path, uint8_t code_size, bool triple) {
@@ -51,6 +65,7 @@ std::pair<double, size_t> parse(const std::string& in_file_path, std::ifstream& 
             : sizeof(uint64_t) * 2;
 
     auto total_start = high_resolution_clock::now();
+    uint64_t mask = 1ULL << 63;
 
     #pragma omp parallel for schedule(dynamic)
     for (size_t i = 0; i < seq_files.size(); i++) {
@@ -72,12 +87,52 @@ std::pair<double, size_t> parse(const std::string& in_file_path, std::ifstream& 
         file.read(sequence.data(), size);
         const auto sv = std::string_view(sequence.data(), size);
 
-        //parses.reserve(size/1000);
-        //parse the sequence
-        if constexpr (std::tuple_size_v<T> == 3)
-            bwt.parse_triples(sv, parses, code_size);
-        else
-            bwt.parse_tuples(sv, parses, code_size);
+        bool ACGT = is_acgt(sv[size-1]);
+        uint32_t length = 1;
+        for (size_t j = size-1; j > 0; j--) {
+            if (ACGT) {
+                if (is_acgt(sv[j-1])) {
+                    length++;
+                } else if (!is_acgt(sv[j-1])) {
+                    if constexpr (std::tuple_size_v<T> == 3)
+                        bwt.parse_triples(sv.substr(j, length), parses, code_size);
+                    else
+                        bwt.parse_tuples(sv.substr(j, length), parses, code_size);
+                    length = 1;
+                }
+            } else {
+                if (is_acgt(sv[j-1]) || sv[j-1] != sv[j]) {
+                    if constexpr (std::tuple_size_v<T> == 3)
+                        parses.emplace_back(length|mask, uint64_t(sv[j]), 0);
+                    else
+                        parses.emplace_back(length|mask, uint64_t(sv[j]));
+                    length = 1;
+                } else {
+                    length++;
+                }
+            }
+
+            ACGT = is_acgt(sv[j-1]);
+        }
+
+        if (is_acgt(sv[0]) && is_acgt(sv[1])) {
+            if constexpr (std::tuple_size_v<T> == 3)
+                bwt.parse_triples(sv.substr(0, length), parses, code_size);
+            else
+                bwt.parse_tuples(sv.substr(0, length), parses, code_size);
+        } else {
+            if (sv[0] == sv[1]) {
+                if constexpr (std::tuple_size_v<T> == 3)
+                    parses.emplace_back(length|mask, uint64_t(sv[0]), 0);
+                else
+                    parses.emplace_back(length|mask, uint64_t(sv[0]));
+            }
+            length = 1;
+            if constexpr (std::tuple_size_v<T> == 3)
+                parses.emplace_back(length|mask, uint64_t(sv[0]), 0);
+            else
+                parses.emplace_back(length|mask, uint64_t(sv[0]));
+        }
 
         // output the phrases
         std::vector<char> output;
