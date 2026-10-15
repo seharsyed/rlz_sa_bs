@@ -839,6 +839,10 @@ struct RangeSizeStats {
   std::size_t positions = 0;
   std::size_t range_positions = 0;
 
+  // Sum of the squared range sizes: range_size_squares / positions is the
+  // expected range size of a random reference position (0 for a singleton's).
+  double range_size_squares = 0;
+
   std::array<std::size_t, bin_count> size_bins{};
   std::array<std::size_t, large_thresholds.size()> large{};
   std::array<std::size_t, large_thresholds.size()> large_positions{};
@@ -864,6 +868,7 @@ struct RangeSizeStats {
 
     ++ranges;
     range_positions += size;
+    range_size_squares += static_cast<double>(size) * static_cast<double>(size);
     ++size_bins[std::bit_width(size - 1) - 1];
 
     for (std::size_t t = 0; t < large_thresholds.size(); ++t) {

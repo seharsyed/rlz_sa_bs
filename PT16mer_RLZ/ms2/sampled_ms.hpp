@@ -28,7 +28,10 @@
 //                               exact since MS[i] <= MS[i+1] + 1; otherwise
 //                               from the result alone: a short phrase
 //                               (miss, tail) as is, a singleton extended, a
-//                               range narrowed -- exact;
+//                               range resolved by the mlr search -- exact;
+//                               but first, in a run of one character longer
+//                               than the reference's longest such run, the
+//                               run shortcut (runs.hpp) -- exact, O(1);
 //              stretch interior after its last singleton (whose answer lies
 //                               on the path: its only occurrence), every
 //                               position to the left up to the first
@@ -43,7 +46,7 @@
 #include <string>
 #include <vector>
 
-#include "../rlz_common.hpp"  // rlz::binarySearchLB / RB
+#include "runs.hpp"     // ReferenceRuns, resolve_hit, occurs_at
 #include "sampled.hpp"
 
 namespace ms2 {
@@ -67,6 +70,7 @@ struct SampledMsStats {
   std::size_t by_short = 0;      // a lookup's short phrase (miss or tail)
   std::size_t by_singleton = 0;  // a lookup's singleton, extended
   std::size_t by_range = 0;      // a lookup's range, narrowed
+  std::size_t by_run = 0;        // the run shortcut (runs.hpp)
   std::size_t by_stretch = 0;    // a stretch interior, filled (+1 per step)
   std::size_t separators = 0;
   std::size_t stretch_ends = 0;  // stretches entered (also counted above)
@@ -85,6 +89,7 @@ struct SampledMsStats {
     by_short += o.by_short;
     by_singleton += o.by_singleton;
     by_range += o.by_range;
+    by_run += o.by_run;
     by_stretch += o.by_stretch;
     separators += o.separators;
     stretch_ends += o.stretch_ends;
@@ -107,6 +112,7 @@ struct SampledMsStats {
                                            {"by-short", by_short},
                                            {"by-singleton", by_singleton},
                                            {"by-range", by_range},
+                                           {"by-run", by_run},
                                            {"by-stretch", by_stretch},
                                            {"separators", separators},
                                            {"stretch-ends", stretch_ends}}) +
@@ -137,56 +143,6 @@ struct SampledMsBuffers {
   std::vector<KmerLookupResult> hole_results;  // aligned with them
 };
 
-// The exact MS at i from a lookup made at i (lazy_ms.hpp's break step).
-template <typename Symbol>
-std::pair<std::uint32_t, std::uint32_t> resolve_lookup(
-    const KmerLookupResult& hit, const std::vector<Symbol>& input,
-    const std::vector<Symbol>& reference, const std::size_t i,
-    std::size_t& work) {
-  if (!hit.found) return {hit.match_position, hit.match_length};
-
-  const std::size_t n = input.size();
-  std::size_t offset = KMER_LENGTH;
-  std::size_t j = i + KMER_LENGTH;
-  std::size_t match = hit.match_position;
-
-  if (hit.count > 1) {
-    std::int64_t nlb = 0;
-    std::int64_t nrb = static_cast<std::int64_t>(hit.positions.size()) - 1;
-
-    while (nlb < nrb && j < n) {
-      const auto lb = rlz::binarySearchLB(reference, hit.positions, nlb, nrb,
-                                          static_cast<std::int64_t>(offset),
-                                          input[j]);
-      if (!lb) break;
-      const auto rb =
-          rlz::binarySearchRB(reference, hit.positions, lb.value(), nrb,
-                              static_cast<std::int64_t>(offset), input[j]);
-      if (!rb) break;
-      nlb = lb.value();
-      nrb = rb.value();
-      ++j;
-      ++offset;
-      ++work;
-    }
-
-    match = hit.positions[static_cast<std::size_t>(nlb)];
-    if (nlb != nrb) {
-      return {static_cast<std::uint32_t>(match),
-              static_cast<std::uint32_t>(offset)};
-    }
-  }
-
-  while (j < n && match + offset < reference.size() &&
-         reference[match + offset] == input[j]) {
-    ++j;
-    ++offset;
-    ++work;
-  }
-
-  return {static_cast<std::uint32_t>(match), static_cast<std::uint32_t>(offset)};
-}
-
 // The whole method on one table. `FingerPolicy` does the sorted lookups
 // (phases 1 and 2), `PlainPolicy` the tails. The phase times go to
 // `phases`: 1-collect, 1-sort, 1-lookups, 1-link, 2-collect, 2-sort,
@@ -194,8 +150,9 @@ std::pair<std::uint32_t, std::uint32_t> resolve_lookup(
 template <typename FingerPolicy, typename PlainPolicy, typename Symbol>
 MatchingStatistics sampled_matching_statistics(
     const typename PlainPolicy::Table& table, const std::vector<Symbol>& input,
-    const std::vector<Symbol>& reference, const std::size_t step,
-    SampledMsBuffers& b, SampledMsStats& stats, Diagnostics* phases) {
+    const std::vector<Symbol>& reference, const ReferenceRuns& runs,
+    const std::size_t step, SampledMsBuffers& b, SampledMsStats& stats,
+    Diagnostics* phases) {
   const std::size_t n = input.size();
   MatchingStatistics ms(n);
   stats.positions += n;
@@ -210,7 +167,7 @@ MatchingStatistics sampled_matching_statistics(
 
   const double link_ms = time_ms([&] {
     SampleStats unused;
-    link_samples(b.samples, b.kinds, step, b.chosen, b.linked, unused);
+    link_samples(b.samples, b.kinds, step, b.chosen, b.linked, unused, reference);
 
     // Strict stretches: each chain from its first singleton to its last.
     b.stretches.clear();
@@ -329,6 +286,20 @@ MatchingStatistics sampled_matching_statistics(
     std::size_t hole = b.hole_positions.size();  // cursor, one past
     std::size_t stretch = b.stretches.size();    // cursor, one past
 
+    // The run of one character starting at i (input[i] == input[i+1] ...),
+    // from the previous position's when the walk moved by one, else counted.
+    std::size_t run_at = n, run_length = 0;
+    const auto run_from = [&](const std::size_t i) {
+      if (run_at == i + 1 && input[i] == input[i + 1]) {
+        ++run_length;
+      } else {
+        run_length = 1;
+        while (i + run_length < n && input[i + run_length] == input[i]) ++run_length;
+      }
+      run_at = i;
+      return run_length;
+    };
+
     std::size_t i = n;
     while (i > 0) {
       --i;
@@ -348,15 +319,16 @@ MatchingStatistics sampled_matching_statistics(
       // From the lookup result at i: chained to i + 1 if one of its
       // occurrences is q - 1, else from the result alone.
       const auto from_lookup = [&](const KmerLookupResult& result) {
-        if (result.found && L > 0 && q > 0) {
-          std::size_t scanned = 0;
-          if (contains(result, q - 1, scanned)) {
-            ms[i] = {q - 1, L + 1};
-            ++stats.chained;
-            return;
-          }
+        if (result.found && L > 0 && q > 0 && occurs_at(result, q - 1, reference)) {
+          ms[i] = {q - 1, L + 1};
+          ++stats.chained;
+          return;
         }
-        ms[i] = resolve_lookup(result, input, reference, i, stats.hit_extension);
+        if (runs.shortcut(static_cast<unsigned char>(input[i]), run_from(i), ms[i])) {
+          ++stats.by_run;
+          return;
+        }
+        ms[i] = resolve_hit(result, input, reference, i, stats.hit_extension);
         if (!result.found) ++stats.by_short;
         else if (result.count == 1) ++stats.by_singleton;
         else ++stats.by_range;

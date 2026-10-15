@@ -36,6 +36,7 @@
 
 #include "../pt16_utils.hpp"  // alphatab, is_acgt, KMER_LENGTH, Diagnostics
 #include "input_keys.hpp"     // sorted_order, key_of
+#include "runs.hpp"           // occurs_at
 
 namespace ms2 {
 
@@ -58,7 +59,7 @@ struct SampleStats {
   std::size_t pairs = 0;         // neighbouring sample pairs
   std::size_t linked = 0;        // of them, lined up
   std::size_t range_decided_by_left = 0;  // an undecided range fixed later
-  std::size_t occurrences_scanned = 0;
+  std::size_t occurrences_scanned = 0;  // occurrence checks (contains)
 
   std::size_t stretches = 0;           // maximal runs of linked samples
   std::size_t stretch_characters = 0;  // input characters they cover
@@ -149,7 +150,7 @@ struct SampleStats {
                                          {"linked", linked},
                                          {"range-decided-by-left",
                                           range_decided_by_left},
-                                         {"occurrences-scanned",
+                                         {"occurrence-checks",
                                           occurrences_scanned}}) +
            counter_diagnostics("stretches",
                                {{"count", stretches},
@@ -241,14 +242,13 @@ void sample_lookups(const typename Policy::Table& table,
   }
 }
 
-inline bool contains(const KmerLookupResult& result, const std::uint32_t wanted,
-                     std::size_t& scanned) {
-  if (result.count == 1) return result.match_position == wanted;
-  scanned += result.positions.size();
-  for (const std::uint32_t position : result.positions) {
-    if (position == wanted) return true;
-  }
-  return false;
+// Whether `wanted` is one of a hit's occurrences (runs.hpp's occurs_at: 16
+// characters compared, whatever the range's size); `checks` counts the calls.
+template <typename Symbol>
+bool contains(const KmerLookupResult& result, const std::uint32_t wanted,
+              std::size_t& checks, const std::vector<Symbol>& reference) {
+  ++checks;
+  return occurs_at(result, wanted, reference);
 }
 
 // Step 1, sorted: the same samples, but the 16-mer lookups are done in
@@ -314,12 +314,13 @@ void sample_lookups_sorted(const typename Policy::Table& table,
 // Step 2. `chosen[j]`: the reference position of hit j's alignment
 // (UNDECIDED for a range nothing linked to, and for non-hits);
 // `linked[j]`: sample j lines up with sample j + 1.
-inline void link_samples(const std::vector<KmerLookupResult>& samples,
-                         const std::vector<SampleKind>& kinds,
-                         const std::size_t step,
-                         std::vector<std::uint32_t>& chosen,
-                         std::vector<std::uint8_t>& linked,
-                         SampleStats& stats) {
+template <typename Symbol>
+void link_samples(const std::vector<KmerLookupResult>& samples,
+                  const std::vector<SampleKind>& kinds,
+                  const std::size_t step,
+                  std::vector<std::uint32_t>& chosen,
+                  std::vector<std::uint8_t>& linked,
+                  SampleStats& stats, const std::vector<Symbol>& reference) {
   const std::size_t m = samples.size();
   chosen.assign(m, UNDECIDED);
   linked.assign(m, 0);
@@ -343,13 +344,14 @@ inline void link_samples(const std::vector<KmerLookupResult>& samples,
     if (chosen[j + 1] != UNDECIDED) {
       // The right sample's alignment is known: does ours continue it?
       const std::uint32_t q = chosen[j + 1];
-      if (q >= d && contains(result, q - d, stats.occurrences_scanned)) {
+      if (q >= d && contains(result, q - d, stats.occurrences_scanned, reference)) {
         chosen[j] = q - d;
         linked[j] = 1;
       }
     } else if (kinds[j] == SampleKind::singleton) {
       // The right sample is an undecided range: does it contain ours + d?
-      if (contains(samples[j + 1], chosen[j] + d, stats.occurrences_scanned)) {
+      if (contains(samples[j + 1], chosen[j] + d, stats.occurrences_scanned,
+                   reference)) {
         chosen[j + 1] = chosen[j] + d;
         linked[j] = 1;
         ++stats.range_decided_by_left;
@@ -439,12 +441,13 @@ inline void strict_stretches(const std::vector<SampleKind>& kinds,
 // a range can be reached: a singleton reached would mean the two chains
 // were one alignment and should have linked); samples outside any chain
 // reached this way extend the chain into a hole. See SampleStats.
-inline void overlap_stats(const std::vector<KmerLookupResult>& samples,
-                          const std::vector<SampleKind>& kinds,
-                          const std::vector<std::uint32_t>& chosen,
-                          const std::vector<std::uint8_t>& linked,
-                          const std::size_t step, const std::size_t n,
-                          SampleStats& stats) {
+template <typename Symbol>
+void overlap_stats(const std::vector<KmerLookupResult>& samples,
+                   const std::vector<SampleKind>& kinds,
+                   const std::vector<std::uint32_t>& chosen,
+                   const std::vector<std::uint8_t>& linked,
+                   const std::size_t step, const std::size_t n,
+                   SampleStats& stats, const std::vector<Symbol>& reference) {
   const std::size_t m = kinds.size();
   const auto is_hit = [&](std::size_t k) {
     return kinds[k] == SampleKind::singleton || kinds[k] == SampleKind::range;
@@ -480,7 +483,7 @@ inline void overlap_stats(const std::vector<KmerLookupResult>& samples,
       std::uint32_t position = chosen[k];
       for (std::size_t next = k + 1;
            next < m && is_hit(next) &&
-           contains(samples[next], position + d, scanned);
+           contains(samples[next], position + d, scanned, reference);
            ++next) {
         position += d;
         reach(next, overlapped);
@@ -494,7 +497,7 @@ inline void overlap_stats(const std::vector<KmerLookupResult>& samples,
       std::uint32_t position = chosen[k];
       for (std::size_t previous = k;
            previous > 0 && is_hit(previous - 1) && position >= d &&
-           contains(samples[previous - 1], position - d, scanned);
+           contains(samples[previous - 1], position - d, scanned, reference);
            --previous) {
         position -= d;
         reach(previous - 1, overlapped);
@@ -521,7 +524,8 @@ void midpoint_lookups(const typename Policy::Table& table,
                       const std::vector<SampleKind>& kinds,
                       const std::vector<std::uint32_t>& chosen,
                       const std::vector<std::uint8_t>& linked,
-                      const std::size_t step, SampleStats& stats) {
+                      const std::size_t step, SampleStats& stats,
+                      const std::vector<Symbol>& reference) {
   const std::size_t m = samples.size();
   const std::uint32_t half = static_cast<std::uint32_t>(step / 2);
   typename Policy::State state{};
@@ -551,10 +555,10 @@ void midpoint_lookups(const typename Policy::Table& table,
 
     const bool left = chosen[j] != UNDECIDED &&
                       contains(result, chosen[j] + half,
-                               stats.occurrences_scanned);
+                               stats.occurrences_scanned, reference);
     const bool right = chosen[j + 1] != UNDECIDED && chosen[j + 1] >= half &&
                        contains(result, chosen[j + 1] - half,
-                                stats.occurrences_scanned);
+                                stats.occurrences_scanned, reference);
 
     if (left && right) ++stats.mid_both;
     else if (left) ++stats.mid_left;

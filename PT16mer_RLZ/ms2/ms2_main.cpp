@@ -340,10 +340,10 @@ struct SampledRow {
 template <typename LookupPolicy, typename MidPolicy>
 SampledRow make_sampled(std::string name,
                         std::shared_ptr<const typename MidPolicy::Table> table,
-                        const bool sorted) {
+                        const bool sorted, const std::vector<Symbol>& reference) {
   SampledRow row;
   row.name = std::move(name);
-  row.run = [table, sorted](const std::vector<Symbol>& input,
+  row.run = [table, sorted, &reference](const std::vector<Symbol>& input,
                             const std::size_t step, SampledBuffers& b,
                             ms2::SampleStats& stats, double (&ms)[3]) {
     ms[0] = msbench::time_ms([&] {
@@ -359,11 +359,13 @@ SampledRow make_sampled(std::string name,
       }
     });
     ms[1] = msbench::time_ms([&] {
-      ms2::link_samples(b.samples, b.kinds, step, b.chosen, b.linked, stats);
+      ms2::link_samples(b.samples, b.kinds, step, b.chosen, b.linked, stats,
+                        reference);
     });
     ms[2] = msbench::time_ms([&] {
       ms2::midpoint_lookups<MidPolicy>(*table, input, b.samples, b.kinds,
-                                       b.chosen, b.linked, step, stats);
+                                       b.chosen, b.linked, step, stats,
+                                       reference);
     });
 
     // Bookkeeping for the report (untimed).
@@ -384,7 +386,7 @@ SampledRow make_sampled(std::string name,
     ms2::count_stretches(b.kinds, b.linked, step, input.size(), stats);
     ms2::strict_stretches(b.kinds, b.linked, step, input.size(), stats);
     ms2::overlap_stats(b.samples, b.kinds, b.chosen, b.linked, step,
-                       input.size(), stats);
+                       input.size(), stats, reference);
     stats.positions += input.size();
     for (const Symbol c : input) {
       stats.separator_positions += is_acgt(c) ? 0 : 1;
@@ -413,13 +415,14 @@ SampledMsRow make_sampled_ms(
     const std::vector<Symbol>& reference) {
   SampledMsRow row;
   row.name = std::move(name);
-  row.run = [table, &reference](const std::vector<Symbol>& input,
+  auto runs = std::make_shared<const ms2::ReferenceRuns>(reference);
+  row.run = [table, runs, &reference](const std::vector<Symbol>& input,
                                 const std::size_t step,
                                 ms2::SampledMsBuffers& buffers,
                                 ms2::SampledMsStats& stats,
                                 Diagnostics* phases) {
     return ms2::sampled_matching_statistics<FingerPolicy, PlainPolicy>(
-        *table, input, reference, step, buffers, stats, phases);
+        *table, input, reference, *runs, step, buffers, stats, phases);
   };
   return row;
 }
@@ -602,17 +605,17 @@ int main(int argc, char** argv) {
 
     if (v2) {
       sampled_rows.push_back(make_sampled<msbench::V2Policy, msbench::V2Policy>(
-          "sampled-v2-textorder", v2, /*sorted=*/false));
+          "sampled-v2-textorder", v2, /*sorted=*/false, reference));
       sampled_rows.push_back(
           make_sampled<msbench::V2FingerPolicy, msbench::V2Policy>(
-              "sampled-v2-sorted", v2, /*sorted=*/true));
+              "sampled-v2-sorted", v2, /*sorted=*/true, reference));
     }
     sampled_rows.push_back(
         make_sampled<msbench::SassyPolicy, msbench::SassyPolicy>(
-            "sampled-sassy-textorder", sassy, /*sorted=*/false));
+            "sampled-sassy-textorder", sassy, /*sorted=*/false, reference));
     sampled_rows.push_back(
         make_sampled<msbench::SassyFingerPolicy, msbench::SassyPolicy>(
-            "sampled-sassy-sorted", sassy, /*sorted=*/true));
+            "sampled-sassy-sorted", sassy, /*sorted=*/true, reference));
 
     std::vector<SampledMsRow> sampled_ms_rows;
     if (v2) {

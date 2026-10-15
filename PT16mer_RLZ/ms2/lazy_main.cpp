@@ -127,14 +127,15 @@ struct Variant {
 
 template <typename Policy>
 Variant make_variant(std::string name,
-                     std::shared_ptr<const typename Policy::Table> table) {
+                     std::shared_ptr<const typename Policy::Table> table,
+                     std::shared_ptr<const ms2::ReferenceRuns> runs) {
   Variant variant;
   variant.name = std::move(name);
-  variant.compute = [table](const std::vector<Symbol>& input,
-                            const std::vector<Symbol>& reference,
-                            ms2::LazyStats* stats) {
+  variant.compute = [table, runs](const std::vector<Symbol>& input,
+                                  const std::vector<Symbol>& reference,
+                                  ms2::LazyStats* stats) {
     return ms2::lazy_matching_statistics<Policy>(*table, input, reference,
-                                                 stats);
+                                                 *runs, stats);
   };
   return variant;
 }
@@ -258,6 +259,12 @@ int main(int argc, char** argv) {
     }
 
     std::vector<Variant> variants;
+
+    // The reference's longest run of each character (the run shortcut).
+    std::shared_ptr<const ms2::ReferenceRuns> runs;
+    const double runs_ms = msbench::time_ms(
+        [&] { runs = std::make_shared<const ms2::ReferenceRuns>(reference); });
+    std::cerr << "    reference runs: " << runs_ms << " ms\n";
     double v2_build_ms = 0.0;
 
     if (reference_is_acgt) {
@@ -273,7 +280,7 @@ int main(int argc, char** argv) {
       v2_build_ms = write_ms + load_ms;
       std::cerr << "    v2 table: write " << write_ms << " ms, load " << load_ms
                 << " ms\n";
-      variants.push_back(make_variant<msbench::V2Policy>("lazy-v2", v2));
+      variants.push_back(make_variant<msbench::V2Policy>("lazy-v2", v2, runs));
     } else {
       std::cerr << "    v2 table: skipped (the reference has non-ACGT bytes)\n";
     }
@@ -290,7 +297,7 @@ int main(int argc, char** argv) {
               << sassy_load_ms << " ms\n"
               << range_stats.format();
 
-    variants.push_back(make_variant<msbench::SassyPolicy>("lazy-sassy", sassy));
+    variants.push_back(make_variant<msbench::SassyPolicy>("lazy-sassy", sassy, runs));
 
     std::ofstream csv;
     if (!args.results.empty()) {
@@ -451,7 +458,8 @@ int main(int argc, char** argv) {
               << "median_match_length=" << total_phrases.median_length() << '\n'
               << "unmatched_positions=" << total_phrases.unmatched << '\n'
               << "v2_build_ms=" << v2_build_ms << '\n'
-              << "sassy_build_ms=" << sassy_write_ms + sassy_load_ms << '\n';
+              << "sassy_build_ms=" << sassy_write_ms + sassy_load_ms << '\n'
+              << "runs_ms=" << runs_ms << '\n';
     for (const Variant& variant : variants) {
       std::cout << variant.name << "_ms=" << variant.total_ms << '\n'
                 << variant.name << "_breaks=" << variant.stats.breaks << '\n'

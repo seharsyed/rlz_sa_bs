@@ -57,7 +57,8 @@ void check_one(const std::string& name, const typename Policy::Table& table,
                const std::vector<Symbol>& reference) {
   ms2::LazyStats stats;
   const MatchingStatistics ms =
-      ms2::lazy_matching_statistics<Policy>(table, input, reference, &stats);
+      ms2::lazy_matching_statistics<Policy>(table, input, reference,
+                                            ms2::ReferenceRuns(reference), &stats);
 
   if (stats.extended + stats.breaks + stats.separators != input.size()) {
     fail(name + ": positions not all accounted for");
@@ -168,6 +169,24 @@ int main() {
     // Runs and separators.
     inputs.push_back(std::string(120, 'A') + "N" + std::string(40, 'C') +
                      "NNNN" + reference.substr(500, 200) + std::string(30, 'T'));
+    // Runs of the reference's longest run's character around its length
+    // (the run shortcut applies only above it), followed by what follows
+    // that run in the reference.
+    {
+      const char c = "ACGT"[t % 4];
+      std::size_t longest = 0, at = 0;
+      for (std::size_t i = 0; i < reference.size();) {
+        std::size_t j = i;
+        while (j < reference.size() && reference[j] == reference[i]) ++j;
+        if (reference[i] == c && j - i > longest) longest = j - i, at = i;
+        i = j;
+      }
+      const std::string after = reference.substr(at + longest, 40);
+      for (const std::size_t k : {longest - 1, longest, longest + 1, 3 * longest}) {
+        inputs.push_back(std::string(k, c) + after);
+        inputs.push_back(random_dna(rng, 30) + std::string(k, c));
+      }
+    }
     // Short inputs.
     inputs.push_back("");
     inputs.push_back("ACGT");
